@@ -13,7 +13,7 @@
   <a href="https://www.redhat.com/"><img width="50" height="50" alt="redhat-icon" src="https://github.com/user-attachments/assets/0b920778-14d8-4a3c-a390-a54961bb156e" /></a>&nbsp;&nbsp;
   <a href="https://fedoraproject.org/"><img width="50" height="50" alt="fedora-icon" src="https://github.com/user-attachments/assets/10c51358-fd27-4a7b-b987-d482f4108af9" /></a>&nbsp;&nbsp;
   <a href="https://www.debian.org/"><img width="44.4" height="51.2" alt="debian-icon" src="https://github.com/user-attachments/assets/637d8994-cadc-44dd-b7dd-14a98c9987e2" /></a>&nbsp;&nbsp;
-  <a href="https://www.freebsd.org/"><img width="50" height="50" alt="freebsd-icon" src="https://github.com/user-attachments/assets/145bda8a-daff-43f8-aa3b-7346144e3b67" /></a>
+  <a href="https://www.freebsd.org/"><img width="50" height="50" alt="freebsd-icon" src="https://github.com/user-attachments/assets/94e0244c-ed9f-41ad-9d95-f0a80af7de6b" /></a>
 </p>
 
 ## Requirement / 系统要求
