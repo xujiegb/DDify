@@ -919,6 +919,10 @@ seed_account_linux() {
 preserve_hostname: false
 hostname: localhost
 prefer_fqdn_over_hostname: false
+growpart:
+  mode: auto
+  devices: [/]
+resize_rootfs: true
 EOF
 
     [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]] || return 0
@@ -972,7 +976,7 @@ seed_runcmd_ssh_port() {
   - |
       (
       cfg=/etc/ssh/sshd_config
-      tmp= backup= backup_ready=0 selinux_added=0 firewall_added=0 ufw_added=0 socket_override=
+      tmp= backup= backup_ready=0 selinux_added=0 firewall_added=0 firewall_zone= ufw_added=0 socket_override=
       ddify_rollback() {
           rc=\$?
           if [ "\$rc" -ne 0 ]; then
@@ -983,7 +987,7 @@ seed_runcmd_ssh_port() {
               fi
               [ "\$selinux_added" = 0 ] || semanage port -d -p tcp $port 2>/dev/null || true
               if [ "\$firewall_added" = 1 ]; then
-                  firewall-cmd --permanent --remove-port=$port/tcp >/dev/null 2>&1 || true
+                  firewall-cmd --permanent --zone="\$firewall_zone" --remove-port=$port/tcp >/dev/null 2>&1 || true
                   firewall-cmd --reload >/dev/null 2>&1 || true
               fi
               [ "\$ufw_added" = 0 ] || ufw --force delete allow $port/tcp >/dev/null 2>&1 || true
@@ -1014,8 +1018,16 @@ seed_runcmd_ssh_port() {
           fi
       fi
       if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-          if ! firewall-cmd --permanent --query-port=$port/tcp >/dev/null 2>&1; then
-              firewall-cmd --permanent --add-port=$port/tcp || exit 1
+          iface=
+          if command -v ip >/dev/null 2>&1; then
+              iface=\$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if(\$i=="dev") {print \$(i+1); exit}}')
+              [ -n "\$iface" ] || iface=\$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if(\$i=="dev") {print \$(i+1); exit}}')
+          fi
+          [ -n "\$iface" ] || exit 1
+          firewall_zone=\$(firewall-cmd --get-zone-of-interface="\$iface" 2>/dev/null || true)
+          [ -n "\$firewall_zone" ] || firewall_zone=\$(firewall-cmd --get-default-zone) || exit 1
+          if ! firewall-cmd --permanent --zone="\$firewall_zone" --query-port=$port/tcp >/dev/null 2>&1; then
+              firewall-cmd --permanent --zone="\$firewall_zone" --add-port=$port/tcp || exit 1
               firewall_added=1
           fi
           firewall-cmd --reload || exit 1
@@ -1043,7 +1055,38 @@ seed_runcmd_ssh_port() {
           systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart
       }
       sshd -t -f "\$tmp" && cat "\$tmp" > "\$cfg" && sshd -t && ddify_restart_ssh || exit 1
-      ) || echo "DDify: SSH configuration failed; check cloud-init logs" >&2
+      ) || { ddify_ssh_failed=1; echo "DDify: SSH configuration failed; check cloud-init logs" >&2; }
+EOF
+}
+
+seed_runcmd_expand_root() {
+    if [[ "$1" == freebsd ]]; then
+        cat <<'EOF'
+  - |
+      rootdev=$(mount -p | awk '$2=="/" {print $1; exit}')
+      if command -v fstyp >/dev/null 2>&1 && [ "$(fstyp "$rootdev" 2>/dev/null)" = ufs ]; then
+          growfs -y / || echo "DDify: FreeBSD UFS expansion needs inspection" >&2
+      fi
+EOF
+        return
+    fi
+    cat <<'EOF'
+  - |
+      # Root-only LVM: extend a single-PV, single-LV volume group after partition growth.
+      if command -v lvs >/dev/null 2>&1 && command -v pvs >/dev/null 2>&1 &&
+         command -v pvresize >/dev/null 2>&1 && command -v lvextend >/dev/null 2>&1; then
+          rootdev=$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null)
+          vg=$(lvs --noheadings -o vg_name "$rootdev" 2>/dev/null | xargs)
+          if [ -n "$vg" ] && [ "$(lvs --noheadings -o lv_name "$vg" | wc -l)" -eq 1 ]; then
+              pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" | xargs)
+              case "$pv" in
+                  /dev/*) if [ "${pv#* }" = "$pv" ]; then
+                      pvresize "$pv" && lvextend -r -l +100%FREE "$rootdev" ||
+                          echo "DDify: LVM root expansion unavailable or already complete" >&2
+                  fi ;;
+              esac
+          fi
+      fi
 EOF
 }
 
@@ -1056,9 +1099,55 @@ EOF
 }
 
 
+seed_runcmd_cleanup_cidata_freebsd() {
+    local partuuid="$1"
+    printf '  - |\n      ddify_cidata_partuuid="%s"\n' "$partuuid"
+    cat <<'EOF'
+      if command -v gpart >/dev/null 2>&1 && command -v fstyp >/dev/null 2>&1 && command -v diskinfo >/dev/null 2>&1; then
+          found=$(gpart list 2>/dev/null | awk -v id="$ddify_cidata_partuuid" '
+              function check() {
+                  if (tolower(uuid) == tolower(id)) {
+                      count++
+                      if (label == "CIDATA" && idx ~ /^[1-9][0-9]*$/) result=name " " idx
+                  }
+              }
+              /^[[:space:]]*[0-9]+\. Name:/ { check(); name=$3; idx=""; uuid=""; label="" }
+              /^[[:space:]]*index:/ { idx=$2 }
+              /^[[:space:]]*rawuuid:/ { uuid=$2 }
+              /^[[:space:]]*label:/ { label=$2 }
+              END { check(); if (count == 1) print result }
+          ')
+          provider=${found%% *} idx=${found#* }
+          disk=${provider%p$idx}
+          if [ -n "$provider" ] && [ -n "$idx" ] && [ "$disk" != "$provider" ] &&
+             [ "$(fstyp "/dev/$provider" 2>/dev/null)" = msdosfs ] &&
+             echo " $(sysctl -n kern.disks 2>/dev/null) " | grep -Fq " $disk " &&
+             ! mount -p | awk -v p="$provider" -v uuid="$ddify_cidata_partuuid" '
+                 $1 == "/dev/" p || $1 == "/dev/gpt/CIDATA" ||
+                 $1 == "/dev/msdosfs/CIDATA" || tolower($1) == "/dev/gptid/" tolower(uuid) { found=1 }
+                 END {exit !found}
+             '; then
+              size=$(diskinfo "/dev/$provider" 2>/dev/null | awk 'NR==1 {print $3}')
+              case "$size" in ''|*[!0-9]*) size=0 ;; esac
+              if [ "$size" -gt 0 ] && [ $((size % 1048576)) -eq 0 ] &&
+                 dd if=/dev/zero of="/dev/$provider" bs=1m count=$((size / 1048576)) 2>/dev/null &&
+                 gpart delete -i "$idx" "$disk" >/dev/null 2>&1; then
+                  echo "DDify: removed temporary CIDATA on $disk"
+              else
+                  echo "DDify: FreeBSD CIDATA cleanup failed; check the seed partition" >&2
+              fi
+          else
+              echo "DDify: FreeBSD CIDATA not uniquely verified or still mounted; retained" >&2
+          fi
+      else
+          echo "DDify: FreeBSD CIDATA tools unavailable; retained" >&2
+      fi
+EOF
+}
+
 seed_runcmd_cleanup_cidata() {
     local os="$1" partuuid="${2:-}"
-    [[ "$os" != "freebsd" ]] || return 0
+    [[ "$os" != "freebsd" ]] || { seed_runcmd_cleanup_cidata_freebsd "$partuuid"; return; }
     [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
         error "Missing/invalid CIDATA PARTUUID for Linux cloud-init cleanup"
 
@@ -1138,8 +1227,13 @@ seed_runcmd() {
     echo
     echo "runcmd:"
     seed_runcmd_ssh_port "$os"
+    seed_runcmd_expand_root "$os"
     seed_runcmd_frpc "$frpc_b64"
     seed_runcmd_cleanup_cidata "$os" "$cidata_partuuid"
+    cat <<'EOF'
+  - |
+      [ "${ddify_ssh_failed:-0}" = 0 ] || exit 1
+EOF
 }
 
 write_nocloud_seed() {
@@ -1361,6 +1455,7 @@ write_install_plan() {
         printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
         printf 'DISK_ID_PTUUID=%q\n' "${DISK_ID_PTUUID:-}"
         printf 'IMG_URL=%q\n' "$IMG_URL"
+        printf 'IMAGE_BUILTIN=%q\n' "${IMAGE_BUILTIN:-0}"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
         printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
         printf 'SSH_PORT=%q\n' "$SSH_PORT"
@@ -2246,6 +2341,9 @@ reset_disk_for_staging() {
     mdev -s 2>/dev/null || true
 
     sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT"
+    if [[ -n "${DISK_ID_PTUUID:-}" ]]; then
+        sgdisk -U "$DISK_ID_PTUUID" "$DISK" >/dev/null || error "Failed to preserve target GPT identity"
+    fi
     sgdisk -n "${TEMP_STAGE_PART_NUM}:-3072M:0" -t "${TEMP_STAGE_PART_NUM}:8300" \
         -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" "$DISK" >/dev/null || error "Failed to create staging partition"
     reread_partition_table_strict
@@ -2398,10 +2496,44 @@ inspect_qcow_partition_layout() {
     fi
 }
 
+# Official HTTPS checksum manifests protect built-in images without adding CLI options.
+# Manifest authenticity relies on TLS; this is not a GPG-signature verification.
+image_checksum_from_official_manifest() {
+    local name="${IMG_URL##*/}" base="${IMG_URL%/*}" url algo=SHA256 manifest expected
+    case "$TARGET_OS" in
+        rocky)      url="${IMG_URL}.CHECKSUM" ;;
+        almalinux)  url="$base/CHECKSUM" ;;
+        fedora)     url="$base/Fedora-Cloud-44-1.7-${MACHINE_ARCH}-CHECKSUM" ;;
+        freebsd)    url="$base/CHECKSUM.SHA256" ;;
+        debian)     url="$base/SHA512SUMS"; algo=SHA512 ;;
+        *) error "No official checksum source for built-in $TARGET_OS image" ;;
+    esac
+    manifest="$INSTALL_TMPDIR/official-image-checksum"
+    curl -fsSL --proto '=https' --proto-redir '=https' "$url" -o "$manifest" ||
+        error "Could not retrieve official checksum manifest: $url"
+    expected=$(awk -v file="$name" -v algorithm="$algo" '
+        $1 == algorithm && $2 == "(" file ")" && $3 == "=" { print $4; exit }
+        $2 == file || $2 == "*" file { print $1; exit }
+    ' "$manifest")
+    case "$algo:$expected" in
+        SHA256:*) [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] ;;
+        SHA512:*) [[ "$expected" =~ ^[[:xdigit:]]{128}$ ]] ;;
+    esac || error "Official checksum manifest lacks a valid entry for $name"
+    IMAGE_HASH_ALGO="${algo,,}"
+    IMAGE_HASH_EXPECTED="${expected,,}"
+}
+
 download_target_image_in_alpine() {
-    local dst="$1" tmp="${1}.part.$$" remote_size allocated
+    local dst="$1" tmp="${1}.part.$$" remote_size allocated digest= hash_pid= fifo=
 
     rm -f "$tmp"
+    [[ "$IMG_URL" == https://* ]] || error "Target image must use HTTPS"
+    if [[ "${IMAGE_BUILTIN:-0}" == 1 ]]; then
+        image_checksum_from_official_manifest
+    else
+        IMAGE_HASH_EXPECTED="" IMAGE_HASH_ALGO=""
+        warn "Custom --img: no publisher checksum is available; source authenticity is unverified"
+    fi
     info "Downloading target image onto the mandatory 3 GiB staging partition: $IMG_URL"
 
     remote_size=$(http_content_length "$IMG_URL" || true)
@@ -2410,25 +2542,33 @@ download_target_image_in_alpine() {
     fi
 
     if [[ "$IMG_URL" == *.xz ]]; then
-        # into a regular qcow2 file on the staging filesystem. xz recreates sparse
-        if command -v curl >/dev/null 2>&1; then
-            if ! curl -L --fail "$IMG_URL" | xz -dc >"$tmp"; then
-                rm -f "$tmp"
-                error "Failed to download/decompress target qcow2.xz onto staging partition: $IMG_URL"
+        if [[ -n "$IMAGE_HASH_EXPECTED" ]]; then
+            fifo="$INSTALL_TMPDIR/image-checksum.fifo"
+            mkfifo "$fifo" || error "Could not create image checksum pipe"
+            "${IMAGE_HASH_ALGO}sum" <"$fifo" >"$INSTALL_TMPDIR/image-hash" &
+            hash_pid=$!
+            if ! curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" |
+                    tee "$fifo" | xz -dc >"$tmp"; then
+                rm -f "$tmp" "$fifo"
+                wait "$hash_pid" || true
+                error "Failed to download/decompress target image"
             fi
-        elif command -v wget >/dev/null 2>&1; then
-            if ! wget -O - "$IMG_URL" | xz -dc >"$tmp"; then
-                rm -f "$tmp"
-                error "Failed to download/decompress target qcow2.xz onto staging partition: $IMG_URL"
-            fi
+            wait "$hash_pid" || error "Failed to calculate compressed image hash"
+            rm -f "$fifo"
+            digest=$(awk '{print $1; exit}' "$INSTALL_TMPDIR/image-hash")
         else
-            error "No curl or wget available in Alpine RAM"
+            curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" |
+                xz -dc >"$tmp" || error "Failed to download/decompress target image"
         fi
     else
-        http_download "$IMG_URL" "$tmp" || {
-            rm -f "$tmp"
-            error "Failed to download target image onto staging partition: $IMG_URL"
-        }
+        curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" -o "$tmp" ||
+            error "Failed to download target image"
+        [[ -z "$IMAGE_HASH_EXPECTED" ]] ||
+            digest=$("${IMAGE_HASH_ALGO}sum" "$tmp" | awk '{print $1}')
+    fi
+    if [[ -n "$IMAGE_HASH_EXPECTED" ]]; then
+        [[ "${digest,,}" == "$IMAGE_HASH_EXPECTED" ]] || error "Official image checksum mismatch"
+        info "Official ${IMAGE_HASH_ALGO^^} checksum verified (HTTPS manifest; signature not checked)"
     fi
 
     [[ "$(qemu-img info --output=json "$tmp" 2>/dev/null | sed -n 's/^[[:space:]]*"format"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" == qcow2 ]] || {
@@ -2622,6 +2762,10 @@ write_sparse_shadow_to_target_after_releasing_stage() {
     disk_bytes=$(get_disk_size_bytes "$DISK" || true)
     [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -gt 0 ]] || \
         error "Could not determine target disk size for sparse-shadow write"
+
+    # A sparse file may legitimately contain holes, but must cover the entire disk.
+    truncate -s "$disk_bytes" "$shadow" || error "Failed to size sparse shadow"
+    [[ "$(stat -c %s "$shadow")" == "$disk_bytes" ]] || error "Sparse shadow is shorter than the target disk"
 
     release_temp_staging_partition
     TEMP_STAGE_RELEASED=1
@@ -2841,10 +2985,8 @@ installer_write_seed() {
     local part partuuid mnt="$INSTALL_TMPDIR/cidata"
     part=$(create_nocloud_cidata_partition)
     partuuid=$(lsblk -d -n -r -o PARTUUID "$part" 2>/dev/null | head -n1)
-    if [[ "$TARGET_OS" != "freebsd" ]]; then
-        [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
-            error "Failed to read newly created CIDATA PARTUUID"
-    fi
+    [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+        error "Failed to read newly created CIDATA PARTUUID"
     mkdir -p "$mnt"
     mount -t vfat "$part" "$mnt" || error "Failed to mount CIDATA partition $part"
 
@@ -2898,7 +3040,7 @@ reset_config() {
     TARGET_OS="" TARGET_VER="" IMG_URL="" DISK=""
     PASSWORD="" PASSWORD_HASH="" PASSWORD_TO_DISPLAY="" AUTO_PASSWORD=0
     SSH_KEYS_ALL="" SSH_PORT="" WEB_PORT="" FRPC_TOML="" POST_INSTALL_HOOK="" FRPC_PRESENT=""
-    HOLD=0 AUTO_YES=0
+    HOLD=0 AUTO_YES=0 IMAGE_BUILTIN=0
 }
 
 target_versions() {
@@ -3040,7 +3182,10 @@ host_main() {
     [[ "$HOLD" == 1 ]] || ensure_dependencies
     prepare_target_disk
     prepare_credentials
-    [[ -n "$IMG_URL" ]] || IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
+    if [[ -z "$IMG_URL" ]]; then
+        IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
+        IMAGE_BUILTIN=1
+    fi
     print_host_summary
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
     if [[ "$HOLD" != 1 ]]; then
