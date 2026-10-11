@@ -1798,6 +1798,10 @@ setup_zram_swap() {
         exit 1
     }
 
+    [ "$mem_kb" -ge 716800 ] || {
+        echo "DDify requires a VPS with at least 768 MiB installed RAM (usable MemTotal=$mem_kb KiB)." >&2
+        exit 1
+    }
     zram_bytes=$((mem_kb * 1024 * 2))
     min_bytes=1073741824
     max_bytes=8589934592
@@ -1836,8 +1840,9 @@ setup_work_tmpfs() {
     mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
     mem_bytes=$((mem_kb * 1024))
     zram_bytes="$(cat /run/reinstall-zram-bytes 2>/dev/null || echo 0)"
-    reserve=268435456
-    work_bytes=$((mem_bytes + zram_bytes - reserve))
+    reserve=201326592
+    # zram is compressed swap, not physical RAM; bound tmpfs and watch MemAvailable.
+    work_bytes=$((mem_bytes + zram_bytes / 2 - reserve))
     [ "$work_bytes" -gt 536870912 ] || work_bytes=536870912
 
     mkdir -p /run/reinstall-work
@@ -2039,10 +2044,12 @@ EOF
     else
         local grub_boot_prefix="/boot"
         is_mountpoint /boot && grub_boot_prefix=""
+        [[ -n "$PLAN_EFI_UUID" ]] || error "Cannot locate BIOS bootstrap filesystem UUID"
         cat >"$GRUB_SCRIPT_PATH" <<EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
+    search --no-floppy --fs-uuid --set=root ${PLAN_EFI_UUID}
     linux ${grub_boot_prefix}${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd ${grub_boot_prefix}${ALPINE_INITRAMFS_REL}
 }
@@ -2156,29 +2163,38 @@ efi_bootnext_number() {
     efibootmgr 2>/dev/null | awk -F: '/^BootNext[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
 }
 
+efi_bootorder() {
+    efibootmgr 2>/dev/null | awk -F: '/^BootOrder[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
+}
+
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
-    local old before after num bootnext
+    local before num order bootnext current
 
-    while read -r old; do
-        [[ -z "$old" ]] || efibootmgr -B -b "$old" >/dev/null 2>&1 || true
-    done < <(efi_entry_numbers "$ALPINE_ENTRY_TITLE")
+    # Do not delete old entries by label: they might be user-managed entries.
+    [[ -z "$(efi_entry_numbers "$ALPINE_ENTRY_TITLE")" ]] || \
+        error "An existing Alpine reinstall EFI entry needs manual removal"
+    order=$(efi_bootorder)
+    [[ "$order" =~ ^[0-9A-F]{4}(,[0-9A-F]{4})*$ ]] || \
+        error "Could not safely capture the original UEFI BootOrder"
 
     before=$(efi_entry_numbers)
     efibootmgr -a -c -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
         error "Failed to create UEFI boot entry"
+    num=$(comm -13 <(printf '%s\n' "$before") <(efi_entry_numbers) | head -n1)
+    [[ "$num" =~ ^[0-9A-F]{4}$ ]] || error "Could not uniquely determine new UEFI boot entry"
 
-    num=$(efi_entry_numbers "$ALPINE_ENTRY_TITLE" | head -n1)
-    if [[ -z "$num" ]]; then
-        after=$(efi_entry_numbers)
-        num=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1)
+    # -c prepends the new entry to BootOrder; preserve the user's original order.
+    if ! efibootmgr -o "$order" >/dev/null; then
+        efibootmgr -B -b "$num" >/dev/null 2>&1 || true
+        error "Failed to restore original UEFI BootOrder"
     fi
-    [[ "$num" =~ ^[0-9A-F]{4}$ ]] || error "Could not determine new UEFI boot entry"
-
+    current=$(efi_bootorder)
+    [[ "$current" == "$order" ]] || error "UEFI BootOrder changed unexpectedly: $current"
     efibootmgr -n -b "$num" >/dev/null || error "Failed to set BootNext=$num"
     bootnext=$(efi_bootnext_number)
-    [[ -z "$bootnext" || "$bootnext" == "$num" ]] || error "BootNext verification failed: $bootnext != $num"
-    info "BootNext=$num ($ALPINE_ENTRY_TITLE)"
+    [[ "$bootnext" == "$num" ]] || error "BootNext verification failed: $bootnext != $num"
+    info "BootNext=$num ($ALPINE_ENTRY_TITLE); original BootOrder preserved"
 }
 
 prepare_and_boot_alpine_ram() {
@@ -2718,8 +2734,21 @@ prepare_sparse_shadow_for_target() {
     local img="$1" shadow="$2" nbd sector target_sector disk_bytes total reserve target_end partdev part_bytes allocated
 
     rm -f "$shadow"
-    info "Creating sparse RAM/zram shadow"
-    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" || error "Failed to create sparse raw shadow"
+    info "Creating bounded sparse RAM/zram shadow"
+    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" &
+    local convert_pid=$! available_kb pressure=0
+    while kill -0 "$convert_pid" 2>/dev/null; do
+        available_kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+        if [[ "$available_kb" =~ ^[0-9]+$ ]] && (( available_kb < 98304 )); then
+            pressure=1
+            kill "$convert_pid" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+    done
+    if ! wait "$convert_pid" || (( pressure )); then
+        error "Insufficient RAM/zram for sparse-shadow; refusing an unsafe partial write"
+    fi
     allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}')
     info "Sparse shadow: logical=$(stat -c %s "$shadow") allocated=${allocated:-unknown} bytes"
 
@@ -2774,9 +2803,17 @@ write_sparse_shadow_to_target_after_releasing_stage() {
     info "Writing sparse shadow to the target disk after releasing the 3 GiB staging partition..."
     info "Copy length: ${disk_bytes} bytes"
 
-    # truncated to a smaller VPS disk after pvresize/GPT preparation.
-    dd if="$shadow" of="$DISK" bs=16M iflag=count_bytes count="$disk_bytes" \
-        status=progress conv=fsync || error "Failed to write sparse shadow to target disk"
+    # A sparse copy is safe only after the entire destination was zeroed.
+    # BLKZEROOUT guarantees zeros; plain blkdiscard and dd conv=sparse do not.
+    if command -v blkdiscard >/dev/null 2>&1 && blkdiscard --zeroout "$DISK"; then
+        info "Destination zeroed; transferring sparse data extents"
+        qemu-img convert -p -n --target-is-zero -S 4k -f raw -O raw "$shadow" "$DISK" || \
+            error "Sparse conversion failed after target zeroing"
+    else
+        info "Zeroout unavailable; writing every byte to avoid stale target data"
+        dd if="$shadow" of="$DISK" bs=16M iflag=count_bytes count="$disk_bytes" \
+            status=progress conv=fsync || error "Failed to write sparse shadow to target disk"
+    fi
 
     sync
     rm -f "$shadow"
