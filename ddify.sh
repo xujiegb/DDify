@@ -42,7 +42,7 @@ Options:
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
-    exit 1
+    exit 0
 }
 
 to_lower() {
@@ -78,6 +78,16 @@ http_download() {
     fi
 
     mv -f "$tmp" "$dst"
+}
+
+http_download_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$1"
+    else
+        return 1
+    fi
 }
 
 http_content_length() {
@@ -150,43 +160,20 @@ lsblk_get_kv() {
 
 hash_password() {
     local plain="$1"
-
     if command -v openssl >/dev/null 2>&1; then
-        openssl passwd -6 "$plain"
-        return 0
+        printf '%s\n' "$plain" | openssl passwd -6 -stdin
+    elif command -v python3 >/dev/null 2>&1 && python3 -c 'import passlib.hash' 2>/dev/null; then
+        printf '%s' "$plain" | python3 -c 'import sys; from passlib.hash import sha512_crypt; print(sha512_crypt.hash(sys.stdin.read()))'
+    elif command -v perl >/dev/null 2>&1; then
+        printf '%s\n' "$plain" | perl -e '
+            chomp(my $pw = <STDIN>);
+            my @chars = ("a".."z", "A".."Z", 0..9, ".", "/");
+            my $salt = join "", map { $chars[int rand @chars] } 1..16;
+            print crypt($pw, "\$6\$rounds=5000\$$salt\$") . "\n";
+        '
+    else
+        error "Password hashing requires openssl, python3 with passlib, or perl"
     fi
-
-    if command -v python3 >/dev/null 2>&1; then
-        if python3 - <<'PY' >/dev/null 2>&1
-from passlib.hash import sha512_crypt
-print("ok")
-PY
-        then
-            python3 - "$plain" <<'PY'
-from passlib.hash import sha512_crypt
-import sys
-pw = sys.argv[1]
-print(sha512_crypt.hash(pw))
-PY
-            return 0
-        fi
-    fi
-
-    if command -v perl >/dev/null 2>&1; then
-        perl -e '
-            use strict;
-            use warnings;
-            my $pw = shift @ARGV;
-            my @chars = ("a".."z","A".."Z",0..9,".","/");
-            my $salt = join("", map { $chars[rand @chars] } 1..16);
-            my $rounds = 5000;
-            my $out = crypt($pw, "\$6\$rounds=$rounds\$$salt\$");
-            print "$out\n";
-        ' "$plain"
-        return 0
-    fi
-
-    error "No password hashing tool found. Install openssl, or python3 with passlib, or perl, or use --ssh-key only."
 }
 
 detect_os_arch() {
@@ -320,7 +307,7 @@ install_deps_debian() {
     command -v apt >/dev/null 2>&1 || error "Auto-install requires apt on Debian system"
 
     info "Installing missing dependencies with apt: ${pkgs[*]}"
-    apt install -y "${pkgs[@]}"
+    apt-get update && apt-get install -y "${pkgs[@]}"
 }
 
 install_deps_freebsd_host() {
@@ -384,6 +371,7 @@ DISK_ID_WWN=""
 DISK_ID_SERIAL=""
 DISK_ID_SIZE=""
 DISK_ID_MODEL=""
+DISK_ID_PTUUID=""
 
 validate_target_disk() {
     local disk="$1" typ d
@@ -422,6 +410,7 @@ capture_target_disk_identity() {
     DISK_ID_SERIAL=""
     DISK_ID_SIZE=""
     DISK_ID_MODEL=""
+    DISK_ID_PTUUID=""
 
     if [[ "$OS" == "Linux" ]]; then
         line=$(lsblk -b -dn -P -o WWN,SERIAL,SIZE,MODEL "$disk" 2>/dev/null | head -n1 || true)
@@ -430,6 +419,7 @@ capture_target_disk_identity() {
         DISK_ID_SERIAL=$(lsblk_get_kv "$line" "SERIAL")
         DISK_ID_SIZE=$(lsblk_get_kv "$line" "SIZE")
         DISK_ID_MODEL=$(lsblk_get_kv "$line" "MODEL")
+        DISK_ID_PTUUID=$(blkid -s PTUUID -o value "$disk" 2>/dev/null || true)
     else
         d="${disk#/dev/}"
         if command -v diskinfo >/dev/null 2>&1; then
@@ -443,14 +433,16 @@ capture_target_disk_identity() {
         fi
     fi
 
-    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_SIZE" ]] || \
-        error "Could not obtain a stable identity for target disk $disk"
+    [[ "$DISK_ID_SIZE" =~ ^[0-9]+$ && "$DISK_ID_SIZE" -gt 0 ]] ||
+        error "Unable to read target disk size"
+    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" ]] || \
+        error "Target disk has no stable identity (WWN/serial/PTUUID); refusing unattended reinstallation"
 
     info "Target disk identity: serial=${DISK_ID_SERIAL:-unknown} wwn=${DISK_ID_WWN:-unknown} size=${DISK_ID_SIZE:-unknown}"
 }
 
 list_disk_identities() {
-    local line path type wwn serial size model d
+    local line path type wwn serial size model ptuuid="" d
 
     if [[ "$OS" == Linux ]]; then
         while IFS= read -r line; do
@@ -461,7 +453,8 @@ list_disk_identities() {
             serial=$(lsblk_get_kv "$line" SERIAL)
             size=$(lsblk_get_kv "$line" SIZE)
             model=$(lsblk_get_kv "$line" MODEL)
-            printf '%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model"
+            ptuuid=$(blkid -s PTUUID -o value "$path" 2>/dev/null || true)
+            printf '%s|%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model" "$ptuuid"
         done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null)
         return
     fi
@@ -472,59 +465,33 @@ list_disk_identities() {
         size=$(diskinfo "$path" 2>/dev/null | awk 'NR==1 {print $3; exit}')
         wwn=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
         model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
-        printf '%s|%s|%s|%s|%s\n' "$path" "$(normalize_disk_wwn "$wwn")" "$serial" "$size" "$model"
+        printf '%s|%s|%s|%s|%s|%s\n' "$path" "$(normalize_disk_wwn "$wwn")" "$serial" "$size" "$model" "$ptuuid"
     done
 }
 
 disk_identity_matches() {
-    local wwn="$1" serial="$2" size="$3" model="$4"
-    [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || return 1
-
-    if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" ]]; then
-        [[ "$wwn" == "$DISK_ID_WWN" ]] && return 0
-    fi
-    if [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" ]]; then
-        [[ "$serial" == "$DISK_ID_SERIAL" ]] && return 0
-    fi
-
-    [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]] || return 1
-    [[ -n "${DISK_ID_SIZE:-}" ]] || return 1
-    [[ -z "${DISK_ID_MODEL:-}" || "$model" == "$DISK_ID_MODEL" ]]
-}
-
-resolve_bootstrap_disk_by_uuid() {
-    [[ "$OS" == Linux && -n "${PLAN_EFI_UUID:-}" ]] || return 1
-    command -v blkid >/dev/null 2>&1 || return 1
-
-    local part disk size
-    part=$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)
-    [[ -b "$part" ]] || return 1
-    disk=$(linux_source_to_disk "$part" || true)
-    [[ -b "$disk" ]] || return 1
-    size=$(lsblk -b -dn -o SIZE "$disk" 2>/dev/null | head -n1)
-    [[ -z "${DISK_ID_SIZE:-}" || -z "$size" || "$size" == "$DISK_ID_SIZE" ]] || return 1
-
-    [[ -z "${DISK:-}" || "$DISK" == "$disk" ]] || info "Target disk device changed: $DISK -> $disk"
-    info "Resolved target disk from bootstrap UUID $PLAN_EFI_UUID: $part -> $disk"
-    DISK="$disk"
+    local wwn="$1" serial="$2" size="$3" model="$4" ptuuid="${5:-}" pair stored current hit=0
+    [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || return 1
+    for pair in "${DISK_ID_WWN:-}|$wwn" "${DISK_ID_SERIAL:-}|$serial" "${DISK_ID_PTUUID,,}|${ptuuid,,}"; do
+        stored=${pair%%|*}; current=${pair#*|}
+        [[ -n "$stored" && -n "$current" ]] || continue
+        [[ "$stored" == "$current" ]] || return 1
+        hit=1
+    done
+    ((hit))
 }
 
 resolve_target_disk_from_identity() {
-    local row path wwn serial size model matches=()
-
-    resolve_bootstrap_disk_by_uuid && return 0
-    [[ -n "${DISK_ID_SERIAL:-}${DISK_ID_WWN:-}${DISK_ID_SIZE:-}" ]] || return 0
-
-    while IFS='|' read -r path wwn serial size model; do
-        disk_identity_matches "$wwn" "$serial" "$size" "$model" && matches+=("$path")
+    local path wwn serial size model ptuuid
+    local matches=()
+    [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}" ]] || \
+        error "No strong target disk identity recorded; refusing destructive write"
+    while IFS='|' read -r path wwn serial size model ptuuid; do
+        disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" && matches+=("$path")
     done < <(list_disk_identities)
 
-    if ((${#matches[@]} != 1)); then
-        warn "Saved disk: path=${DISK:-unset} wwn=${DISK_ID_WWN:-none} serial=${DISK_ID_SERIAL:-none} size=${DISK_ID_SIZE:-none}"
-        error "Saved target identity matched ${#matches[@]} disks; refusing destructive write"
-    fi
-
-    [[ -z "${DISK:-}" || "$DISK" == "${matches[0]}" ]] || info "Target disk device changed: $DISK -> ${matches[0]}"
+    ((${#matches[@]} == 1)) || error "Saved target identity matched ${#matches[@]} disks; refusing destructive write"
+    [[ -z "${DISK:-}" || "$DISK" == "${matches[0]}" ]] || info "Target disk path changed: $DISK -> ${matches[0]}"
     DISK="${matches[0]}"
 }
 
@@ -600,7 +567,7 @@ unmount_target_disk_filesystems() {
     fi
 
     d="${disk#/dev/}"
-    while read -r dev _ mnt _; do
+    while read -r dev mnt _; do
         case "$dev" in
             /dev/${d}p*|/dev/${d}s*|/dev/${d})
                 info "Unmounting target-disk filesystem: $dev from $mnt"
@@ -611,43 +578,20 @@ unmount_target_disk_filesystems() {
 }
 
 linux_source_to_disk() {
-    local src="$1" name pkname typ
-    [[ -n "$src" ]] || return 1
+    local src="${1%%\[*}" name typ
+    local disks=()
     [[ -b "$src" ]] || return 1
-
-    if command -v lsblk >/dev/null 2>&1; then
-        pkname=$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1 || true)
-        if [[ -n "$pkname" ]]; then
-            echo "/dev/$pkname"
-            return 0
-        fi
-
-        typ=$(lsblk -ndo TYPE "$src" 2>/dev/null | head -n1 || true)
-        name=$(lsblk -ndo NAME "$src" 2>/dev/null | head -n1 || true)
-        if [[ "$typ" == "disk" && -n "$name" ]]; then
-            echo "/dev/$name"
-            return 0
-        fi
-    fi
-
-    case "$src" in
-        /dev/nvme*n*p[0-9]*|/dev/mmcblk*p[0-9]*)
-            echo "${src%p*}"
-            return 0
-            ;;
-        /dev/sd[a-z][0-9]*|/dev/vd[a-z][0-9]*|/dev/xvd[a-z][0-9]*)
-            echo "${src%%[0-9]*}"
-            return 0
-            ;;
-    esac
-
-    return 1
+    while read -r name typ; do
+        [[ "$typ" == disk ]] && disks+=("$name")
+    done < <(lsblk -s -l -n -p -o NAME,TYPE "$src" 2>/dev/null | awk '!seen[$1]++')
+    ((${#disks[@]} == 1)) || return 1
+    printf '%s\n' "${disks[0]}"
 }
 
 linux_find_mount_source() {
     local mnt="$1"
     if command -v findmnt >/dev/null 2>&1; then
-        findmnt -n -o SOURCE --target "$mnt" 2>/dev/null | head -n1 || true
+        findmnt -n -o SOURCE --mountpoint "$mnt" 2>/dev/null | head -n1 || true
     fi
 }
 
@@ -754,25 +698,6 @@ print_disk_candidates() {
     echo "Recommended disk: $AUTO_DETECTED_DISK"
     echo "Reason: $AUTO_DETECT_REASON"
     echo
-}
-
-confirm_auto_detected_disk_host() {
-    [[ "$DISK_AUTO_SELECTED" -eq 1 ]] || return 0
-    print_disk_candidates
-    while :; do
-        read -r -p "Use recommended disk '$AUTO_DETECTED_DISK'? [yes/no]: " ans
-        case "$ans" in
-            y|Y|yes|YES|Yes)
-                return 0
-                ;;
-            n|N|no|NO|No)
-                error "Auto-detected disk was not accepted. Please rerun with --disk /dev/XXX"
-                ;;
-            *)
-                echo "Please type yes or no."
-                ;;
-        esac
-    done
 }
 
 candidate_add() {
@@ -913,67 +838,27 @@ run_post_install_hook() {
 }
 
 parse_ssh_key() {
-    local val="$1"
-    local val_lower key_url tmpfile ssh_key
-
-    ssh_key_error_and_exit() {
-        error "$1
-Available options:
-  --ssh-key \"ssh-rsa ...\"
-  --ssh-key \"ssh-ed25519 ...\"
-  --ssh-key \"ecdsa-sha2-nistp(256|384|521) ...\"
-  --ssh-key github:your_username
-  --ssh-key gitlab:your_username
-  --ssh-key http://path/to/public_key
-  --ssh-key https://path/to/public_key
-  --ssh-key /path/to/public_key
-  --ssh-key C:\\path\\to\\public_key (not supported directly, copy to a local path first)"
-    }
-
-    is_valid_ssh_key() {
-        grep -qE '^(ecdsa-sha2-nistp(256|384|521)|ssh-(ed25519|rsa)) ' <<<"$1"
-    }
-
-    val_lower=$(to_lower "$val")
-
-    case "$val_lower" in
-        github:*|gitlab:*|http://*|https://*)
-            if [[ "$val_lower" == http* ]]; then
-                key_url="$val"
-            else
-                local site user extra
-                IFS=: read -r site user extra <<<"$val"
-                [[ -n "$user" ]] || ssh_key_error_and_exit "Need a username for $site"
-                site=$(to_lower "$site")
-                key_url="https://$site.com/$user.keys"
-            fi
-            info "Downloading SSH key from: $key_url"
-            tmpfile=$(mktemp /tmp/reinstall-sshkey.XXXXXX)
-            if ! http_download "$key_url" "$tmpfile"; then
-                rm -f "$tmpfile"
-                ssh_key_error_and_exit "Failed to download SSH key from $key_url"
-            fi
-            ssh_key=$(grep -m1 -E '^(ecdsa-sha2-nistp(256|384|521)|ssh-(ed25519|rsa)) ' "$tmpfile" || true)
-            rm -f "$tmpfile"
-            [[ -n "$ssh_key" ]] || ssh_key_error_and_exit "No valid SSH key found in $key_url"
-            ;;
-        *)
-            if [[ "$val" =~ ^[A-Za-z]:\\ ]]; then
-                ssh_key_error_and_exit "Windows path is not supported, please copy the key file to local filesystem and use /path/to/public_key"
-            fi
-            if is_valid_ssh_key "$val"; then
-                ssh_key="$val"
-            else
-                if [[ ! -f "$val" ]]; then
-                    ssh_key_error_and_exit "SSH key/file/url \"$val\" is invalid (file not found)"
-                fi
-                ssh_key=$(grep -m1 -E '^(ecdsa-sha2-nistp(256|384|521)|ssh-(ed25519|rsa)) ' "$val" || true)
-                [[ -n "$ssh_key" ]] || ssh_key_error_and_exit "No valid SSH key found in file: $val"
-            fi
-            ;;
+    local val="$1" url="" text=""
+    case "$(to_lower "$val")" in
+        github:*|gitlab:*)
+            local site user
+            site="${val%%:*}"; user="${val#*:}"
+            [[ "$user" =~ ^[A-Za-z0-9_-]+$ ]] || error "Invalid public-key username"
+            url="https://${site,,}.com/${user}.keys" ;;
+        https://*) url="$val" ;;
+        http://*) error "SSH key URLs must use HTTPS" ;;
     esac
-
-    echo "$ssh_key"
+    if [[ -n "$url" ]]; then
+        text=$(http_download_stdout "$url") || error "Unable to download public keys"
+    elif [[ -f "$val" ]]; then
+        text=$(cat -- "$val")
+    else
+        text="$val"
+    fi
+    local filtered
+    filtered=$(printf '%s\n' "$text" | tr -d '\r' | grep -E '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh.com) [A-Za-z0-9+/=]+([[:space:]].*)?$' || true)
+    [[ -n "$filtered" ]] || error "No supported SSH public key in input"
+    printf '%s\n' "$filtered"
 }
 
 get_default_image_url() {
@@ -1002,7 +887,10 @@ get_default_image_url() {
 emit_ssh_keys() {
     local indent="$1" key
     while IFS= read -r key; do
-        [[ -n "$key" ]] && printf '%s- %s\n' "$indent" "$key"
+        [[ -n "$key" ]] || continue
+        key=${key//\\/\\\\}
+        key=${key//\"/\\\"}
+        printf '%s- "%s"\n' "$indent" "$key"
     done <<<"$SSH_KEYS_ALL"
 }
 
@@ -1076,47 +964,86 @@ EOF
 EOF
 }
 
-seed_runcmd_freebsd() {
-    cat <<EOF
-  - |
-      awk '
-        /^[[:space:]]*PermitRootLogin[[:space:]]+/ { next }
-        /^[[:space:]]*PasswordAuthentication[[:space:]]+/ { next }
-        { print }
-        END {
-          if ("${PASSWORD_HASH}" != "") {
-            print "PermitRootLogin yes"
-            print "PasswordAuthentication yes"
-          } else {
-            print "PermitRootLogin prohibit-password"
-            print "PasswordAuthentication no"
-          }
-        }
-      ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
-      cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
-      rm -f /tmp/sshd_config.reinstall
-      service sshd restart 2>/dev/null || true
-EOF
-}
-
 seed_runcmd_ssh_port() {
-    [[ -n "$SSH_PORT" ]] || return 0
+    [[ "$1" == "freebsd" || -n "$PASSWORD_HASH" || -n "$SSH_PORT" ]] || return 0
+    local permit="prohibit-password" auth="no" port="${SSH_PORT:-22}"
+    [[ -z "$PASSWORD_HASH" ]] || { permit="yes"; auth="yes"; }
     cat <<EOF
   - |
+      (
+      cfg=/etc/ssh/sshd_config
+      tmp= backup= backup_ready=0 selinux_added=0 firewall_added=0 ufw_added=0 socket_override=
+      ddify_rollback() {
+          rc=\$?
+          if [ "\$rc" -ne 0 ]; then
+              [ "\$backup_ready" = 0 ] || cat "\$backup" > "\$cfg"
+              if [ -n "\$socket_override" ]; then
+                  rm -f "\$socket_override"
+                  systemctl daemon-reload && systemctl restart ssh.socket || true
+              fi
+              [ "\$selinux_added" = 0 ] || semanage port -d -p tcp $port 2>/dev/null || true
+              if [ "\$firewall_added" = 1 ]; then
+                  firewall-cmd --permanent --remove-port=$port/tcp >/dev/null 2>&1 || true
+                  firewall-cmd --reload >/dev/null 2>&1 || true
+              fi
+              [ "\$ufw_added" = 0 ] || ufw --force delete allow $port/tcp >/dev/null 2>&1 || true
+              (systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart) >/dev/null 2>&1 || true
+          fi
+          [ -z "\$tmp" ] || rm -f "\$tmp"
+          [ -z "\$backup" ] || rm -f "\$backup"
+      }
+      trap ddify_rollback EXIT
+      [ -f "\$cfg" ] || exit 1
+      backup=\$(mktemp) || exit 1
+      cp "\$cfg" "\$backup" || exit 1
+      backup_ready=1
+      tmp=\$(mktemp) || exit 1
       awk '
-        /^[[:space:]]*Port[[:space:]]+/ { next }
-        { print }
-        END { print "Port ${SSH_PORT}" }
-      ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
-      cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
-      rm -f /tmp/sshd_config.reinstall
-      if command -v semanage >/dev/null 2>&1; then
-        semanage port -a -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || \
-        semanage port -m -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || true
+          BEGIN { print "PermitRootLogin $permit"; print "PasswordAuthentication $auth"; print "PubkeyAuthentication yes"; print "Port $port" }
+          /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|Port)[[:space:]]+/ { next }
+          { print }
+      ' "\$cfg" > "\$tmp" || exit 1
+      if [ "$port" != 22 ] && command -v getenforce >/dev/null 2>&1 && [ "\$(getenforce)" = Enforcing ]; then
+          if ! command -v semanage >/dev/null 2>&1; then
+              (dnf install -y policycoreutils-python-utils || yum install -y policycoreutils-python-utils) >/dev/null 2>&1 || exit 1
+          fi
+          if semanage port -a -t ssh_port_t -p tcp $port 2>/dev/null; then
+              selinux_added=1
+          else
+              semanage port -l | awk -v p="$port" '\$1=="ssh_port_t" && \$2=="tcp" {for(i=3;i<=NF;i++){gsub(",","",\$i);if(\$i==p) found=1}} END {exit !found}' || exit 1
+          fi
       fi
-      sshd -t 2>/dev/null || true
-      systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || \
-      service sshd restart 2>/dev/null || service ssh restart 2>/dev/null || true
+      if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+          if ! firewall-cmd --permanent --query-port=$port/tcp >/dev/null 2>&1; then
+              firewall-cmd --permanent --add-port=$port/tcp || exit 1
+              firewall_added=1
+          fi
+          firewall-cmd --reload || exit 1
+      fi
+      if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+          if ! ufw status | grep -Eq "^[[:space:]]*$port/tcp([[:space:]]|\$)"; then
+              ufw allow $port/tcp || exit 1
+              ufw_added=1
+          fi
+      fi
+      ddify_restart_ssh() {
+          if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ssh.socket; then
+              systemctl daemon-reload && systemctl restart ssh.socket || return 1
+              if [ "$port" != 22 ] && ! systemctl show -p Listen --value ssh.socket | tr ' ' '\n' | grep -Eq ":${port}\$"; then
+                  socket_path=/etc/systemd/system/ssh.socket.d/90-ddify-port.conf
+                  [ ! -e "\$socket_path" ] && [ ! -L "\$socket_path" ] || return 1
+                  socket_override=\$socket_path
+                  mkdir -p /etc/systemd/system/ssh.socket.d || return 1
+                  printf '[Socket]\nListenStream=\nListenStream=%s\n' "$port" > "\$socket_override" || return 1
+                  systemctl daemon-reload && systemctl restart ssh.socket || return 1
+                  systemctl show -p Listen --value ssh.socket | tr ' ' '\n' | grep -Eq ":${port}\$" || return 1
+              fi
+              return 0
+          fi
+          systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart
+      }
+      sshd -t -f "\$tmp" && cat "\$tmp" > "\$cfg" && sshd -t && ddify_restart_ssh || exit 1
+      ) || echo "DDify: SSH configuration failed; check cloud-init logs" >&2
 EOF
 }
 
@@ -1130,40 +1057,93 @@ EOF
 
 
 seed_runcmd_cleanup_cidata() {
-    [[ "$1" == "linux" ]] || return 0
+    local os="$1" partuuid="${2:-}"
+    [[ "$os" != "freebsd" ]] || return 0
+    [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
+        error "Missing/invalid CIDATA PARTUUID for Linux cloud-init cleanup"
+
+    printf '  - |\n      ddify_cidata_partuuid="%s"\n' "$partuuid"
     cat <<'EOF'
-  - |
-      # CIDATA is only an installation seed. Remove it after cloud-init has consumed it.
-      if command -v sgdisk >/dev/null 2>&1; then
-          disk="$(findmnt -n -o SOURCE / | sed -E 's/p?[0-9]+$//' 2>/dev/null || true)"
-          if [ -b "$disk" ]; then
-              cidata="$(lsblk -lnpo NAME,PARTLABEL "$disk" 2>/dev/null | awk '$2=="CIDATA" {print $1; exit}')"
-              if [ -n "$cidata" ]; then
-                  partnum="$(lsblk -no PARTN "$cidata" 2>/dev/null || true)"
-                  if [ -n "$partnum" ]; then
-                      sgdisk -d "$partnum" "$disk" >/dev/null 2>&1 || true
-                      sgdisk -e "$disk" >/dev/null 2>&1 || true
-                  fi
+      ddify_wipe_cidata() {
+          command -v blockdev >/dev/null 2>&1 || return 1
+          size=$(blockdev --getsize64 "$cidata" 2>/dev/null) || return 1
+          case "$size" in ''|*[!0-9]*) return 1 ;; esac
+          [ "$size" -gt 0 ] || return 1
+          dd if=/dev/zero of="$cidata" bs=1M iflag=count_bytes count="$size" conv=fsync status=none 2>/dev/null
+      }
+      # Confirm the seed's unique GPT identity both in the kernel and on disk.
+      if command -v lsblk >/dev/null 2>&1 && command -v blkid >/dev/null 2>&1 && command -v findmnt >/dev/null 2>&1; then
+          cidata="$(lsblk -p -r -n -o NAME,PARTUUID 2>/dev/null | awk -v id="$ddify_cidata_partuuid" '
+              toupper($2) == toupper(id) { count++; path=$1 }
+              END { if (count == 1) print path }
+          ')"
+          if [ -n "$cidata" ] && [ -b "$cidata" ]; then
+              part_kind="$(lsblk -d -n -r -o TYPE "$cidata" 2>/dev/null)"
+              part_label="$(lsblk -d -n -r -o PARTLABEL "$cidata" 2>/dev/null)"
+              fs_type="$(blkid -s TYPE -o value "$cidata" 2>/dev/null)"
+              fs_label="$(blkid -s LABEL -o value "$cidata" 2>/dev/null)"
+              partnum="$(lsblk -d -n -r -o PARTN "$cidata" 2>/dev/null)"
+              parent="$(lsblk -d -n -r -o PKNAME "$cidata" 2>/dev/null)"
+              disk="/dev/$parent"
+              if [ "$part_kind" = part ] && [ "$part_label" = CIDATA ] && \
+                 [ "$fs_type" = vfat ] && [ "$fs_label" = CIDATA ] && \
+                 [ -n "$parent" ] && [ -b "$disk" ] && \
+                 [ "$(lsblk -d -n -r -o TYPE "$disk" 2>/dev/null)" = disk ]; then
+                  case "$partnum" in
+                      ''|0|*[!0-9]*) echo "DDify: invalid CIDATA partition number; leaving seed intact" >&2 ;;
+                      *)
+                          if findmnt -r -n -S "$cidata" >/dev/null 2>&1; then
+                              echo "DDify: CIDATA is mounted; skipping cleanup" >&2
+                          elif command -v sfdisk >/dev/null 2>&1; then
+                              ondisk_uuid="$(sfdisk --part-uuid "$disk" "$partnum" 2>/dev/null || true)"
+                              if [ "$(printf '%s' "$ondisk_uuid" | tr 'A-F' 'a-f')" != "$(printf '%s' "$ddify_cidata_partuuid" | tr 'A-F' 'a-f')" ]; then
+                                  echo "DDify: on-disk GPT PARTUUID differs from CIDATA; refusing cleanup" >&2
+                               elif ! ddify_wipe_cidata; then
+                                   echo "DDify: CIDATA wipe failed; partition retained" >&2
+                               elif sfdisk --lock=yes --no-reread --no-tell-kernel --delete "$disk" "$partnum" >/dev/null; then
+                                  echo "DDify: removed temporary CIDATA GPT entry on $disk (partition $partnum)"
+                              else
+                                  echo "DDify: sfdisk failed; CIDATA retained" >&2
+                              fi
+                          elif command -v sgdisk >/dev/null 2>&1; then
+                              ondisk_uuid="$(sgdisk -i "$partnum" "$disk" 2>/dev/null | awk '/Partition unique GUID:/ {print $4; exit}')"
+                              if [ "$(printf '%s' "$ondisk_uuid" | tr 'A-F' 'a-f')" != "$(printf '%s' "$ddify_cidata_partuuid" | tr 'A-F' 'a-f')" ]; then
+                                  echo "DDify: on-disk GPT PARTUUID differs from CIDATA; refusing cleanup" >&2
+                               elif ! ddify_wipe_cidata; then
+                                   echo "DDify: CIDATA wipe failed; partition retained" >&2
+                               elif sgdisk -d "$partnum" "$disk" >/dev/null; then
+                                  echo "DDify: removed temporary CIDATA GPT entry on $disk (partition $partnum)"
+                              else
+                                  echo "DDify: sgdisk failed; CIDATA retained" >&2
+                              fi
+                          else
+                              echo "DDify: sfdisk/sgdisk unavailable; CIDATA retained" >&2
+                          fi
+                          ;;
+                  esac
+              else
+                  echo "DDify: CIDATA partition metadata mismatch; refusing cleanup" >&2
               fi
+          else
+              echo "DDify: no unique matching CIDATA PARTUUID; refusing cleanup" >&2
           fi
+      else
+          echo "DDify: lsblk/blkid/findmnt unavailable; CIDATA retained" >&2
       fi
 EOF
 }
-
 seed_runcmd() {
-    local os="$1" frpc_b64="$2"
-    [[ "$os" == "freebsd" || -n "$SSH_PORT" || -n "$frpc_b64" ]] || return 0
+    local os="$1" frpc_b64="$2" cidata_partuuid="${3:-}"
 
     echo
     echo "runcmd:"
-    [[ "$os" != "freebsd" ]] || seed_runcmd_freebsd
-    seed_runcmd_ssh_port
+    seed_runcmd_ssh_port "$os"
     seed_runcmd_frpc "$frpc_b64"
-    seed_runcmd_cleanup_cidata "$os"
+    seed_runcmd_cleanup_cidata "$os" "$cidata_partuuid"
 }
 
 write_nocloud_seed() {
-    local os="$1" meta="$2" user="$3" frpc_b64=""
+    local os="$1" meta="$2" user="$3" cidata_partuuid="${4:-}" frpc_b64=""
 
     mkdir -p "$(dirname "$meta")"
     cat >"$meta" <<EOF
@@ -1181,7 +1161,7 @@ EOF
             *)       seed_account_linux ;;
         esac
         seed_write_files "$frpc_b64"
-        seed_runcmd "$os" "$frpc_b64"
+        seed_runcmd "$os" "$frpc_b64" "$cidata_partuuid"
     } >"$user"
 }
 
@@ -1227,7 +1207,7 @@ find_efi_for_plan() {
     if [[ "$os" == "Linux" ]]; then
         if command -v findmnt >/dev/null 2>&1; then
             local mounted_src
-            mounted_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+            mounted_src=$(findmnt -n -o SOURCE --mountpoint /boot/efi 2>/dev/null | head -n1 || true)
             if [[ -n "$mounted_src" && -b "$mounted_src" ]]; then
                 echo "$mounted_src"
                 return 0
@@ -1246,9 +1226,8 @@ find_efi_for_plan() {
                 partflags=$(lsblk_get_kv "$line" "PARTFLAGS")
 
                 [[ "$type" == "part" ]] || continue
-                if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] ||
-                   echo "${partlabel:-}" | grep -qiE 'efi|esp' ||
-                   { [[ "$fstype" == "vfat" ]] && echo "${partflags:-}" | grep -qi 'boot,esp'; }; then
+                if [[ "${parttype,,}" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" && "$fstype" == "vfat" ]] && \
+                   [[ "$(linux_source_to_disk "$path" || true)" == "$DISK" ]]; then
                     if [[ -n "$path" ]]; then
                         echo "$path"
                     else
@@ -1317,7 +1296,7 @@ mount_efi_for_plan() {
         if [[ -d /boot/efi ]] && is_mountpoint /boot/efi; then
             EFI_MOUNT_POINT="/boot/efi"
             PLAN_STORAGE_MODE="efi"
-            PLAN_EFI_PART=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+            PLAN_EFI_PART=$(findmnt -n -o SOURCE --mountpoint /boot/efi 2>/dev/null | head -n1 || true)
         else
             local efi_part
             efi_part=$(find_efi_for_plan 2>/dev/null || true)
@@ -1334,9 +1313,9 @@ mount_efi_for_plan() {
                 EFI_MOUNT_POINT="/boot"
                 PLAN_STORAGE_MODE="boot"
                 if is_mountpoint /boot; then
-                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target /boot 2>/dev/null | head -n1 || true)
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --mountpoint /boot 2>/dev/null | head -n1 || true)
                 else
-                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target / 2>/dev/null | head -n1 || true)
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null | head -n1 || true)
                 fi
             fi
         fi
@@ -1380,6 +1359,7 @@ write_install_plan() {
         printf 'DISK_ID_SERIAL=%q\n' "${DISK_ID_SERIAL:-}"
         printf 'DISK_ID_SIZE=%q\n' "${DISK_ID_SIZE:-}"
         printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
+        printf 'DISK_ID_PTUUID=%q\n' "${DISK_ID_PTUUID:-}"
         printf 'IMG_URL=%q\n' "$IMG_URL"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
         printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
@@ -1515,7 +1495,7 @@ download_alpine_ram_files() {
     sync
 
     local free_kb
-    free_kb=$(df -k "$ALPINE_BOOT_DIR_ABS" 2>/dev/null | awk 'NR==2 {print $4; exit}')
+    free_kb=$(df -Pk "$ALPINE_BOOT_DIR_ABS" 2>/dev/null | awk 'NR==2 {print $4; exit}')
     if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < 22528 )); then
         rm -rf "$tmpdir"
         error "Bootstrap filesystem has only ${free_kb} KiB free after removing stale modloop; at least 22 MiB is required for Alpine kernel/initramfs and bootstrap files"
@@ -1551,6 +1531,7 @@ build_alpine_apkovl() {
 
     mkdir -p "$ovl_dir/etc/apk" "$ovl_dir/etc/reinstall" "$ovl_dir/usr/local/sbin"
     : >"$ovl_dir/etc/.default_boot_services"
+    printf 'DDIFY_ALPINE_REPO=%s\n' "$ALPINE_REPO_BASE" >"$ovl_dir/etc/reinstall/alpine-repo.conf"
 
     cat >"$ovl_dir/etc/apk/repositories" <<EOF
 ${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}
@@ -1613,7 +1594,7 @@ is_mountpoint() {
 ensure_network() {
     local n
 
-    if ip route 2>/dev/null | grep -q '^default '; then
+    if ip route 2>/dev/null | grep -q '^default ' || ip -6 route 2>/dev/null | grep -q '^default '; then
         echo "Network already configured by Alpine initramfs."
         return 0
     fi
@@ -1631,25 +1612,27 @@ ensure_network() {
         fi
     done
 
-    ip route 2>/dev/null | grep -q '^default ' || {
+    { ip route 2>/dev/null | grep -q '^default ' || ip -6 route 2>/dev/null | grep -q '^default '; } || {
         echo "Failed to obtain a default route in Alpine RAM."
         exit 1
     }
 }
 
 install_runtime_deps_online() {
+    . /etc/reinstall/alpine-repo.conf
     cat > /etc/apk/repositories <<REPOEOF
-https://dl-cdn.alpinelinux.org/alpine/v3.22/main
-https://dl-cdn.alpinelinux.org/alpine/v3.22/community
+${DDIFY_ALPINE_REPO}/main
+${DDIFY_ALPINE_REPO}/community
 REPOEOF
 
     echo "[stage] apk update (online)"
     apk update
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
-        bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
+        bash curl wget ca-certificates xz qemu-img util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
         e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
     update-ca-certificates 2>/dev/null || true
+    blkid -V 2>&1 | grep -qi util-linux || { echo "Full util-linux blkid is required" >&2; exit 1; }
 
     # Fail here with a precise message instead of reaching the destructive stage
     for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
@@ -1881,9 +1864,11 @@ main() {
 
     echo "[stage] launch installer"
     echo "Launching installer phase..."
-    bash "$RUN_SCRIPT" --phase installer --yes
-
-    rc=$?
+    if bash "$RUN_SCRIPT" --phase installer --yes; then
+        rc=0
+    else
+        rc=$?
+    fi
     echo "Installer phase finished with rc=$rc"
 
     if [ "$rc" -eq 0 ]; then
@@ -1957,12 +1942,14 @@ menuentry '${ALPINE_ENTRY_TITLE}' {
 }
 EOF
     else
+        local grub_boot_prefix="/boot"
+        is_mountpoint /boot && grub_boot_prefix=""
         cat >"$GRUB_SCRIPT_PATH" <<EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
-    initrd /boot${ALPINE_INITRAMFS_REL}
+    linux ${grub_boot_prefix}${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
+    initrd ${grub_boot_prefix}${ALPINE_INITRAMFS_REL}
 }
 EOF
     fi
@@ -2101,6 +2088,14 @@ install_freebsd_bootnext_entry() {
 
 prepare_and_boot_alpine_ram() {
     prepare_alpine_paths
+    local boot_disk
+    if [[ "$OS" == Linux ]]; then
+        boot_disk=$(linux_source_to_disk "$PLAN_EFI_PART" || true)
+    else
+        boot_disk=$(freebsd_provider_to_disk "$PLAN_EFI_PART" || true)
+    fi
+    [[ -n "$boot_disk" && "$boot_disk" == "$DISK" ]] || \
+        error "Bootstrap partition is not on target disk $DISK; refusing unsafe cross-disk install"
     download_alpine_ram_files
     build_alpine_apkovl
 
@@ -2172,6 +2167,10 @@ create_nocloud_cidata_partition() {
         error "Target image does not expose a usable GPT; refusing non-standard EFI:/nocloud injection"
     fi
 
+    local existing_cidata seed_part seed_matches=()
+    existing_cidata=$(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk '$2=="CIDATA" {print $1}')
+    [[ -z "$existing_cidata" ]] || error "Image already contains a CIDATA partition; refusing to format an ambiguous seed: $existing_cidata"
+
     info "Creating temporary 16 MiB NoCloud CIDATA seed partition..."
     sgdisk -e "$DISK" >/dev/null || error "Failed to relocate GPT backup header on $DISK"
     sgdisk -n 0:0:+16M -t 0:0700 -c 0:CIDATA "$DISK" >/dev/null || \
@@ -2179,10 +2178,11 @@ create_nocloud_cidata_partition() {
     reread_partition_table_strict
     sleep 1
 
-    local seed_part
-    seed_part=$(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk '$2=="CIDATA" {print $1; exit}')
-    [[ -n "$seed_part" && -b "$seed_part" ]] || error "Could not locate newly created CIDATA partition"
-    mkfs.vfat -F 32 -n CIDATA "$seed_part" >/dev/null || error "Failed to format CIDATA partition: $seed_part"
+    mapfile -t seed_matches < <(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk '$2=="CIDATA" {print $1}')
+    ((${#seed_matches[@]} == 1)) || error "Expected exactly one newly created CIDATA partition; found ${#seed_matches[@]}"
+    seed_part="${seed_matches[0]}"
+    [[ -b "$seed_part" ]] || error "New CIDATA partition is not a block device: $seed_part"
+    mkfs.vfat -F 16 -n CIDATA "$seed_part" >/dev/null || error "Failed to format CIDATA partition: $seed_part"
     printf '%s\n' "$seed_part"
 }
 
@@ -2195,6 +2195,7 @@ TEMP_STAGE_START_SECTOR=""
 TEMP_STAGE_START_BYTES=""
 TEMP_STAGE_SECTOR_SIZE=""
 QCOW_VIRTUAL_SIZE=""
+QCOW_GPT_GUID=""
 QCOW_MAX_PART_END_BYTES=""
 QCOW_MAX_PART_END_SECTOR=""
 QCOW_PARTITION_CROSSES_STAGE=0
@@ -2280,17 +2281,6 @@ read_stage_geometry() {
     TEMP_STAGE_LAST_SECTOR="$last"
 }
 
-invalidate_staging_backup_gpt() {
-    local disk_bytes total tail
-    disk_bytes=$(blockdev --getsize64 "$DISK")
-    total=$((disk_bytes / TEMP_STAGE_SECTOR_SIZE))
-    tail=$((total - 34))
-    (( tail <= TEMP_STAGE_LAST_SECTOR )) && return
-    dd if=/dev/zero of="$DISK" bs="$TEMP_STAGE_SECTOR_SIZE" seek="$tail" count=34 conv=notrunc status=none || \
-        error "Failed to invalidate temporary backup GPT"
-    sync
-}
-
 prepare_fixed_temp_staging_partition() {
     local disk_size min_remaining=$((2 * 1024 * 1024 * 1024))
     [[ "$OS" == Linux ]] || error "Staging requires Alpine/Linux"
@@ -2305,7 +2295,6 @@ prepare_fixed_temp_staging_partition() {
     mkfs.ext4 -F -m 0 -L "$TEMP_STAGE_LABEL" "$TEMP_STAGE_PART" >/dev/null || error "Failed to format staging partition"
     mkdir -p "$TEMP_STAGE_MNT"
     mount -t ext4 -o noatime "$TEMP_STAGE_PART" "$TEMP_STAGE_MNT" || error "Failed to mount staging partition"
-    invalidate_staging_backup_gpt
 
     info "Staging: $TEMP_STAGE_PART mounted at $TEMP_STAGE_MNT"
     info "Staging boundary: ${TEMP_STAGE_START_BYTES} bytes"
@@ -2364,9 +2353,14 @@ inspect_qcow_partition_layout() {
         error "Target qcow2 does not expose a usable GPT; cannot safely use an in-disk staging partition"
     fi
 
+    QCOW_GPT_GUID=$(printf '%s\n' "$table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
+    [[ "$QCOW_GPT_GUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
+        error "Target image has no valid GPT disk GUID"
+
     sector_size=$(blockdev --getss "$nbd" 2>/dev/null || true)
     [[ "$sector_size" =~ ^[0-9]+$ && "$sector_size" -gt 0 ]] || \
         error "Could not determine qcow2 logical sector size"
+    [[ "$sector_size" == "$(blockdev --getss "$DISK")" ]] || error "Image/target logical sector-size mismatch"
 
     max_end=$(printf '%s\n' "$table" | awk '
         /^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ {
@@ -2437,7 +2431,7 @@ download_target_image_in_alpine() {
         }
     fi
 
-    qemu-img info "$tmp" >/dev/null 2>&1 || {
+    [[ "$(qemu-img info --output=json "$tmp" 2>/dev/null | sed -n 's/^[[:space:]]*"format"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" == qcow2 ]] || {
         rm -f "$tmp"
         error "Downloaded target image is not a readable qcow2 image"
     }
@@ -2598,7 +2592,13 @@ prepare_sparse_shadow_for_target() {
     disk_bytes=$(get_disk_size_bytes "$DISK")
     total=$((disk_bytes / sector))
     reserve=$(((32 * 1024 * 1024 + sector - 1) / sector))
-    target_end=$((total - 34 - reserve))
+    local image_sectors last_usable gpt_tail
+    image_sectors=$(($(blockdev --getsize64 "$nbd") / sector))
+    last_usable=$(sgdisk -p "$nbd" | awk '/last usable sector is/ {print $NF; exit}')
+    [[ "$last_usable" =~ ^[0-9]+$ ]] || error "Cannot determine GPT last usable sector"
+    gpt_tail=$((image_sectors - last_usable))
+    (( gpt_tail >= 2 && gpt_tail <= 1024 )) || error "Invalid source GPT tail geometry"
+    target_end=$((total - gpt_tail - reserve))
     (( target_end > 2048 )) || error "Target disk is too small for GPT + CIDATA"
 
     shadow_last_partition "$nbd"
@@ -2810,7 +2810,7 @@ installer_stage_optional_inputs() {
 confirm_destructive_write() {
     echo
     echo "WARNING: $DISK will be repartitioned. ALL DATA WILL BE LOST."
-    [[ "$AUTO_YES" == 1 ]] && return 0
+    [[ "$AUTO_YES" == 1 ]] && [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}" ]] && return 0
     read -r -p "Type yes to continue: " ans
     case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
 }
@@ -2827,18 +2827,29 @@ installer_write_image() {
 
     [[ "${TEMP_STAGE_RELEASED:-0}" == 1 ]] || release_temp_staging_partition
     sync
+    local written_table written_guid
+    written_table=$(sgdisk -p "$DISK" 2>&1) || error "Target GPT unreadable after image write: $written_table"
+    written_guid=$(printf '%s\n' "$written_table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
+    [[ "${written_guid,,}" == "${QCOW_GPT_GUID,,}" ]] || \
+        error "Target GPT identity differs from verified image; refusing backup GPT repair"
+    [[ "$written_table" != *REINSTALL_TMP* ]] || error "Staging GPT survived image write; refusing GPT repair"
     sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT"
     grow_last_partition_reserving_cidata
 }
 
 installer_write_seed() {
-    local part mnt="$INSTALL_TMPDIR/cidata"
+    local part partuuid mnt="$INSTALL_TMPDIR/cidata"
     part=$(create_nocloud_cidata_partition)
+    partuuid=$(lsblk -d -n -r -o PARTUUID "$part" 2>/dev/null | head -n1)
+    if [[ "$TARGET_OS" != "freebsd" ]]; then
+        [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
+            error "Failed to read newly created CIDATA PARTUUID"
+    fi
     mkdir -p "$mnt"
     mount -t vfat "$part" "$mnt" || error "Failed to mount CIDATA partition $part"
 
     [[ -n "$FRPC_TOML" && -f "$FRPC_TOML" ]] && FRPC_PRESENT=1 || FRPC_PRESENT=""
-    write_nocloud_seed "$TARGET_OS" "$mnt/meta-data" "$mnt/user-data"
+    write_nocloud_seed "$TARGET_OS" "$mnt/meta-data" "$mnt/user-data" "$partuuid"
     sync
     umount "$mnt" || error "Failed to unmount CIDATA"
 }
@@ -2909,7 +2920,7 @@ parse_target() {
     [[ "$TARGET_OS" != redhat ]] || { PARSE_SHIFT=0; return; }
     [[ $# -gt 0 && "$1" != --* ]] || error "Missing version for $TARGET_OS"
     TARGET_VER="$1"
-    grep -qw "$TARGET_VER" <<<"$(target_versions "$TARGET_OS")" || \
+    [[ -n "$TARGET_VER" ]] && tr ' ' '\n' <<<"$(target_versions "$TARGET_OS")" | grep -Fxq -- "$TARGET_VER" || \
         error "Unsupported $TARGET_OS version: $TARGET_VER (supported: $(target_versions "$TARGET_OS"))"
     PARSE_SHIFT=1
 }
@@ -2939,12 +2950,25 @@ parse_host_options() {
                     --hold) [[ "$1" == 1 || "$1" == 2 ]] || error "--hold must be 1 or 2"; HOLD="$1" ;;
                 esac
                 ;;
-            --disk=*) DISK="${1#*=}" ;;
-            --img=*) IMG_URL="${1#*=}" ;;
+            --*=*)
+                local opt="${1%%=*}" value="${1#*=}"
+                [[ -n "$value" ]] || error "Empty value: $opt"
+                set -- "$opt" "$value" "${@:2}"
+                continue ;;
             *) error "Unknown argument: $1" ;;
         esac
         shift
     done
+}
+
+ensure_supported_sector_size() {
+    local sector
+    if [[ "$OS" == Linux ]]; then
+        sector=$(blockdev --getss "$DISK" 2>/dev/null || true)
+    else
+        sector=$(diskinfo -v "$DISK" 2>/dev/null | awk '/# sectorsize/ {print $1; exit}')
+    fi
+    [[ "$sector" == 512 ]] || error "Unsupported logical sector size (${sector:-unknown}) on $DISK; aborting before disk modification"
 }
 
 prepare_target_disk() {
@@ -2952,10 +2976,11 @@ prepare_target_disk() {
         [[ "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
     else
         auto_detect_disk
-        confirm_auto_detected_disk_host
     fi
     validate_target_disk "$DISK"
+    ensure_supported_sector_size
     capture_target_disk_identity "$DISK"
+    resolve_target_disk_from_identity
 }
 
 prepare_credentials() {
@@ -3000,6 +3025,9 @@ print_host_summary() {
 host_main() {
     reset_config
     [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage
+    (( EUID == 0 )) || error "Must run as root"
+    [[ -f "$0" && -r "$0" && "$0" != /dev/fd/* && "$0" != /proc/*/fd/* ]] ||
+        error "Run from a local script file; piping or process substitution is unsupported"
 
     parse_target "$@"
     local skip=$((1 + PARSE_SHIFT))
@@ -3007,12 +3035,19 @@ host_main() {
     parse_host_options "$@"
 
     [[ "$TARGET_OS" != redhat || -n "$IMG_URL" ]] || error "redhat requires --img URL"
+    [[ "$IMG_URL" != http://* ]] || error "HTTP image URLs are not supported; use HTTPS"
     detect_os_arch
     [[ "$HOLD" == 1 ]] || ensure_dependencies
     prepare_target_disk
     prepare_credentials
     [[ -n "$IMG_URL" ]] || IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
     print_host_summary
+    [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
+    if [[ "$HOLD" != 1 ]]; then
+        local answer
+        read -r -p "Type ERASE ${DISK} to authorize reboot and destruction: " answer
+        [[ "$answer" == "ERASE $DISK" ]] || error "Destructive operation cancelled"
+    fi
 
     [[ "$HOLD" != 1 ]] || return 0
     PASSWORD_TO_DISPLAY=""
@@ -3035,14 +3070,17 @@ installer_main() {
     parse_installer_options "$@"
     local hold_override="$HOLD"
 
+    (( EUID == 0 )) || error "Must run as root"
     detect_os_arch
     load_install_plan
     [[ "$hold_override" == 0 ]] || HOLD="$hold_override"
     [[ "$HOLD" == 1 ]] || ensure_dependencies
 
     [[ -z "$DISK" || "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
-    [[ -n "$DISK" ]] && resolve_target_disk_from_identity || auto_detect_disk
+    [[ -n "$DISK" ]] || error "Install plan contains no target disk"
+    resolve_target_disk_from_identity
     validate_target_disk "$DISK"
+    ensure_supported_sector_size
     do_install
 }
 
