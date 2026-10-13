@@ -50,7 +50,7 @@ to_lower() {
 }
 
 is_port_valid() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
 http_download() {
@@ -833,7 +833,7 @@ run_post_install_hook() {
 
     info "Running explicit post-install hook: $POST_INSTALL_HOOK"
     if ! bash "$POST_INSTALL_HOOK"; then
-        warn "Post-install hook failed: $POST_INSTALL_HOOK"
+        error "Post-install hook failed: $POST_INSTALL_HOOK"
     fi
 }
 
@@ -899,8 +899,10 @@ seed_account_freebsd() {
     echo "ssh_pwauth: $([[ -n "$PASSWORD_HASH" ]] && echo true || echo false)"
 
     if [[ -n "$SSH_KEYS_ALL" ]]; then
-        echo "ssh_authorized_keys:"
-        emit_ssh_keys "  "
+        echo "users:"
+        echo "  - name: root"
+        echo "    ssh_authorized_keys:"
+        emit_ssh_keys "      "
     fi
 
     [[ -n "$PASSWORD_HASH" ]] || return 0
@@ -945,7 +947,8 @@ EOF
 }
 
 seed_write_files() {
-    local frpc_b64="$1"
+    local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml"
+    [[ "$os" != freebsd ]] || frpc_path="/etc/frpc.toml"
     [[ -n "$WEB_PORT" || -n "$frpc_b64" ]] || return 0
 
     echo
@@ -960,7 +963,7 @@ seed_write_files() {
 EOF
 
     [[ -z "$frpc_b64" ]] || cat <<EOF
-  - path: /etc/frp/frpc.toml
+  - path: ${frpc_path}
     permissions: '0600'
     owner: root:root
     encoding: b64
@@ -969,7 +972,7 @@ EOF
 }
 
 seed_runcmd_ssh_port() {
-    [[ "$1" == "freebsd" || -n "$PASSWORD_HASH" || -n "$SSH_PORT" ]] || return 0
+    [[ "$1" == "freebsd" || -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" || -n "$SSH_PORT" ]] || return 0
     local permit="prohibit-password" auth="no" port="${SSH_PORT:-22}"
     [[ -z "$PASSWORD_HASH" ]] || { permit="yes"; auth="yes"; }
     cat <<EOF
@@ -1091,10 +1094,12 @@ EOF
 }
 
 seed_runcmd_frpc() {
-    [[ -n "$1" ]] || return 0
-    cat <<'EOF'
+    local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml"
+    [[ -n "$frpc_b64" ]] || return 0
+    [[ "$os" != freebsd ]] || frpc_path="/etc/frpc.toml"
+    cat <<EOF
   - |
-      (frpc -c /etc/frp/frpc.toml || /usr/local/bin/frpc -c /etc/frp/frpc.toml || true) &
+      (frpc -c ${frpc_path} || /usr/local/bin/frpc -c ${frpc_path} || true) &
 EOF
 }
 
@@ -1228,12 +1233,15 @@ seed_runcmd() {
     echo "runcmd:"
     seed_runcmd_ssh_port "$os"
     seed_runcmd_expand_root "$os"
-    seed_runcmd_frpc "$frpc_b64"
-    seed_runcmd_cleanup_cidata "$os" "$cidata_partuuid"
+    seed_runcmd_frpc "$os" "$frpc_b64"
     cat <<'EOF'
   - |
-      [ "${ddify_ssh_failed:-0}" = 0 ] || exit 1
+      [ "${ddify_ssh_failed:-0}" = 0 ] || {
+          echo "DDify: SSH setup failed; CIDATA retained for recovery" >&2
+          exit 1
+      }
 EOF
+    seed_runcmd_cleanup_cidata "$os" "$cidata_partuuid"
 }
 
 write_nocloud_seed() {
@@ -1254,7 +1262,7 @@ EOF
             freebsd) seed_account_freebsd ;;
             *)       seed_account_linux ;;
         esac
-        seed_write_files "$frpc_b64"
+        seed_write_files "$os" "$frpc_b64"
         seed_runcmd "$os" "$frpc_b64" "$cidata_partuuid"
     } >"$user"
 }
@@ -1575,6 +1583,9 @@ prepare_alpine_paths() {
     ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$ALPINE_VMLINUZ_REL"
     ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$ALPINE_INITRAMFS_REL"
     ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
+    if [[ "$PLAN_STORAGE_MODE" == boot ]] && ! is_mountpoint /boot; then
+        ALPINE_APKOVL_ABS="$ALPINE_APKOVL_REL"
+    fi
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
 }
 
@@ -1629,8 +1640,8 @@ build_alpine_apkovl() {
     printf 'DDIFY_ALPINE_REPO=%s\n' "$ALPINE_REPO_BASE" >"$ovl_dir/etc/reinstall/alpine-repo.conf"
 
     cat >"$ovl_dir/etc/apk/repositories" <<EOF
-${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}
-${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}
+${ALPINE_REPO_BASE}/main
+${ALPINE_REPO_BASE}/community
 EOF
 
     write_install_plan "$ovl_dir/etc/reinstall/plan.env"
@@ -1722,6 +1733,9 @@ REPOEOF
 
     echo "[stage] apk update (online)"
     apk update
+    echo "[stage] apk add (rescue SSH prerequisites)"
+    apk add --no-cache openssh openssl
+    start_reinstall_rescue_ssh
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
         bash curl wget ca-certificates xz qemu-img util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
@@ -1738,6 +1752,55 @@ REPOEOF
             exit 1
         }
     done
+}
+
+start_reinstall_rescue_ssh() {
+    . /etc/reinstall/plan.env
+    rescue_port="${SSH_PORT:-22}"
+    case "$rescue_port" in
+        ''|*[!0-9]*) echo "Invalid rescue SSH port" >&2; exit 1 ;;
+    esac
+    [ "$rescue_port" -ge 1 ] && [ "$rescue_port" -le 65535 ] || exit 1
+    mkdir -p /root/.ssh /run/sshd
+    chmod 0700 /root/.ssh
+    : > /root/.ssh/authorized_keys
+    if [ -n "${SSH_KEYS_ALL:-}" ]; then
+        printf '%s\n' "$SSH_KEYS_ALL" > /root/.ssh/authorized_keys
+    fi
+    chmod 0600 /root/.ssh/authorized_keys
+
+    if [ -n "${PASSWORD_HASH:-}" ]; then
+        rescue_hash="$PASSWORD_HASH"
+        pw_auth=yes
+    else
+        rescue_hash=$(head -c 48 /dev/urandom | base64 | openssl passwd -6 -stdin) || exit 1
+        pw_auth=no
+    fi
+    awk -F: -v hash="$rescue_hash" 'BEGIN {OFS=FS} $1=="root"{$2=hash} {print}' /etc/shadow > /etc/shadow.ddify
+    cat /etc/shadow.ddify > /etc/shadow
+    rm -f /etc/shadow.ddify
+    chmod 0600 /etc/shadow
+    if [ ! -s /root/.ssh/authorized_keys ] && [ "$pw_auth" = no ]; then
+        echo "No credentials for rescue SSH; refusing to proceed." >&2
+        exit 1
+    fi
+    ssh-keygen -A >/dev/null || exit 1
+    cat > /etc/ssh/sshd_config <<SSHEOF
+Port $rescue_port
+PermitRootLogin yes
+PasswordAuthentication $pw_auth
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PermitEmptyPasswords no
+UsePAM no
+Subsystem sftp internal-sftp
+SSHEOF
+    /usr/sbin/sshd -t || exit 1
+    /usr/sbin/sshd || { echo "Failed to start Alpine rescue SSH" >&2; exit 1; }
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn | grep -Eq ":${rescue_port}[[:space:]]" || { echo "Rescue sshd is not listening on port $rescue_port" >&2; exit 1; }
+    fi
+    echo "Alpine rescue SSH available on port $rescue_port (root); remains alive after installer failure."
 }
 
 ensure_modloop_ready() {
@@ -2020,6 +2083,13 @@ exec /sbin/init
 EOF
     chmod 0755 "$initfile"
 
+    # Alpine mkinitfs finds exactly one *.apkovl.tar.gz in the boot filesystem root.
+    # Do not force an absolute apkovl= path: it resolves inside initramfs, not GRUB.
+    local existing_apkovl
+    for existing_apkovl in "$(dirname "$ALPINE_APKOVL_ABS")/"*.apkovl.tar.gz; do
+        [[ ! -e "$existing_apkovl" || "$existing_apkovl" == "$ALPINE_APKOVL_ABS" ]] || \
+            error "Another apkovl exists on the boot filesystem: $existing_apkovl"
+    done
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
     chmod 0644 "$ALPINE_APKOVL_ABS"
     rm -rf "$tmp"
@@ -2102,7 +2172,7 @@ patch_alpine_grub_efi() {
     (( new_len <= old_len )) || error "Patched GRUB early config is too large"
 
     marker="search --no-floppy --set=root --label \"${volid}\""
-    offset=$(LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" | head -n1 | cut -d: -f1)
+    offset=$(LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" | head -n1 | cut -d: -f1) || true
     [[ "$offset" =~ ^[0-9]+$ ]] || error "Could not locate Alpine GRUB early config"
 
     dd if="$ALPINE_FREEBSD_GRUB_EFI_ABS" of="$tmp/original.cfg" bs=1 skip="$offset" count="$old_len" status=none
@@ -2539,17 +2609,30 @@ image_checksum_from_official_manifest() {
     IMAGE_HASH_EXPECTED="${expected,,}"
 }
 
-download_target_image_in_alpine() {
-    local dst="$1" tmp="${1}.part.$$" remote_size allocated digest= hash_pid= fifo=
-
-    rm -f "$tmp"
+preflight_target_image_in_alpine() {
     [[ "$IMG_URL" == https://* ]] || error "Target image must use HTTPS"
     if [[ "${IMAGE_BUILTIN:-0}" == 1 ]]; then
         image_checksum_from_official_manifest
     else
         IMAGE_HASH_EXPECTED="" IMAGE_HASH_ALGO=""
-        warn "Custom --img: no publisher checksum is available; source authenticity is unverified"
+        warn "Custom --img has no publisher-verified checksum; QCOW2 structure will still be checked"
     fi
+    info "Checking target image URL before modifying the disk"
+    curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
+        error "Target image URL is not reachable before disk modification"
+    local remote_size
+    remote_size=$(http_content_length "$IMG_URL" || true)
+    if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
+        error "Image download size exceeds the staging policy before disk modification"
+    fi
+}
+
+download_target_image_in_alpine() {
+    local dst="$1" tmp="${1}.part.$$" remote_size allocated digest= hash_pid= fifo=
+
+    rm -f "$tmp"
+    [[ "$IMG_URL" == https://* ]] || error "Target image must use HTTPS"
+    [[ -n "${IMAGE_HASH_ALGO:-}" || -z "${IMAGE_HASH_EXPECTED:-}" ]] || error "Missing image checksum algorithm"
     info "Downloading target image onto the mandatory 3 GiB staging partition: $IMG_URL"
 
     remote_size=$(http_content_length "$IMG_URL" || true)
@@ -2591,6 +2674,13 @@ download_target_image_in_alpine() {
         rm -f "$tmp"
         error "Downloaded target image is not a readable qcow2 image"
     }
+
+    local qcow_info
+    qcow_info=$(qemu-img info --output=json "$tmp" 2>/dev/null) || error "Failed to inspect downloaded qcow2"
+    if grep -Eq '"backing-filename"[[:space:]]*:' <<<"$qcow_info"; then
+        error "Image has an external backing file; refusing dependent qcow2"
+    fi
+    qemu-img check -f qcow2 "$tmp" >/dev/null || error "qcow2 consistency check failed"
 
     mv -f "$tmp" "$dst"
     sync
@@ -2636,22 +2726,30 @@ connect_raw_rw_nbd() {
 }
 
 shadow_last_partition() {
-    local nbd="$1" line best_end=0
+    local nbd="$1" line best_end=0 pnum pstart pend detail code
     SHADOW_PART_NUM="" SHADOW_PART_START="" SHADOW_PART_END="" SHADOW_PART_CODE=""
 
     while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+.*[[:space:]]+([0-9A-Fa-f]{4})[[:space:]] ]] || continue
-        (( BASH_REMATCH[3] <= best_end )) && continue
-        best_end="${BASH_REMATCH[3]}"
-        SHADOW_PART_NUM="${BASH_REMATCH[1]}"
-        SHADOW_PART_START="${BASH_REMATCH[2]}"
-        SHADOW_PART_END="${BASH_REMATCH[3]}"
-        SHADOW_PART_CODE="${BASH_REMATCH[4]^^}"
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]] ]] || continue
+        pnum="${BASH_REMATCH[1]}"
+        pstart="${BASH_REMATCH[2]}"
+        pend="${BASH_REMATCH[3]}"
+        (( pend > best_end )) || continue
+        best_end="$pend"
+        SHADOW_PART_NUM="$pnum"
+        SHADOW_PART_START="$pstart"
+        SHADOW_PART_END="$pend"
     done < <(sgdisk -p "$nbd" 2>/dev/null)
 
     [[ -n "$SHADOW_PART_NUM" ]] || error "Could not identify final GPT partition in sparse shadow"
+    detail=$(sgdisk -i "$SHADOW_PART_NUM" "$nbd" 2>/dev/null) || error "Failed to inspect final GPT partition"
+    code=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$detail")
+    [[ "$code" =~ ^[0-9A-Fa-f]{4}$ ]] || error "Invalid final GPT partition type"
+    SHADOW_PART_CODE="${code^^}"
+    case "$SHADOW_PART_CODE" in
+        EF00|EF02|8200|A502) error "Cannot shrink a trailing EFI/BIOS/swap partition" ;;
+    esac
 }
-
 shadow_partition_node() {
     local nbd="$1" num="$2" dev i
     dev=$(partition_device_for_number "$nbd" "$num")
@@ -2734,12 +2832,24 @@ prepare_sparse_shadow_for_target() {
     local img="$1" shadow="$2" nbd sector target_sector disk_bytes total reserve target_end partdev part_bytes allocated
 
     rm -f "$shadow"
+    local available_bytes tmpfs_free image_bytes
+    available_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    tmpfs_free=$(df -B1 --output=avail /run/reinstall-work | awk 'NR==2 {print $1; exit}')
+    image_bytes=$(du -B1 "$img" | awk '{print $1; exit}')
+    [[ "$available_bytes" =~ ^[0-9]+$ && "$tmpfs_free" =~ ^[0-9]+$ && "$image_bytes" =~ ^[0-9]+$ ]] || \
+        error "Could not evaluate available sparse-shadow memory"
+    (( available_bytes >= 201326592 )) || \
+        error "Less than 192 MiB MemAvailable before sparse-shadow conversion"
+    (( tmpfs_free >= image_bytes + 134217728 )) || \
+        error "Sparse-shadow tmpfs headroom is lower than the compressed QCOW2 allocation; refusing high-risk conversion"
     info "Creating bounded sparse RAM/zram shadow"
     qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" &
-    local convert_pid=$! available_kb pressure=0
+    local convert_pid=$! available_kb pressure=0 free_now
     while kill -0 "$convert_pid" 2>/dev/null; do
         available_kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
-        if [[ "$available_kb" =~ ^[0-9]+$ ]] && (( available_kb < 98304 )); then
+        free_now=$(df -B1 --output=avail /run/reinstall-work | awk 'NR==2 {print $1; exit}')
+        if [[ ! "$available_kb" =~ ^[0-9]+$ || ! "$free_now" =~ ^[0-9]+$ ]] || \
+           (( available_kb < 98304 || free_now < 134217728 )); then
             pressure=1
             kill "$convert_pid" 2>/dev/null || true
             break
@@ -2750,7 +2860,10 @@ prepare_sparse_shadow_for_target() {
         error "Insufficient RAM/zram for sparse-shadow; refusing an unsafe partial write"
     fi
     allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}')
-    info "Sparse shadow: logical=$(stat -c %s "$shadow") allocated=${allocated:-unknown} bytes"
+    [[ "$allocated" =~ ^[0-9]+$ ]] || error "Cannot verify completed sparse-shadow allocation"
+    qemu-img compare -f qcow2 -F raw "$img" "$shadow" >/dev/null || \
+        error "Sparse RAW shadow does not match source QCOW2; refusing write"
+    info "Sparse shadow: logical=$(stat -c %s "$shadow") allocated=${allocated} bytes"
 
     connect_raw_rw_nbd "$shadow"
     nbd="$QCOW_NBD_DEV"
@@ -2888,43 +3001,46 @@ release_temp_staging_partition() {
 }
 
 find_last_growable_gpt_partition() {
-    local line num start end code best_num="" best_end=0 best_code=""
+    local line num end detail code best_num="" best_end=0
 
     while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+.*[[:space:]]+([0-9A-Fa-f]{4})[[:space:]] ]] || continue
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]] ]] || continue
         num="${BASH_REMATCH[1]}"
-        start="${BASH_REMATCH[2]}"
         end="${BASH_REMATCH[3]}"
-        code="${BASH_REMATCH[4]}"
-        code="${code^^}"
         if (( end > best_end )); then
             best_end="$end"
             best_num="$num"
-            best_code="$code"
         fi
     done < <(sgdisk -p "$DISK" 2>/dev/null || true)
 
     [[ -n "$best_num" ]] || return 1
-    case "$best_code" in
+    detail=$(sgdisk -i "$best_num" "$DISK" 2>/dev/null) || return 1
+    code=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$detail")
+    [[ "$code" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+    code="${code^^}"
+    case "$code" in
         EF00|EF02|8200|A502)
-            warn "The physically last GPT partition is type $best_code; refusing to expand EFI/BIOS/swap partition automatically."
-            return 1
+            warn "Last GPT partition is $code; skipping automatic expansion of EFI/BIOS/swap."
+            return 2
             ;;
     esac
 
     printf '%s\n' "$best_num"
 }
-
 grow_last_partition_reserving_cidata() {
     command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required to expand the target GPT"
 
     local partnum info_text start end type_guid unique_guid attrs name
-    local sector_size reserve_bytes reserve_sectors largest_end new_end
+    local sector_size reserve_bytes reserve_sectors last_usable new_end
 
     sgdisk -e "$DISK" >/dev/null || error "Failed to relocate/rebuild target backup GPT after staging write"
 
-    partnum=$(find_last_growable_gpt_partition || true)
-    [[ -n "$partnum" ]] || error "Could not identify a safe final GPT data partition to expand"
+    partnum=$(find_last_growable_gpt_partition) || {
+        local rc=$?
+        [[ "$rc" == 2 ]] || error "Could not identify a safe final GPT data partition to expand"
+        info "Leaving the trailing non-data partition unchanged; CIDATA will use available free space."
+        return 0
+    }
 
     info_text=$(sgdisk -i "$partnum" "$DISK" 2>/dev/null) || error "Failed to inspect target partition $partnum"
     start=$(printf '%s\n' "$info_text" | awk '/First sector:/ {print $3; exit}')
@@ -2940,11 +3056,10 @@ grow_last_partition_reserving_cidata() {
     sector_size=$(blockdev --getss "$DISK")
     reserve_bytes=$((32 * 1024 * 1024))
     reserve_sectors=$(((reserve_bytes + sector_size - 1) / sector_size))
-    largest_end=$(sgdisk -E "$DISK" 2>/dev/null || true)
-    [[ "$largest_end" =~ ^[0-9]+$ && "$largest_end" -gt 0 ]] || \
-        error "Could not determine free-space end for target partition expansion"
-
-    new_end=$((largest_end - reserve_sectors))
+    last_usable=$(sgdisk -p "$DISK" 2>/dev/null | sed -n 's/.*last usable sector is \([0-9][0-9]*\).*/\1/p' | head -n1)
+    [[ "$last_usable" =~ ^[0-9]+$ && "$last_usable" -gt "$end" ]] || \
+        error "Could not identify safe trailing GPT space after the final data partition"
+    new_end=$((last_usable - reserve_sectors))
     if [[ "$new_end" -eq "$end" ]]; then
         info "Target partition $partnum already ends at the CIDATA-safe boundary."
         return 0
@@ -2983,6 +3098,7 @@ installer_workspace() {
 installer_stage_optional_inputs() {
     [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]] || return 0
     local dst="$INSTALL_TMPDIR/frpc.toml"
+    [[ "$FRPC_TOML" == https://* ]] || error "FRPC config URL must use HTTPS"
     info "Downloading FRPC config"
     http_download "$FRPC_TOML" "$dst" || error "Failed to download FRPC config"
     FRPC_TOML="$dst"
@@ -3059,6 +3175,7 @@ do_install() {
 
     installer_workspace
     installer_stage_optional_inputs
+    preflight_target_image_in_alpine
     installer_write_image
     installer_write_seed
     run_post_install_hook
@@ -3201,6 +3318,23 @@ print_host_summary() {
     echo "============================================================"
 }
 
+preflight_target_image_on_host() {
+    [[ "$IMG_URL" == https://* ]] || error "Target image URL must use HTTPS"
+    info "Checking image URL before rebooting the current OS"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
+            error "Image URL preflight failed on host: $IMG_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --spider --tries=1 --timeout=20 "$IMG_URL" >/dev/null 2>&1 || \
+            error "Image URL preflight failed on host: $IMG_URL"
+    elif command -v fetch >/dev/null 2>&1; then
+        fetch -s "$IMG_URL" >/dev/null 2>&1 || \
+            error "Image URL preflight failed on host: $IMG_URL"
+    else
+        error "No host downloader available for image URL preflight"
+    fi
+}
+
 host_main() {
     reset_config
     [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage
@@ -3223,6 +3357,7 @@ host_main() {
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
         IMAGE_BUILTIN=1
     fi
+    [[ "$HOLD" == 1 ]] || preflight_target_image_on_host
     print_host_summary
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
     if [[ "$HOLD" != 1 ]]; then
