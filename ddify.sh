@@ -234,9 +234,7 @@ detect_linux_family() {
 }
 
 have_any_downloader() {
-    command -v curl >/dev/null 2>&1 || \
-    command -v wget >/dev/null 2>&1 || \
-    command -v fetch >/dev/null 2>&1
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
 }
 
 missing_deps_linux_common() {
@@ -370,6 +368,7 @@ DISK_ID_SERIAL=""
 DISK_ID_SIZE=""
 DISK_ID_MODEL=""
 DISK_ID_PTUUID=""
+DISK_ID_MBR_ID=""
 
 validate_target_disk() {
     local disk="$1" typ d
@@ -409,6 +408,7 @@ capture_target_disk_identity() {
     DISK_ID_SIZE=""
     DISK_ID_MODEL=""
     DISK_ID_PTUUID=""
+    DISK_ID_MBR_ID=""
 
     if [[ "$OS" == "Linux" ]]; then
         line=$(lsblk -b -dn -P -o WWN,SERIAL,SIZE,MODEL "$disk" 2>/dev/null | head -n1 || true)
@@ -419,6 +419,9 @@ capture_target_disk_identity() {
         DISK_ID_MODEL=$(lsblk_get_kv "$line" "MODEL")
         if [[ "$(blkid -s PTTYPE -o value "$disk" 2>/dev/null || true)" == gpt ]]; then
             DISK_ID_PTUUID=$(blkid -s PTUUID -o value "$disk" 2>/dev/null || true)
+        elif [[ "$(blkid -s PTTYPE -o value "$disk" 2>/dev/null || true)" == dos ]]; then
+            DISK_ID_MBR_ID=$(blkid -s PTUUID -o value "$disk" 2>/dev/null || true)
+            [[ "$DISK_ID_MBR_ID" =~ ^[[:xdigit:]]{8}$ && "${DISK_ID_MBR_ID,,}" != 00000000 ]] || DISK_ID_MBR_ID=""
         fi
     else
         d="${disk#/dev/}"
@@ -437,14 +440,17 @@ capture_target_disk_identity() {
         error "Unable to read target disk size"
     [[ -z "$DISK_ID_PTUUID" || "$DISK_ID_PTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
         error "Target disk GPT GUID is invalid; refusing unattended reinstallation"
-    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" ]] || \
-        error "Target disk has no stable identity (WWN/serial/PTUUID); refusing unattended reinstallation"
+    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" || -n "$DISK_ID_MBR_ID" ]] || \
+        error "Target disk lacks a usable WWN, serial, GPT GUID or MBR signature"
 
+    if [[ -n "$DISK_ID_MBR_ID" && -z "$DISK_ID_WWN$DISK_ID_SERIAL" ]]; then
+        warn "Using a 32-bit MBR disk signature as fallback identity; cloned disks must be disconnected"
+    fi
     info "Target disk identity: serial=${DISK_ID_SERIAL:-unknown} wwn=${DISK_ID_WWN:-unknown} size=${DISK_ID_SIZE:-unknown}"
 }
 
 list_disk_identities() {
-    local line path type wwn serial size model ptuuid="" d
+    local line path type wwn serial size model ptuuid="" mbr_id="" d
 
     if [[ "$OS" == Linux ]]; then
         while IFS= read -r line; do
@@ -455,11 +461,14 @@ list_disk_identities() {
             serial=$(lsblk_get_kv "$line" SERIAL)
             size=$(lsblk_get_kv "$line" SIZE)
             model=$(lsblk_get_kv "$line" MODEL)
-            ptuuid=""
+            ptuuid=""; mbr_id=""
             if [[ "$(blkid -s PTTYPE -o value "$path" 2>/dev/null || true)" == gpt ]]; then
                 ptuuid=$(blkid -s PTUUID -o value "$path" 2>/dev/null || true)
+            elif [[ "$(blkid -s PTTYPE -o value "$path" 2>/dev/null || true)" == dos ]]; then
+                mbr_id=$(blkid -s PTUUID -o value "$path" 2>/dev/null || true)
+                [[ "$mbr_id" =~ ^[[:xdigit:]]{8}$ && "${mbr_id,,}" != 00000000 ]] || mbr_id=""
             fi
-            printf '%s|%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model" "$ptuuid"
+            printf '%s|%s|%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model" "$ptuuid" "$mbr_id"
         done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null)
         return
     fi
@@ -470,14 +479,14 @@ list_disk_identities() {
         size=$(diskinfo "$path" 2>/dev/null | awk 'NR==1 {print $3; exit}')
         wwn=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
         model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
-        printf '%s|%s|%s|%s|%s|%s\n' "$path" "$(normalize_disk_wwn "$wwn")" "$serial" "$size" "$model" "$ptuuid"
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$path" "$(normalize_disk_wwn "$wwn")" "$serial" "$size" "$model" "$ptuuid" ""
     done
 }
 
 disk_identity_matches() {
-    local wwn="$1" serial="$2" size="$3" model="$4" ptuuid="${5:-}" pair stored current hit=0
+    local wwn="$1" serial="$2" size="$3" model="$4" ptuuid="${5:-}" mbr_id="${6:-}" pair stored current hit=0
     [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || return 1
-    for pair in "${DISK_ID_WWN:-}|$wwn" "${DISK_ID_SERIAL:-}|$serial" "${DISK_ID_PTUUID,,}|${ptuuid,,}"; do
+    for pair in "${DISK_ID_WWN:-}|$wwn" "${DISK_ID_SERIAL:-}|$serial" "${DISK_ID_PTUUID,,}|${ptuuid,,}" "${DISK_ID_MBR_ID,,}|${mbr_id,,}"; do
         stored=${pair%%|*}; current=${pair#*|}
         [[ -n "$stored" && -n "$current" ]] || continue
         [[ "$stored" == "$current" ]] || return 1
@@ -487,12 +496,12 @@ disk_identity_matches() {
 }
 
 resolve_target_disk_from_identity() {
-    local path wwn serial size model ptuuid
+    local path wwn serial size model ptuuid mbr_id
     local matches=()
-    [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}" ]] || \
+    [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}" ]] || \
         error "No strong target disk identity recorded; refusing destructive write"
-    while IFS='|' read -r path wwn serial size model ptuuid; do
-        disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" && matches+=("$path")
+    while IFS='|' read -r path wwn serial size model ptuuid mbr_id; do
+        disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" "$mbr_id" && matches+=("$path")
     done < <(list_disk_identities)
 
     ((${#matches[@]} == 1)) || error "Saved target identity matched ${#matches[@]} disks; refusing destructive write"
@@ -1158,9 +1167,48 @@ seed_runcmd_cleanup_cidata_freebsd() {
 EOF
 }
 
+seed_runcmd_cleanup_cidata_mbr() {
+    local partuuid="$1"
+    printf '  - |\n      ddify_cidata_partuuid="%s"\n' "$partuuid"
+    cat <<'EOF'
+      if command -v lsblk >/dev/null 2>&1 && command -v sfdisk >/dev/null 2>&1 &&
+         command -v blkid >/dev/null 2>&1 && command -v findmnt >/dev/null 2>&1; then
+          cidata=$(lsblk -p -r -n -o NAME,PARTUUID 2>/dev/null | awk -v id="$ddify_cidata_partuuid" '
+              tolower($2) == tolower(id) { n++; path=$1 }
+              END { if (n == 1) print path }
+          ')
+          if [ -n "$cidata" ] && [ -b "$cidata" ] && ! findmnt -rn -S "$cidata" >/dev/null 2>&1 &&
+             [ "$(blkid -s TYPE -o value "$cidata")" = vfat ] &&
+             [ "$(blkid -s LABEL -o value "$cidata")" = CIDATA ]; then
+              num=$(lsblk -dnro PARTN "$cidata")
+              parent=$(lsblk -dnro PKNAME "$cidata")
+              disk="/dev/$parent"
+              case "$num" in 1|2|3|4) ;; *) disk= ;; esac
+              if [ -n "$disk" ] && [ -b "$disk" ] &&
+                 [ "$(lsblk -dnro TYPE "$disk")" = disk ] &&
+                 [ "$(sfdisk --part-size "$disk" "$num" 2>/dev/null)" = 32768 ] &&
+                 printf '%s' "$(sfdisk --part-type "$disk" "$num" 2>/dev/null | tr 'A-F' 'a-f')" | grep -Eq '^(0x)?0?e$'; then
+                  size=$(blockdev --getsize64 "$cidata")
+                  if [ "$size" -eq 16777216 ] &&
+                     dd if=/dev/zero of="$cidata" bs=1M count=16 conv=fsync status=none &&
+                     sfdisk --no-reread --no-tell-kernel --delete "$disk" "$num" >/dev/null 2>&1; then
+                      echo "DDify: removed temporary MBR CIDATA partition"
+                  else
+                      echo "DDify: MBR CIDATA cleanup incomplete" >&2
+                  fi
+              fi
+          fi
+      fi
+EOF
+}
+
 seed_runcmd_cleanup_cidata() {
     local os="$1" partuuid="${2:-}"
     [[ "$os" != "freebsd" ]] || { seed_runcmd_cleanup_cidata_freebsd "$partuuid"; return; }
+    if [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{2}$ ]]; then
+        seed_runcmd_cleanup_cidata_mbr "$partuuid"
+        return
+    fi
     [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
         error "Missing/invalid CIDATA PARTUUID for Linux cloud-init cleanup"
 
@@ -1470,6 +1518,7 @@ write_install_plan() {
         printf 'DISK_ID_SIZE=%q\n' "${DISK_ID_SIZE:-}"
         printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
         printf 'DISK_ID_PTUUID=%q\n' "${DISK_ID_PTUUID:-}"
+        printf 'DISK_ID_MBR_ID=%q\n' "${DISK_ID_MBR_ID:-}"
         printf 'IMG_URL=%q\n' "$IMG_URL"
         printf 'IMAGE_BUILTIN=%q\n' "${IMAGE_BUILTIN:-0}"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
@@ -1595,6 +1644,7 @@ prepare_alpine_paths() {
         local root_fs root_source root_type
         root_fs=$(findmnt -n -o FSTYPE --mountpoint / 2>/dev/null || true)
         root_source=$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null || true)
+        root_source="${root_source%%\[*}"
         root_type=$(lsblk -dn -o TYPE "$root_source" 2>/dev/null || true)
         [[ "$root_fs" == ext2 || "$root_fs" == ext3 || "$root_fs" == ext4 ]] &&
         [[ "$root_type" == part || "$root_type" == disk ]] ||
@@ -1759,7 +1809,7 @@ REPOEOF
     blkid -V 2>&1 | grep -qi util-linux || { echo "Full util-linux blkid is required" >&2; exit 1; }
 
     # Fail here with a precise message instead of reaching the destructive stage
-    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
+    for cmd in sgdisk sfdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
             echo "Installed matching packages:"
@@ -2238,8 +2288,11 @@ build_freebsd_grub_efi() {
 efi_entry_numbers() {
     local title="${1:-}"
     efibootmgr -v 2>/dev/null | awk -v title="$title" '
-        title == "" || index($0, title) {
-            if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) print toupper(substr($0, RSTART + 4, 4))
+        /^[[:space:]]*[+*]?Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            if (title == "" || index($0, title)) {
+                match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)
+                print toupper(substr($0, RSTART + 4, 4))
+            }
         }
     ' | sort -u
 }
@@ -2283,18 +2336,24 @@ install_freebsd_bootnext_entry() {
 }
 
 check_secure_boot() {
-    local var value
-    if [[ "$OS" == Linux && -d /sys/firmware/efi/efivars ]]; then
+    local var value=""
+    if [[ "$OS" == Linux ]]; then
+        [[ -d /sys/firmware/efi ]] || return 0
+        [[ -d /sys/firmware/efi/efivars ]] || error "Cannot determine UEFI Secure Boot state"
         for var in /sys/firmware/efi/efivars/SecureBoot-*; do
             [[ -r "$var" ]] || continue
             value=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]')
-            [[ "$value" != 1 ]] || error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
-            return 0
+            break
         done
-    elif [[ "$OS" == FreeBSD ]] && command -v efivar >/dev/null 2>&1; then
-        value=$(efivar -N -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot -b 2>/dev/null | od -An -tu1 | tr -d '[:space:]' || true)
-        [[ "$value" != 1 ]] || error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
+    else
+        command -v efivar >/dev/null 2>&1 || error "Cannot read FreeBSD UEFI Secure Boot state"
+        value=$(efivar -N -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot -b 2>/dev/null | od -An -tu1 | tr -d '[:space:]') || true
     fi
+    case "$value" in
+        0) return 0 ;;
+        1) error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported" ;;
+        *) error "UEFI Secure Boot state is unknown; refusing unattended reboot" ;;
+    esac
 }
 
 prepare_and_boot_alpine_ram() {
@@ -2370,6 +2429,47 @@ reread_partition_table_strict() {
     }
 }
 
+create_mbr_cidata_partition() {
+    local table line num type slot= last_end=0 start size sectors dev
+    command -v sfdisk >/dev/null 2>&1 || error "sfdisk is required for MBR CIDATA"
+    table=$(sfdisk -d "$DISK") || error "Cannot read target MBR for CIDATA"
+    [[ "$table" == *"label: dos"* ]] || error "Target is not an MBR disk"
+    if lsblk -nr -o LABEL "$DISK" | awk '$0 == "CIDATA" {found=1} END {exit !found}'; then
+        error "Target MBR image already contains a CIDATA volume"
+    fi
+
+    local -A used=()
+    while IFS= read -r line; do
+        [[ "$line" == "$DISK"*' : '* || "$line" == "$DISK"*' :'* ]] || continue
+        [[ "$line" =~ start=[[:space:]]*([0-9]+) ]] || error "Malformed MBR partition start"
+        start="${BASH_REMATCH[1]}"
+        [[ "$line" =~ size=[[:space:]]*([0-9]+) ]] || error "Malformed MBR partition size"
+        size="${BASH_REMATCH[1]}"
+        [[ "$line" =~ type=[[:space:]]*([[:xdigit:]]+) ]] || error "Malformed MBR partition type"
+        type="${BASH_REMATCH[1]}"
+        num="${line%%:*}"; num="${num%% *}"; num="${num#"$DISK"}"; num="${num#p}"
+        [[ "$num" =~ ^[1-4]$ ]] || error "Extended/logical MBR partitions are unsupported"
+        case "${type,,}" in 5|05|f|0f|85) error "Extended MBR partitions are unsupported" ;; esac
+        used[$num]=1
+        (( start + size - 1 > last_end )) && last_end=$((start + size - 1))
+    done <<<"$table"
+    for num in 1 2 3 4; do
+        if [[ ! -v used[$num] ]]; then slot=$num; break; fi
+    done
+    [[ -n "$slot" ]] || error "No free MBR primary partition slot for CIDATA"
+    start=$((((last_end + 2048) / 2048) * 2048))
+    size=32768
+    sectors=$(blockdev --getsz "$DISK")
+    (( start >= 2048 && start + size + 2048 <= sectors )) ||         error "Not enough trailing MBR space for the 16 MiB CIDATA partition"
+
+    printf 'start=%s, size=%s, type=e\n' "$start" "$size" |         sfdisk --no-reread --no-tell-kernel -N "$slot" "$DISK" >/dev/null ||         error "Could not create MBR CIDATA partition"
+    reread_partition_table_strict
+    dev=$(partition_device_for_number "$DISK" "$slot")
+    ensure_linux_block_node_from_sysfs "$dev" || [[ -b "$dev" ]] || error "MBR CIDATA partition node missing"
+    mkfs.vfat -F 16 -n CIDATA "$dev" >/dev/null || error "Cannot format MBR CIDATA"
+    printf '%s\n' "$dev"
+}
+
 create_nocloud_cidata_partition() {
     [[ "$OS" == "Linux" ]] || error "Creating the standard NoCloud CIDATA partition requires the Linux/Alpine installer environment"
     command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required to create a standard NoCloud CIDATA partition"
@@ -2377,6 +2477,11 @@ create_nocloud_cidata_partition() {
 
     if ! sgdisk -p "$DISK" >/dev/null 2>&1; then
         error "Target image does not expose a usable GPT; refusing non-standard EFI:/nocloud injection"
+    fi
+
+    if [[ "${QCOW_PARTITION_TABLE:-gpt}" == dos ]]; then
+        create_mbr_cidata_partition
+        return
     fi
 
     local existing_cidata seed_part seed_matches=()
@@ -2408,6 +2513,8 @@ TEMP_STAGE_START_BYTES=""
 TEMP_STAGE_SECTOR_SIZE=""
 QCOW_VIRTUAL_SIZE=""
 QCOW_GPT_GUID=""
+QCOW_MBR_ID=""
+QCOW_PARTITION_TABLE="gpt"
 QCOW_MAX_PART_END_BYTES=""
 QCOW_MAX_PART_END_SECTOR=""
 QCOW_PARTITION_CROSSES_STAGE=0
@@ -2565,6 +2672,47 @@ inspect_qcow_partition_layout() {
     fi
     QCOW_VIRTUAL_SIZE="$nbd_virtual_size"
 
+    QCOW_PARTITION_TABLE=$(blkid -p -s PTTYPE -o value "$nbd" 2>/dev/null || true)
+    case "$QCOW_PARTITION_TABLE" in
+        gpt) ;;
+        dos)
+            [[ "$TARGET_OS" != freebsd && ! -d /sys/firmware/efi ]] ||                 error "MBR images are supported for Linux BIOS boot only"
+            local dump line num start size type count=0
+            dump=$(sfdisk -d "$nbd") || error "Cannot inspect MBR image"
+            [[ "$dump" == *"label: dos"* ]] || error "Malformed MBR image"
+            QCOW_MBR_ID=$(sed -n 's/^label-id: //p' <<<"$dump" | head -n1)
+            [[ "$QCOW_MBR_ID" =~ ^0x[[:xdigit:]]{8}$ ]] || error "Invalid MBR disk signature"
+            max_end=0
+            while IFS= read -r line; do
+                [[ "$line" == "$nbd"*' : '* || "$line" == "$nbd"*' :'* ]] || continue
+                [[ "$line" =~ start=[[:space:]]*([0-9]+) ]] || error "Invalid MBR start sector"
+                start="${BASH_REMATCH[1]}"
+                [[ "$line" =~ size=[[:space:]]*([0-9]+) ]] || error "Invalid MBR partition length"
+                size="${BASH_REMATCH[1]}"
+                [[ "$line" =~ type=[[:space:]]*([[:xdigit:]]+) ]] || error "Invalid MBR partition type"
+                type="${BASH_REMATCH[1]}"
+                num="${line%%:*}"; num="${num%% *}"; num="${num#"$nbd"}"; num="${num#p}"
+                [[ "$num" =~ ^[1-4]$ ]] || error "MBR logical partitions are not supported"
+                case "${type,,}" in 5|05|f|0f|85) error "MBR extended partitions are not supported" ;; esac
+                (( ++count <= 3 )) || error "MBR image has no free primary slot for CIDATA"
+                (( size > 0 && start >= 2048 && start + size <= QCOW_VIRTUAL_SIZE / 512 )) ||                     error "Invalid MBR partition boundaries"
+                (( start + size - 1 > max_end )) && max_end=$((start + size - 1))
+            done <<<"$dump"
+            (( count > 0 )) || error "MBR image contains no primary partitions"
+            sfdisk --verify "$nbd" >/dev/null || error "Inconsistent MBR partition layout"
+            sector_size=$(blockdev --getss "$nbd")
+            [[ "$sector_size" == 512 && "$sector_size" == "$(blockdev --getss "$DISK")" ]] ||                 error "MBR image requires matching 512-byte logical sectors"
+            QCOW_MAX_PART_END_SECTOR="$max_end"
+            QCOW_MAX_PART_END_BYTES=$(((max_end + 1) * sector_size))
+            (( QCOW_MAX_PART_END_BYTES + 8 * 1024 * 1024 <= TEMP_STAGE_START_BYTES )) ||                 error "MBR image partitions cross the staging area; MBR shrinking is unsupported"
+            cleanup_qcow_nbd
+            QCOW_PARTITION_CROSSES_STAGE=0
+            info "MBR image partitions end at ${QCOW_MAX_PART_END_BYTES} bytes; staging starts at ${TEMP_STAGE_START_BYTES} bytes"
+            return 0
+            ;;
+        *) error "Target QCOW2 partition table must be GPT or DOS/MBR" ;;
+    esac
+
     if ! table=$(sgdisk -p "$nbd" 2>&1); then
         echo "$table" >&2
         error "Target qcow2 does not expose a usable GPT; cannot safely use an in-disk staging partition"
@@ -2658,6 +2806,7 @@ preflight_target_image_in_alpine() {
     if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
         error "Image download size exceeds the staging policy before disk modification"
     fi
+    preflight_image_geometry
 }
 
 download_target_image_in_alpine() {
@@ -3140,7 +3289,7 @@ installer_stage_optional_inputs() {
 confirm_destructive_write() {
     echo
     echo "WARNING: $DISK will be repartitioned. ALL DATA WILL BE LOST."
-    [[ "$AUTO_YES" == 1 ]] && [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}" ]] && return 0
+    [[ "$AUTO_YES" == 1 ]] && [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}" ]] && return 0
     read -r -p "Type yes to continue: " ans
     case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
 }
@@ -3157,6 +3306,18 @@ installer_write_image() {
 
     [[ "${TEMP_STAGE_RELEASED:-0}" == 1 ]] || release_temp_staging_partition
     sync
+    if [[ "$QCOW_PARTITION_TABLE" == dos ]]; then
+        local written_id
+        local disk_sectors
+        disk_sectors=$(blockdev --getsz "$DISK")
+        (( disk_sectors > 2048 )) || error "Invalid target sector count"
+        dd if=/dev/zero of="$DISK" bs=512 seek=$((disk_sectors - 2048)) count=2048             conv=notrunc,fsync status=none || error "Failed to clear obsolete backup GPT at disk tail"
+        written_id=$(sfdisk --disk-id "$DISK" 2>/dev/null || true)
+        [[ "${written_id,,}" == "${QCOW_MBR_ID,,}" ]] || error "Written MBR signature differs from source image"
+        [[ "$(blkid -p -s PTTYPE -o value "$DISK" 2>/dev/null || true)" == dos ]] ||             error "Written target does not expose the expected MBR"
+        sfdisk --verify "$DISK" >/dev/null || error "Written MBR partition layout is inconsistent"
+        return 0
+    fi
     local written_table written_guid
     written_table=$(sgdisk -p "$DISK" 2>&1) || error "Target GPT unreadable after image write: $written_table"
     written_guid=$(printf '%s\n' "$written_table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
@@ -3171,8 +3332,11 @@ installer_write_seed() {
     local part partuuid mnt="$INSTALL_TMPDIR/cidata"
     part=$(create_nocloud_cidata_partition)
     partuuid=$(lsblk -d -n -r -o PARTUUID "$part" 2>/dev/null | head -n1)
-    [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
-        error "Failed to read newly created CIDATA PARTUUID"
+    if [[ "$QCOW_PARTITION_TABLE" == dos ]]; then
+        [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{2}$ ]] || error "Invalid MBR CIDATA PARTUUID"
+    else
+        [[ "$partuuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||             error "Failed to read newly created CIDATA PARTUUID"
+    fi
     mkdir -p "$mnt"
     mount -t vfat "$part" "$mnt" || error "Failed to mount CIDATA partition $part"
 
@@ -3226,7 +3390,7 @@ do_install() {
 reset_config() {
     TARGET_OS="" TARGET_VER="" IMG_URL="" DISK=""
     PASSWORD="" PASSWORD_HASH="" PASSWORD_TO_DISPLAY="" AUTO_PASSWORD=0
-    SSH_KEYS_ALL="" SSH_PORT="" WEB_PORT="" FRPC_TOML="" POST_INSTALL_HOOK="" FRPC_PRESENT=""
+    SSH_KEYS_ALL="" SSH_KEY_ARGS=() SSH_PORT="" WEB_PORT="" FRPC_TOML="" POST_INSTALL_HOOK="" FRPC_PRESENT=""
     HOLD=0 AUTO_YES=0 IMAGE_BUILTIN=0
 }
 
@@ -3271,7 +3435,7 @@ parse_host_options() {
                     --disk) DISK="$1" ;;
                     --img) IMG_URL="$1" ;;
                     --password|--passwd) PASSWORD="$1" ;;
-                    --ssh-key|--public-key) append_ssh_key "$1" ;;
+                    --ssh-key|--public-key) SSH_KEY_ARGS+=("$1") ;;
                     --ssh-port) is_port_valid "$1" || error "Invalid SSH port: $1"; SSH_PORT="$1" ;;
                     --web-port) is_port_valid "$1" || error "Invalid web port: $1"; WEB_PORT="$1" ;;
                     --frpc-toml) FRPC_TOML="$1" ;;
@@ -3351,6 +3515,51 @@ print_host_summary() {
     echo "============================================================"
 }
 
+probe_remote_qcow_virtual_size() {
+    local header size
+    header=$(mktemp "${TMPDIR:-/tmp}/ddify-qcow.XXXXXX") || return 1
+    if [[ "$IMG_URL" == *.xz ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+                --range 0-262143 "$IMG_URL" 2>/dev/null | xz -dc 2>/dev/null | head -c 72 >"$header" || true
+        else
+            wget --https-only -qO- --header='Range: bytes=0-262143' "$IMG_URL" 2>/dev/null | \
+                xz -dc 2>/dev/null | head -c 72 >"$header" || true
+        fi
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+            --range 0-71 "$IMG_URL" 2>/dev/null | head -c 72 >"$header" || true
+    else
+        wget --https-only -qO- --header='Range: bytes=0-71' "$IMG_URL" 2>/dev/null | \
+            head -c 72 >"$header" || true
+    fi
+    if [[ "$(wc -c <"$header")" != 72 || "$(od -An -tx1 -N4 "$header" | tr -d '[:space:]')" != 514649fb ]]; then
+        rm -f "$header"
+        return 1
+    fi
+    size=$(od -An -tu1 -j24 -N8 "$header" | awk '{for (i=1; i<=8; i++) n=n*256+$i; printf "%.0f\n", n}')
+    rm -f "$header"
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] || return 1
+    printf '%s\n' "$size"
+}
+
+preflight_image_geometry() {
+    local disk_bytes image_bytes stage_safe
+    disk_bytes=$(get_disk_size_bytes "$DISK")
+    image_bytes=$(probe_remote_qcow_virtual_size) || \
+        error "Cannot read remote QCOW2 header before disk modification"
+    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -gt $((5 * 1024 * 1024 * 1024)) ]] || \
+        error "Target disk is too small for 3 GiB staging"
+    stage_safe=$((disk_bytes - 3072 * 1024 * 1024 - 64 * 1024 * 1024))
+    if (( image_bytes > disk_bytes )); then
+        warn "Image virtual size exceeds target disk; actual partition boundaries will be validated before writing"
+    fi
+    if (( image_bytes > stage_safe )); then
+        warn "Image virtual size crosses the 3 GiB staging boundary; sparse-shadow safety is not guaranteed"
+    fi
+    info "Remote QCOW2 virtual size: $image_bytes bytes (disk: $disk_bytes bytes)"
+}
+
 preflight_target_image_on_host() {
     [[ "$IMG_URL" == https://* ]] || error "Target image URL must use HTTPS"
     info "Checking image URL before rebooting the current OS"
@@ -3358,10 +3567,7 @@ preflight_target_image_on_host() {
         curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
             error "Image URL preflight failed on host: $IMG_URL"
     elif command -v wget >/dev/null 2>&1; then
-        wget --spider --tries=1 --timeout=20 "$IMG_URL" >/dev/null 2>&1 || \
-            error "Image URL preflight failed on host: $IMG_URL"
-    elif command -v fetch >/dev/null 2>&1; then
-        fetch -s "$IMG_URL" >/dev/null 2>&1 || \
+        wget --https-only --spider --tries=1 --timeout=20 "$IMG_URL" >/dev/null 2>&1 || \
             error "Image URL preflight failed on host: $IMG_URL"
     else
         error "No host downloader available for image URL preflight"
@@ -3384,13 +3590,18 @@ host_main() {
     [[ "$IMG_URL" != http://* ]] || error "HTTP image URLs are not supported; use HTTPS"
     detect_os_arch
     [[ "$HOLD" == 1 ]] || ensure_dependencies
+    local key
+    for key in "${SSH_KEY_ARGS[@]}"; do append_ssh_key "$key"; done
     prepare_target_disk
     prepare_credentials
     if [[ -z "$IMG_URL" ]]; then
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
         IMAGE_BUILTIN=1
     fi
-    [[ "$HOLD" == 1 ]] || preflight_target_image_on_host
+    if [[ "$HOLD" != 1 ]]; then
+        preflight_target_image_on_host
+        preflight_image_geometry
+    fi
     print_host_summary
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
     if [[ "$HOLD" != 1 ]]; then
