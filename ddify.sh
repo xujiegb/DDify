@@ -362,6 +362,7 @@ ensure_dependencies() {
 AUTO_DETECTED_DISK=""
 AUTO_DETECT_REASON=""
 DISK_CANDIDATE_LINES=""
+DISK_CANDIDATE_PATHS=()
 DISK_AUTO_SELECTED=0
 DISK_ID_WWN=""
 DISK_ID_SERIAL=""
@@ -721,6 +722,7 @@ candidate_add() {
     [[ -z "$tags" ]] || line+=" markers:$tags"
     [[ -z "$note" ]] || line+=" ($note)"
     DISK_CANDIDATE_LINES+="${DISK_CANDIDATE_LINES:+$'\n'}$line"
+    DISK_CANDIDATE_PATHS+=("$path")
 }
 
 select_detected_disk() {
@@ -802,6 +804,7 @@ auto_detect_freebsd_disk() {
 auto_detect_disk() {
     info "Auto-detecting target disk..."
     DISK_CANDIDATE_LINES=""
+    DISK_CANDIDATE_PATHS=()
     DISK_CANDIDATE_COUNT=0
     AUTO_DETECTED_DISK=""
     AUTO_DETECT_REASON=""
@@ -2336,15 +2339,31 @@ install_freebsd_bootnext_entry() {
 }
 
 check_secure_boot() {
-    local var value=""
+    local var value="" status=""
     if [[ "$OS" == Linux ]]; then
         [[ -d /sys/firmware/efi ]] || return 0
-        [[ -d /sys/firmware/efi/efivars ]] || error "Cannot determine UEFI Secure Boot state"
         for var in /sys/firmware/efi/efivars/SecureBoot-*; do
             [[ -r "$var" ]] || continue
-            value=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]')
-            break
+            value=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]') || true
+            [[ "$value" == 0 || "$value" == 1 ]] && break
         done
+        if [[ "$value" != 0 && "$value" != 1 ]]; then
+            if command -v mokutil >/dev/null 2>&1; then
+                status=$(mokutil --sb-state 2>&1 || true)
+                case "$status" in
+                    *"SecureBoot enabled"*) value=1 ;;
+                    *"SecureBoot disabled"*|*"SecureBoot not supported"*) value=0 ;;
+                esac
+            fi
+        fi
+        if [[ "$value" != 0 && "$value" != 1 ]]; then
+            for var in /sys/firmware/efi/efivars/SetupMode-*; do
+                [[ -r "$var" ]] || continue
+                status=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]') || true
+                [[ "$status" == 1 ]] && value=0
+                break
+            done
+        fi
     else
         command -v efivar >/dev/null 2>&1 || error "Cannot read FreeBSD UEFI Secure Boot state"
         value=$(efivar -N -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot -b 2>/dev/null | od -An -tu1 | tr -d '[:space:]') || true
@@ -2352,8 +2371,12 @@ check_secure_boot() {
     case "$value" in
         0) return 0 ;;
         1) error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported" ;;
-        *) error "UEFI Secure Boot state is unknown; refusing unattended reboot" ;;
     esac
+    if [[ "${DDIFY_ASSUME_SECURE_BOOT_DISABLED:-0}" == 1 ]]; then
+        warn "Secure Boot status is unknown; proceeding only because DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 was set"
+        return 0
+    fi
+    error "Secure Boot status unknown. Verify 'mokutil --sb-state' (install mokutil if needed); if independently confirmed disabled, use DDIFY_ASSUME_SECURE_BOOT_DISABLED=1"
 }
 
 prepare_and_boot_alpine_ram() {
@@ -3593,6 +3616,7 @@ host_main() {
     local key
     for key in "${SSH_KEY_ARGS[@]}"; do append_ssh_key "$key"; done
     prepare_target_disk
+    [[ "$HOLD" == 1 ]] || check_secure_boot
     prepare_credentials
     if [[ -z "$IMG_URL" ]]; then
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
@@ -3605,9 +3629,17 @@ host_main() {
     print_host_summary
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
     if [[ "$HOLD" != 1 ]]; then
-        local answer
-        read -r -p "Type ERASE ${DISK} to authorize reboot and destruction: " answer
-        [[ "$answer" == "ERASE $DISK" ]] || error "Destructive operation cancelled"
+        local answer choice=1 i
+        if [[ "$DISK_AUTO_SELECTED" == 1 ]]; then
+            choice=""
+            for i in "${!DISK_CANDIDATE_PATHS[@]}"; do
+                [[ "${DISK_CANDIDATE_PATHS[i]}" != "$DISK" ]] || { choice=$((i + 1)); break; }
+            done
+            [[ -n "$choice" ]] || error "Selected disk is missing from candidate list"
+        fi
+        printf 'WARNING: all data on %s will be destroyed.\n' "$DISK" >&2
+        read -r -p "Select [$choice] to confirm, [0] to cancel: " answer
+        [[ "$answer" == "$choice" ]] || error "Destructive operation cancelled (use --disk to choose another device)"
     fi
 
     [[ "$HOLD" != 1 ]] || return 0
