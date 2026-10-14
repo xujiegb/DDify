@@ -56,25 +56,21 @@ is_port_valid() {
 http_download() {
     local url="$1" dst="$2" tmp
     tmp="${dst}.part.$$"
+    [[ "$url" == https://* ]] || error "Downloads require HTTPS: $url"
     rm -f "$tmp"
 
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -L --fail -o "$tmp" "$url"; then
+        if ! curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp" "$url"; then
             rm -f "$tmp"
             return 1
         fi
     elif command -v wget >/dev/null 2>&1; then
-        if ! wget -O "$tmp" "$url"; then
-            rm -f "$tmp"
-            return 1
-        fi
-    elif command -v fetch >/dev/null 2>&1; then
-        if ! fetch -o "$tmp" "$url"; then
+        if ! wget --https-only -O "$tmp" "$url"; then
             rm -f "$tmp"
             return 1
         fi
     else
-        error "No curl/wget/fetch found, cannot download: $url"
+        error "Secure download requires curl or wget with --https-only: $url"
     fi
 
     mv -f "$tmp" "$dst"
@@ -84,7 +80,7 @@ http_download_stdout() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 "$1"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$1"
+        wget --https-only -qO- "$1"
     else
         return 1
     fi
@@ -94,7 +90,8 @@ http_content_length() {
     local url="$1"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsIL "$url" | awk '
+        curl -fsIL --proto '=https' --proto-redir '=https' "$url" | awk '
+            /^HTTP\// { n="" }
             /^[Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); n=$2 }
             END { if (n != "") print n }
         '
@@ -102,7 +99,8 @@ http_content_length() {
     fi
 
     if command -v wget >/dev/null 2>&1; then
-        wget --server-response --spider "$url" 2>&1 | awk '
+        wget --https-only --server-response --spider "$url" 2>&1 | awk '
+            /^[[:space:]]*HTTP\// { n="" }
             /^  [Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); n=$2 }
             END { if (n != "") print n }
         '
@@ -260,7 +258,7 @@ missing_deps_freebsd_host() {
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
     command -v tar >/dev/null 2>&1 || missing+=("tar")
-    have_any_downloader || missing+=("downloader")
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || missing+=("downloader")
     command -v efibootmgr >/dev/null 2>&1 || missing+=("efibootmgr")
 
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
@@ -419,7 +417,9 @@ capture_target_disk_identity() {
         DISK_ID_SERIAL=$(lsblk_get_kv "$line" "SERIAL")
         DISK_ID_SIZE=$(lsblk_get_kv "$line" "SIZE")
         DISK_ID_MODEL=$(lsblk_get_kv "$line" "MODEL")
-        DISK_ID_PTUUID=$(blkid -s PTUUID -o value "$disk" 2>/dev/null || true)
+        if [[ "$(blkid -s PTTYPE -o value "$disk" 2>/dev/null || true)" == gpt ]]; then
+            DISK_ID_PTUUID=$(blkid -s PTUUID -o value "$disk" 2>/dev/null || true)
+        fi
     else
         d="${disk#/dev/}"
         if command -v diskinfo >/dev/null 2>&1; then
@@ -435,6 +435,8 @@ capture_target_disk_identity() {
 
     [[ "$DISK_ID_SIZE" =~ ^[0-9]+$ && "$DISK_ID_SIZE" -gt 0 ]] ||
         error "Unable to read target disk size"
+    [[ -z "$DISK_ID_PTUUID" || "$DISK_ID_PTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+        error "Target disk GPT GUID is invalid; refusing unattended reinstallation"
     [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" ]] || \
         error "Target disk has no stable identity (WWN/serial/PTUUID); refusing unattended reinstallation"
 
@@ -453,7 +455,10 @@ list_disk_identities() {
             serial=$(lsblk_get_kv "$line" SERIAL)
             size=$(lsblk_get_kv "$line" SIZE)
             model=$(lsblk_get_kv "$line" MODEL)
-            ptuuid=$(blkid -s PTUUID -o value "$path" 2>/dev/null || true)
+            ptuuid=""
+            if [[ "$(blkid -s PTTYPE -o value "$path" 2>/dev/null || true)" == gpt ]]; then
+                ptuuid=$(blkid -s PTUUID -o value "$path" 2>/dev/null || true)
+            fi
             printf '%s|%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model" "$ptuuid"
         done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null)
         return
@@ -947,8 +952,11 @@ EOF
 }
 
 seed_write_files() {
-    local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml"
-    [[ "$os" != freebsd ]] || frpc_path="/etc/frpc.toml"
+    local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml" owner="root:root"
+    if [[ "$os" == freebsd ]]; then
+        frpc_path="/etc/frpc.toml"
+        owner="root:wheel"
+    fi
     [[ -n "$WEB_PORT" || -n "$frpc_b64" ]] || return 0
 
     echo
@@ -957,7 +965,7 @@ seed_write_files() {
     [[ -z "$WEB_PORT" ]] || cat <<EOF
   - path: /etc/reinstall-web-port
     permissions: '0644'
-    owner: root:root
+    owner: ${owner}
     content: |
       $WEB_PORT
 EOF
@@ -965,7 +973,7 @@ EOF
     [[ -z "$frpc_b64" ]] || cat <<EOF
   - path: ${frpc_path}
     permissions: '0600'
-    owner: root:root
+    owner: ${owner}
     encoding: b64
     content: $frpc_b64
 EOF
@@ -1006,8 +1014,8 @@ seed_runcmd_ssh_port() {
       backup_ready=1
       tmp=\$(mktemp) || exit 1
       awk '
-          BEGIN { print "PermitRootLogin $permit"; print "PasswordAuthentication $auth"; print "PubkeyAuthentication yes"; print "Port $port" }
-          /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|Port)[[:space:]]+/ { next }
+          BEGIN { print "PermitRootLogin $permit"; print "PasswordAuthentication $auth"; print "KbdInteractiveAuthentication $auth"; print "PubkeyAuthentication yes"; print "Port $port" }
+          /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|Port)[[:space:]]+/ { next }
           { print }
       ' "\$cfg" > "\$tmp" || exit 1
       if [ "$port" != 22 ] && command -v getenforce >/dev/null 2>&1 && [ "\$(getenforce)" = Enforcing ]; then
@@ -1026,8 +1034,8 @@ seed_runcmd_ssh_port() {
               iface=\$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if(\$i=="dev") {print \$(i+1); exit}}')
               [ -n "\$iface" ] || iface=\$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if(\$i=="dev") {print \$(i+1); exit}}')
           fi
-          [ -n "\$iface" ] || exit 1
-          firewall_zone=\$(firewall-cmd --get-zone-of-interface="\$iface" 2>/dev/null || true)
+          firewall_zone=
+          [ -z "\$iface" ] || firewall_zone=\$(firewall-cmd --get-zone-of-interface="\$iface" 2>/dev/null || true)
           [ -n "\$firewall_zone" ] || firewall_zone=\$(firewall-cmd --get-default-zone) || exit 1
           if ! firewall-cmd --permanent --zone="\$firewall_zone" --query-port=$port/tcp >/dev/null 2>&1; then
               firewall-cmd --permanent --zone="\$firewall_zone" --add-port=$port/tcp || exit 1
@@ -1049,7 +1057,7 @@ seed_runcmd_ssh_port() {
                   [ ! -e "\$socket_path" ] && [ ! -L "\$socket_path" ] || return 1
                   socket_override=\$socket_path
                   mkdir -p /etc/systemd/system/ssh.socket.d || return 1
-                  printf '[Socket]\nListenStream=\nListenStream=%s\n' "$port" > "\$socket_override" || return 1
+                  printf '[Socket]\nListenStream=\nBindIPv6Only=both\nListenStream=%s\n' "$port" > "\$socket_override" || return 1
                   systemctl daemon-reload && systemctl restart ssh.socket || return 1
                   systemctl show -p Listen --value ssh.socket | tr ' ' '\n' | grep -Eq ":${port}\$" || return 1
               fi
@@ -1465,7 +1473,7 @@ write_install_plan() {
         printf 'IMG_URL=%q\n' "$IMG_URL"
         printf 'IMAGE_BUILTIN=%q\n' "${IMAGE_BUILTIN:-0}"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
-        printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
+        printf "SSH_KEYS_ALL='%s'\n" "${SSH_KEYS_ALL//\'/\'\\\'\'}"
         printf 'SSH_PORT=%q\n' "$SSH_PORT"
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
         printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
@@ -1584,6 +1592,13 @@ prepare_alpine_paths() {
     ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$ALPINE_INITRAMFS_REL"
     ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
     if [[ "$PLAN_STORAGE_MODE" == boot ]] && ! is_mountpoint /boot; then
+        local root_fs root_source root_type
+        root_fs=$(findmnt -n -o FSTYPE --mountpoint / 2>/dev/null || true)
+        root_source=$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null || true)
+        root_type=$(lsblk -dn -o TYPE "$root_source" 2>/dev/null || true)
+        [[ "$root_fs" == ext2 || "$root_fs" == ext3 || "$root_fs" == ext4 ]] &&
+        [[ "$root_type" == part || "$root_type" == disk ]] ||
+            error "BIOS without separate /boot requires a directly accessible ext root for Alpine apkovl discovery"
         ALPINE_APKOVL_ABS="$ALPINE_APKOVL_REL"
     fi
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
@@ -2222,7 +2237,7 @@ build_freebsd_grub_efi() {
 
 efi_entry_numbers() {
     local title="${1:-}"
-    efibootmgr 2>/dev/null | awk -v title="$title" '
+    efibootmgr -v 2>/dev/null | awk -v title="$title" '
         title == "" || index($0, title) {
             if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) print toupper(substr($0, RSTART + 4, 4))
         }
@@ -2267,7 +2282,23 @@ install_freebsd_bootnext_entry() {
     info "BootNext=$num ($ALPINE_ENTRY_TITLE); original BootOrder preserved"
 }
 
+check_secure_boot() {
+    local var value
+    if [[ "$OS" == Linux && -d /sys/firmware/efi/efivars ]]; then
+        for var in /sys/firmware/efi/efivars/SecureBoot-*; do
+            [[ -r "$var" ]] || continue
+            value=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]')
+            [[ "$value" != 1 ]] || error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
+            return 0
+        done
+    elif [[ "$OS" == FreeBSD ]] && command -v efivar >/dev/null 2>&1; then
+        value=$(efivar -N -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot -b 2>/dev/null | od -An -tu1 | tr -d '[:space:]' || true)
+        [[ "$value" != 1 ]] || error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
+    fi
+}
+
 prepare_and_boot_alpine_ram() {
+    check_secure_boot
     prepare_alpine_paths
     local boot_disk
     if [[ "$OS" == Linux ]]; then
@@ -2420,6 +2451,8 @@ ensure_linux_block_node_from_sysfs() {
 }
 
 reset_disk_for_staging() {
+    [[ -z "${DISK_ID_PTUUID:-}" || "$DISK_ID_PTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+        error "Invalid saved GPT GUID; refusing destructive write"
     wipefs -a "$DISK" >/dev/null 2>&1 || true
     sgdisk -Z "$DISK" >/dev/null 2>&1 || true
     partx -d "$DISK" >/dev/null 2>&1 || true
