@@ -2931,28 +2931,27 @@ connect_raw_rw_nbd() {
 }
 
 shadow_last_partition() {
-    local nbd="$1" line best_end=0 pnum pstart pend detail code
+    local nbd="$1" line best_end=0 pnum pstart pend pcode
     SHADOW_PART_NUM="" SHADOW_PART_START="" SHADOW_PART_END="" SHADOW_PART_CODE=""
 
     while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]] ]] || continue
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+([[:xdigit:]]{4})([[:space:]]|$) ]] || continue
         pnum="${BASH_REMATCH[1]}"
         pstart="${BASH_REMATCH[2]}"
         pend="${BASH_REMATCH[3]}"
+        pcode="${BASH_REMATCH[4]^^}"
         (( pend > best_end )) || continue
         best_end="$pend"
         SHADOW_PART_NUM="$pnum"
         SHADOW_PART_START="$pstart"
         SHADOW_PART_END="$pend"
+        SHADOW_PART_CODE="$pcode"
     done < <(sgdisk -p "$nbd" 2>/dev/null)
 
     [[ -n "$SHADOW_PART_NUM" ]] || error "Could not identify final GPT partition in sparse shadow"
-    detail=$(sgdisk -i "$SHADOW_PART_NUM" "$nbd" 2>/dev/null) || error "Failed to inspect final GPT partition"
-    code=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$detail")
-    [[ "$code" =~ ^[0-9A-Fa-f]{4}$ ]] || error "Invalid final GPT partition type"
-    SHADOW_PART_CODE="${code^^}"
     case "$SHADOW_PART_CODE" in
         EF00|EF02|8200|A502) error "Cannot shrink a trailing EFI/BIOS/swap partition" ;;
+        FFFF) error "Cannot shrink a partition with an unknown GPT type" ;;
     esac
 }
 shadow_partition_node() {
@@ -3206,27 +3205,29 @@ release_temp_staging_partition() {
 }
 
 find_last_growable_gpt_partition() {
-    local line num end detail code best_num="" best_end=0
+    local line num end code best_num="" best_code="" best_end=0
 
     while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]] ]] || continue
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+([[:xdigit:]]{4})([[:space:]]|$) ]] || continue
         num="${BASH_REMATCH[1]}"
         end="${BASH_REMATCH[3]}"
+        code="${BASH_REMATCH[4]^^}"
         if (( end > best_end )); then
             best_end="$end"
             best_num="$num"
+            best_code="$code"
         fi
     done < <(sgdisk -p "$DISK" 2>/dev/null || true)
 
     [[ -n "$best_num" ]] || return 1
-    detail=$(sgdisk -i "$best_num" "$DISK" 2>/dev/null) || return 1
-    code=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$detail")
-    [[ "$code" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
-    code="${code^^}"
-    case "$code" in
+    case "$best_code" in
         EF00|EF02|8200|A502)
-            warn "Last GPT partition is $code; skipping automatic expansion of EFI/BIOS/swap."
+            warn "Last GPT partition is $best_code; skipping automatic expansion of EFI/BIOS/swap."
             return 2
+            ;;
+        FFFF)
+            warn "Last GPT partition type is unknown; refusing automatic expansion."
+            return 1
             ;;
     esac
 
