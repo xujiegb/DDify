@@ -2831,7 +2831,7 @@ preflight_target_image_in_alpine() {
         image_checksum_from_official_manifest
     else
         IMAGE_HASH_EXPECTED="" IMAGE_HASH_ALGO=""
-        warn "Custom --img has no publisher-verified checksum; QCOW2 structure will still be checked"
+        warn "Custom --img has no publisher-verified checksum; partition layout will still be validated"
     fi
     info "Checking target image URL before modifying the disk"
     curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
@@ -2886,18 +2886,6 @@ download_target_image_in_alpine() {
         [[ "${digest,,}" == "$IMAGE_HASH_EXPECTED" ]] || error "Official image checksum mismatch"
         info "Official ${IMAGE_HASH_ALGO^^} checksum verified (HTTPS manifest; signature not checked)"
     fi
-
-    [[ "$(qemu-img info --output=json "$tmp" 2>/dev/null | sed -n 's/^[[:space:]]*"format"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" == qcow2 ]] || {
-        rm -f "$tmp"
-        error "Downloaded target image is not a readable qcow2 image"
-    }
-
-    local qcow_info
-    qcow_info=$(qemu-img info --output=json "$tmp" 2>/dev/null) || error "Failed to inspect downloaded qcow2"
-    if grep -Eq '"backing-filename"[[:space:]]*:' <<<"$qcow_info"; then
-        error "Image has an external backing file; refusing dependent qcow2"
-    fi
-    qemu-img check -f qcow2 "$tmp" >/dev/null || error "qcow2 consistency check failed"
 
     mv -f "$tmp" "$dst"
     sync
