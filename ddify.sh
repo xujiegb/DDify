@@ -2339,30 +2339,42 @@ install_freebsd_bootnext_entry() {
 }
 
 check_secure_boot() {
-    local var value="" status=""
+    local value="" status="" kernel_messages=""
     if [[ "$OS" == Linux ]]; then
         [[ -d /sys/firmware/efi ]] || return 0
-        for var in /sys/firmware/efi/efivars/SecureBoot-*; do
-            [[ -r "$var" ]] || continue
-            value=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]') || true
-            [[ "$value" == 0 || "$value" == 1 ]] && break
-        done
-        if [[ "$value" != 0 && "$value" != 1 ]]; then
-            if command -v mokutil >/dev/null 2>&1; then
-                status=$(mokutil --sb-state 2>&1 || true)
-                case "$status" in
-                    *"SecureBoot enabled"*) value=1 ;;
-                    *"SecureBoot disabled"*|*"SecureBoot not supported"*) value=0 ;;
-                esac
-            fi
+        kernel_messages=$(dmesg 2>/dev/null || true)
+        if grep -Fqi 'Secure boot enabled' <<<"$kernel_messages"; then
+            error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
         fi
-        if [[ "$value" != 0 && "$value" != 1 ]]; then
-            for var in /sys/firmware/efi/efivars/SetupMode-*; do
-                [[ -r "$var" ]] || continue
-                status=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]') || true
-                [[ "$status" == 1 ]] && value=0
-                break
-            done
+        if ! command -v mokutil >/dev/null 2>&1; then
+            detect_linux_family
+            case "$LINUX_FAMILY" in
+                redhat)
+                    command -v dnf >/dev/null 2>&1 || error "Cannot install mokutil: dnf unavailable"
+                    info "Installing mokutil for Secure Boot detection"
+                    dnf install -y mokutil || error "Failed to install mokutil"
+                    ;;
+                debian)
+                    command -v apt-get >/dev/null 2>&1 || error "Cannot install mokutil: apt-get unavailable"
+                    info "Installing mokutil for Secure Boot detection"
+                    apt-get update && apt-get install -y mokutil || error "Failed to install mokutil"
+                    ;;
+                *)
+                    error "mokutil is missing and automatic installation is unsupported on this Linux distribution"
+                    ;;
+            esac
+        fi
+        command -v mokutil >/dev/null 2>&1 || error "mokutil is unavailable after dependency installation"
+        status=$(mokutil --sb-state 2>&1 || true)
+        if grep -Eiq '^(SecureBoot|Secure Boot)[[:space:]]+enabled([[:space:]]|$)' <<<"$status"; then
+            value=1
+        elif grep -Eiq '^(SecureBoot|Secure Boot)[[:space:]]+disabled([[:space:]]|$)' <<<"$status"; then
+            value=0
+            info "Secure Boot disabled (mokutil)"
+        elif [[ "$status" == *"doesn't support Secure Boot"* || "$status" == *"SecureBoot not supported"* ]] &&
+             grep -Fqi 'Secure boot disabled' <<<"$kernel_messages"; then
+            value=0
+            info "Secure Boot unsupported by firmware; kernel confirms disabled"
         fi
     else
         command -v efivar >/dev/null 2>&1 || error "Cannot read FreeBSD UEFI Secure Boot state"
