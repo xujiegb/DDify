@@ -3553,7 +3553,7 @@ probe_remote_qcow_virtual_size() {
         wget --https-only -qO- --header='Range: bytes=0-71' "$IMG_URL" 2>/dev/null | \
             head -c 72 >"$header" || true
     fi
-    if [[ "$(wc -c <"$header")" != 72 || "$(od -An -tx1 -N4 "$header" | tr -d '[:space:]')" != 514649fb ]]; then
+    if [[ $(wc -c <"$header") -ne 72 || "$(od -An -tx1 -N4 "$header" | tr -d '[:space:]')" != 514649fb ]]; then
         rm -f "$header"
         return 1
     fi
