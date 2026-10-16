@@ -60,7 +60,7 @@ http_download() {
     rm -f "$tmp"
 
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp" "$url"; then
+        if ! curl -fL --progress-bar --proto '=https' --proto-redir '=https' -o "$tmp" "$url"; then
             rm -f "$tmp"
             return 1
         fi
@@ -78,7 +78,7 @@ http_download() {
 
 http_download_stdout() {
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 "$1"
+        curl -fL --progress-bar --proto '=https' --proto-redir '=https' --tlsv1.2 "$1"
     elif command -v wget >/dev/null 2>&1; then
         wget --https-only -qO- "$1"
     else
@@ -2846,7 +2846,7 @@ image_checksum_from_official_manifest() {
         *) error "No official checksum source for built-in $TARGET_OS image" ;;
     esac
     manifest="$INSTALL_TMPDIR/official-image-checksum"
-    curl -fsSL --proto '=https' --proto-redir '=https' "$url" -o "$manifest" ||
+    curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$url" -o "$manifest" ||
         error "Could not retrieve official checksum manifest: $url"
     expected=$(awk -v file="$name" -v algorithm="$algo" '
         $1 == algorithm && $2 == "(" file ")" && $3 == "=" { print $4; exit }
@@ -2898,7 +2898,7 @@ download_target_image_in_alpine() {
             mkfifo "$fifo" || error "Could not create image checksum pipe"
             "${IMAGE_HASH_ALGO}sum" <"$fifo" >"$INSTALL_TMPDIR/image-hash" &
             hash_pid=$!
-            if ! curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" |
+            if ! curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
                     tee "$fifo" | xz -dc >"$tmp"; then
                 rm -f "$tmp" "$fifo"
                 wait "$hash_pid" || true
@@ -2908,11 +2908,11 @@ download_target_image_in_alpine() {
             rm -f "$fifo"
             digest=$(awk '{print $1; exit}' "$INSTALL_TMPDIR/image-hash")
         else
-            curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" |
+            curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
                 xz -dc >"$tmp" || error "Failed to download/decompress target image"
         fi
     else
-        curl -fsSL --proto '=https' --proto-redir '=https' "$IMG_URL" -o "$tmp" ||
+        curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" -o "$tmp" ||
             error "Failed to download target image"
         [[ -z "$IMAGE_HASH_EXPECTED" ]] ||
             digest=$("${IMAGE_HASH_ALGO}sum" "$tmp" | awk '{print $1}')
