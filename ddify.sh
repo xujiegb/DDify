@@ -370,6 +370,7 @@ DISK_ID_SIZE=""
 DISK_ID_MODEL=""
 DISK_ID_PTUUID=""
 DISK_ID_MBR_ID=""
+DISK_ID_ANCHOR_PARTUUID=""
 
 validate_target_disk() {
     local disk="$1" typ d
@@ -401,6 +402,20 @@ normalize_disk_wwn() {
     printf '%s\n' "$v"
 }
 
+freebsd_disk_partition_uuids() {
+    local d="${1#/dev/}"
+    gpart list "$d" 2>/dev/null | awk -v disk="$d" '
+        /^[[:space:]]*[0-9]+\. Name:/ { provider=$3 }
+        /^[[:space:]]*rawuuid:/ {
+            prefix=disk "p"
+            if (index(provider, prefix) == 1 &&
+                substr(provider, length(prefix) + 1) ~ /^[0-9]+$/) {
+                print tolower($2)
+            }
+        }
+    '
+}
+
 capture_target_disk_identity() {
     local disk="$1" line d
 
@@ -410,6 +425,7 @@ capture_target_disk_identity() {
     DISK_ID_MODEL=""
     DISK_ID_PTUUID=""
     DISK_ID_MBR_ID=""
+    DISK_ID_ANCHOR_PARTUUID=""
 
     if [[ "$OS" == "Linux" ]]; then
         line=$(lsblk -b -dn -P -o WWN,SERIAL,SIZE,MODEL "$disk" 2>/dev/null | head -n1 || true)
@@ -426,6 +442,9 @@ capture_target_disk_identity() {
         fi
     else
         d="${disk#/dev/}"
+        DISK_ID_ANCHOR_PARTUUID=$(freebsd_disk_partition_uuids "$disk" | sed -n '1p')
+        [[ "$DISK_ID_ANCHOR_PARTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
+            error "Cannot capture FreeBSD GPT partition UUID for cross-OS disk verification"
         if command -v diskinfo >/dev/null 2>&1; then
             DISK_ID_SERIAL=$(diskinfo -s "$disk" 2>/dev/null | head -n1 || true)
             DISK_ID_SIZE=$(diskinfo "$disk" 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
@@ -448,6 +467,7 @@ capture_target_disk_identity() {
         warn "Using a 32-bit MBR disk signature as fallback identity; cloned disks must be disconnected"
     fi
     info "Target disk identity: serial=${DISK_ID_SERIAL:-unknown} wwn=${DISK_ID_WWN:-unknown} size=${DISK_ID_SIZE:-unknown}"
+    [[ -z "$DISK_ID_ANCHOR_PARTUUID" ]] || info "Portable GPT partition identity: $DISK_ID_ANCHOR_PARTUUID"
 }
 
 list_disk_identities() {
@@ -484,6 +504,17 @@ list_disk_identities() {
     done
 }
 
+disk_contains_anchor_partuuid() {
+    local disk="$1" want="${2,,}" uuids count
+    if [[ "$OS" == FreeBSD ]]; then
+        uuids=$(freebsd_disk_partition_uuids "$disk") || return 1
+    else
+        uuids=$(lsblk -rn -o TYPE,PARTUUID "$disk" 2>/dev/null | awk '$1 == "part" && $2 != "" { print tolower($2) }') || return 1
+    fi
+    count=$(printf '%s\n' "$uuids" | awk -v want="$want" 'tolower($0) == want { n++ } END { print n+0 }')
+    [[ "$count" == 1 ]]
+}
+
 disk_identity_matches() {
     local wwn="$1" serial="$2" size="$3" model="$4" ptuuid="${5:-}" mbr_id="${6:-}" pair stored current hit=0
     [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || return 1
@@ -499,10 +530,17 @@ disk_identity_matches() {
 resolve_target_disk_from_identity() {
     local path wwn serial size model ptuuid mbr_id
     local matches=()
-    [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}" ]] || \
+    [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}${DISK_ID_ANCHOR_PARTUUID:-}" ]] || \
         error "No strong target disk identity recorded; refusing destructive write"
+    [[ -z "${DISK_ID_ANCHOR_PARTUUID:-}" || "$DISK_ID_ANCHOR_PARTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
+        error "Invalid saved GPT partition identity"
     while IFS='|' read -r path wwn serial size model ptuuid mbr_id; do
-        disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" "$mbr_id" && matches+=("$path")
+        if [[ -n "${DISK_ID_ANCHOR_PARTUUID:-}" ]]; then
+            [[ "$size" == "$DISK_ID_SIZE" ]] || continue
+            disk_contains_anchor_partuuid "$path" "$DISK_ID_ANCHOR_PARTUUID" && matches+=("$path")
+        else
+            disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" "$mbr_id" && matches+=("$path")
+        fi
     done < <(list_disk_identities)
 
     ((${#matches[@]} == 1)) || error "Saved target identity matched ${#matches[@]} disks; refusing destructive write"
@@ -1522,6 +1560,7 @@ write_install_plan() {
         printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
         printf 'DISK_ID_PTUUID=%q\n' "${DISK_ID_PTUUID:-}"
         printf 'DISK_ID_MBR_ID=%q\n' "${DISK_ID_MBR_ID:-}"
+        printf 'DISK_ID_ANCHOR_PARTUUID=%q\n' "${DISK_ID_ANCHOR_PARTUUID:-}"
         printf 'IMG_URL=%q\n' "$IMG_URL"
         printf 'IMAGE_BUILTIN=%q\n' "${IMAGE_BUILTIN:-0}"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
