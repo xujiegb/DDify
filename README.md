@@ -64,7 +64,7 @@ curl -O https://raw.githubusercontent.com/xujiegb/DDify/main/ddify.sh || wget -O
 ```bash
 bash ddify.sh rocky     10
               almalinux 10
-              fedora    43
+              fedora    44
               freebsd   14 | 15
               debian    13
               redhat    --img="http://access.cdn.redhat.com/xxx.qcow2"
