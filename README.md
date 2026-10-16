@@ -34,7 +34,7 @@
 </table>
 
 ```bash
-sudo dnf install curl bash
+sudo dnf install -y curl bash
 ```
 
 <table>
@@ -42,7 +42,7 @@ sudo dnf install curl bash
 </table>
 
 ```bash
-sudo apt install curl bash
+sudo apt install -y curl bash
 ```
 
 <table>
@@ -50,7 +50,7 @@ sudo apt install curl bash
 </table>
 
 ```bash
-pkg install curl bash
+pkg install -y curl bash
 ```
 
 ### Step 2 · Download Script / 下载脚本
