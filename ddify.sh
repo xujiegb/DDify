@@ -1847,6 +1847,16 @@ REPOEOF
     apk add --no-cache \
         bash curl wget ca-certificates xz qemu-img util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
         e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
+    if ! grep -q '^TARGET_OS=freebsd$' /etc/reinstall/plan.env; then
+        echo "[stage] apk add (Linux filesystem-copy tools)"
+        apk add --no-cache rsync btrfs-progs python3
+        for cmd in rsync python3 mkfs.btrfs btrfstune btrfs xfs_growfs; do
+            command -v "$cmd" >/dev/null 2>&1 || {
+                echo "Linux file-copy dependency is missing: $cmd" >&2
+                exit 1
+            }
+        done
+    fi
     update-ca-certificates 2>/dev/null || true
     blkid -V 2>&1 | grep -qi util-linux || { echo "Full util-linux blkid is required" >&2; exit 1; }
 
@@ -3325,6 +3335,17 @@ grow_last_partition_reserving_cidata() {
 }
 
 cleanup_install_stage() {
+    local path vg
+    # A failed file copy must release all mounts before disconnecting qemu-nbd.
+    for path in "${LINUX_COPY_ROOT_MNT:-}" "${LINUX_COPY_SRC_MNT:-}" \
+        "${INSTALL_TMPDIR:-}/linux-src-boot" "${INSTALL_TMPDIR:-}/linux-src-efi" \
+        "${INSTALL_TMPDIR:-}/linux-probe"         "${INSTALL_TMPDIR:-}/linux-btrfs-source-top"         "${INSTALL_TMPDIR:-}/linux-btrfs-target-top"; do
+        [[ -n "$path" && "$path" != /linux-* ]] || continue
+        is_mountpoint "$path" && umount -R "$path" 2>/dev/null || true
+    done
+    for vg in "${LINUX_COPY_SOURCE_VGS[@]}"; do
+        vgchange -an "$vg" >/dev/null 2>&1 || true
+    done
     cleanup_qcow_nbd
     is_mountpoint "$TEMP_STAGE_MNT" && umount "$TEMP_STAGE_MNT" 2>/dev/null || true
     [[ -z "${INSTALL_TMPDIR:-}" ]] || rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
@@ -3387,6 +3408,537 @@ installer_write_image() {
     grow_last_partition_reserving_cidata
 }
 
+# Linux cloud images are installed by copying files, not by shrinking an XFS image.
+# FreeBSD retains its original block-level QCOW2 installation path.
+LINUX_COPY_SRC_ROOT=""
+LINUX_COPY_SRC_BOOT=""
+LINUX_COPY_SRC_EFI=""
+LINUX_COPY_ROOT_TYPE=""
+LINUX_COPY_ROOT_UUID=""
+LINUX_COPY_BOOT_UUID=""
+LINUX_COPY_EFI_UUID=""
+LINUX_COPY_ROOT_TARGET=""
+LINUX_COPY_ROOT_MNT=""
+LINUX_COPY_SRC_MNT=""
+LINUX_COPY_EFI_PARTNUM=""
+LINUX_COPY_BOOT_PARTNUM=""
+LINUX_COPY_ROOT_PARTNUM=""
+LINUX_COPY_SOURCE_VGS=()
+LINUX_COPY_BTRFS_MOUNTS=()
+
+linux_copy_source_mount() {
+    local dev="$1" dir="$2" fs="$3"
+    mkdir -p "$dir"
+    case "$fs" in
+        xfs) mount -t xfs -o ro,nouuid,norecovery "$dev" "$dir" ;;
+        ext4|ext3|ext2) mount -t "$fs" -o ro,noload "$dev" "$dir" ;;
+        vfat) mount -t vfat -o ro "$dev" "$dir" ;;
+        btrfs)
+            # Fedora Cloud uses a root subvolume rather than the Btrfs top level.
+            mount -t btrfs -o ro,subvol=root "$dev" "$dir" 2>/dev/null ||
+                mount -t btrfs -o ro "$dev" "$dir" ;;
+
+        *) error "Unsupported Linux source filesystem for file-copy installation: $fs ($dev)" ;;
+    esac || error "Failed to mount source filesystem read-only: $dev"
+}
+
+linux_copy_scan_source() {
+    local nbd="$QCOW_NBD_DEV" table pv vg dev fs type mp path count=0
+    table=$(blkid -p -s PTTYPE -o value "$nbd" 2>/dev/null || true)
+    [[ "$table" == gpt ]] || error "Linux file-copy installer currently requires a GPT cloud image (detected: ${table:-unknown})"
+    sgdisk -v "$nbd" >/dev/null || error "Invalid source GPT"
+    [[ "$(blockdev --getss "$nbd")" == "$(blockdev --getss "$DISK")" ]] || error "Source/target sector size mismatch"
+
+    # Activate only the image's volume groups, if any. Alpine rescue has no VG of its own.
+    while read -r dev fs; do
+        [[ "$fs" == LVM2_member ]] || continue
+        vg=$(pvs --readonly --noheadings -o vg_name "$dev" 2>/dev/null | awk 'NF {print $1; exit}')
+        [[ -n "$vg" ]] || error "Could not determine source LVM volume group on $dev"
+        if [[ ! " ${LINUX_COPY_SOURCE_VGS[*]} " == *" $vg "* ]]; then
+            vgchange -ay "$vg" >/dev/null || error "Cannot activate source LVM group: $vg"
+            LINUX_COPY_SOURCE_VGS+=("$vg")
+        fi
+    done < <(lsblk -pnr -o NAME,FSTYPE "$nbd")
+    command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
+
+    LINUX_COPY_SRC_MNT="$INSTALL_TMPDIR/linux-source"
+    local probe="$INSTALL_TMPDIR/linux-probe"
+    mkdir -p "$LINUX_COPY_SRC_MNT" "$probe"
+    # lsblk includes active LVM logical volumes after vgchange -ay.
+    while read -r dev fs type; do
+        case "$fs" in xfs|ext4|ext3|ext2|vfat|btrfs) ;; *) continue ;; esac
+        [[ "$type" != disk ]] || continue
+        linux_copy_source_mount "$dev" "$probe" "$fs"
+        if [[ -f "$probe/etc/os-release" ]]; then
+            (( ++count == 1 )) || error "Ambiguous Linux source root filesystems"
+            LINUX_COPY_SRC_ROOT="$dev"
+            LINUX_COPY_ROOT_TYPE="$fs"
+        elif [[ "$fs" == vfat && -d "$probe/EFI" ]]; then
+            [[ -z "$LINUX_COPY_SRC_EFI" ]] || error "Ambiguous source EFI partitions"
+            LINUX_COPY_SRC_EFI="$dev"
+        elif [[ "$fs" != vfat && -n "$(find "$probe" -maxdepth 1 -name 'vmlinuz*' -print -quit 2>/dev/null)" ]]; then
+            [[ -z "$LINUX_COPY_SRC_BOOT" ]] || error "Ambiguous source /boot partitions"
+            LINUX_COPY_SRC_BOOT="$dev"
+        elif [[ -d "$probe/grub2" || -d "$probe/grub" || -d "$probe/loader/entries" ]]; then
+            [[ -z "$LINUX_COPY_SRC_BOOT" ]] || error "Ambiguous source /boot partitions"
+            LINUX_COPY_SRC_BOOT="$dev"
+        else
+            # A second unknown Linux filesystem may be /var or /home; do not silently lose it.
+            if [[ "$fs" != vfat ]]; then
+                umount "$probe" || true
+                error "Unrecognized additional source filesystem $dev ($fs); refusing incomplete file copy"
+            fi
+        fi
+        umount "$probe" || error "Cannot unmount source probe $dev"
+    done < <(lsblk -pnr -o NAME,FSTYPE,TYPE "$nbd")
+    (( count == 1 )) || error "Exactly one Linux root filesystem is required (found $count)"
+    [[ "$LINUX_COPY_ROOT_TYPE" == xfs || "$LINUX_COPY_ROOT_TYPE" == ext4 || "$LINUX_COPY_ROOT_TYPE" == btrfs ]] || error "Unsupported Linux root filesystem"
+    [[ -z "$LINUX_COPY_SRC_BOOT" || "$LINUX_COPY_SRC_BOOT" != "$LINUX_COPY_SRC_ROOT" ]] || error "Invalid source /boot"
+    [[ -z "$LINUX_COPY_SRC_EFI" || "$LINUX_COPY_SRC_EFI" != "$LINUX_COPY_SRC_ROOT" ]] || error "Invalid source EFI"
+    if [[ -d /sys/firmware/efi ]]; then
+        [[ -n "$LINUX_COPY_SRC_EFI" ]] || error "UEFI host requires a source EFI system partition"
+    else
+        error "Linux file-copy installation on legacy BIOS is not yet implemented; refusing to produce an unbootable system"
+    fi
+
+    linux_copy_source_mount "$LINUX_COPY_SRC_ROOT" "$LINUX_COPY_SRC_MNT" "$LINUX_COPY_ROOT_TYPE"
+    LINUX_COPY_ROOT_UUID=$(blkid -s UUID -o value "$LINUX_COPY_SRC_ROOT" 2>/dev/null || true)
+    [[ -n "$LINUX_COPY_ROOT_UUID" ]] || error "Source root filesystem has no UUID"
+    if [[ -n "$LINUX_COPY_SRC_BOOT" ]]; then
+        LINUX_COPY_BOOT_UUID=$(blkid -s UUID -o value "$LINUX_COPY_SRC_BOOT" 2>/dev/null || true)
+        [[ -n "$LINUX_COPY_BOOT_UUID" ]] || error "Source /boot filesystem has no UUID"
+    fi
+    if [[ -n "$LINUX_COPY_SRC_EFI" ]]; then
+        LINUX_COPY_EFI_UUID=$(blkid -s UUID -o value "$LINUX_COPY_SRC_EFI" 2>/dev/null || true)
+        [[ "$LINUX_COPY_EFI_UUID" =~ ^[[:xdigit:]]{4}-[[:xdigit:]]{4}$ ]] || error "Invalid source EFI FAT UUID"
+    fi
+    info "File-copy source: root=$LINUX_COPY_SRC_ROOT ($LINUX_COPY_ROOT_TYPE); boot=${LINUX_COPY_SRC_BOOT:-in-root}; EFI=${LINUX_COPY_SRC_EFI:-none}"
+}
+
+linux_copy_preserve_partuuid() {
+    local src="$1" num="$2" uuid
+    [[ -n "$src" && "$src" == "$QCOW_NBD_DEV"p* ]] || return 0
+    uuid=$(blkid -s PARTUUID -o value "$src" 2>/dev/null || true)
+    [[ -z "$uuid" ]] || sgdisk -u "$num:$uuid" "$DISK" >/dev/null || error "Cannot retain PARTUUID for partition $num"
+}
+
+linux_copy_create_partitions() {
+    local n=1 efi_mb boot_mb efi_dev boot_dev root_dev src_size stage_boundary
+    # Staging is partition 128, leaving standard partition numbers free for Linux.
+    [[ "$TEMP_STAGE_PART_NUM" == 128 ]] || error "Linux file-copy requires staging partition 128"
+    [[ -n "$LINUX_COPY_SRC_EFI" ]] || error "No EFI system partition"
+    src_size=$(blockdev --getsize64 "$LINUX_COPY_SRC_EFI")
+    efi_mb=$(((src_size + 1024 * 1024 - 1) / (1024 * 1024)))
+    (( efi_mb >= 32 )) || efi_mb=32
+    LINUX_COPY_EFI_PARTNUM="$n"
+    sgdisk -n "$n:0:+${efi_mb}M" -t "$n:EF00" -c "$n:EFI System" "$DISK" >/dev/null || error "Cannot create Linux EFI partition"
+    linux_copy_preserve_partuuid "$LINUX_COPY_SRC_EFI" "$n"
+    ((n++))
+
+    if [[ -n "$LINUX_COPY_SRC_BOOT" ]]; then
+        src_size=$(blockdev --getsize64 "$LINUX_COPY_SRC_BOOT")
+        boot_mb=$(((src_size + 1024 * 1024 - 1) / (1024 * 1024)))
+        LINUX_COPY_BOOT_PARTNUM="$n"
+        sgdisk -n "$n:0:+${boot_mb}M" -t "$n:8300" -c "$n:Linux boot" "$DISK" >/dev/null || error "Cannot create Linux /boot partition"
+        linux_copy_preserve_partuuid "$LINUX_COPY_SRC_BOOT" "$n"
+        ((n++))
+    fi
+
+    LINUX_COPY_ROOT_PARTNUM="$n"
+    stage_boundary=$((TEMP_STAGE_START_SECTOR - 16384))
+    sgdisk -n "$n:0:$stage_boundary" -t "$n:8300" -c "$n:Linux root" "$DISK" >/dev/null || error "Target disk lacks space for Linux root alongside 3 GiB staging"
+    linux_copy_preserve_partuuid "$LINUX_COPY_SRC_ROOT" "$n"
+    sgdisk -v "$DISK" >/dev/null || error "Target GPT is inconsistent after partition allocation"
+    reread_partition_table_strict
+    efi_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_EFI_PARTNUM")
+    root_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_ROOT_PARTNUM")
+    ensure_linux_block_node_from_sysfs "$efi_dev" || [[ -b "$efi_dev" ]] || error "Missing Linux EFI block device"
+    ensure_linux_block_node_from_sysfs "$root_dev" || [[ -b "$root_dev" ]] || error "Missing Linux root block device"
+    LINUX_COPY_ROOT_TARGET="$root_dev"
+    if [[ -n "$LINUX_COPY_BOOT_PARTNUM" ]]; then
+        boot_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_BOOT_PARTNUM")
+        ensure_linux_block_node_from_sysfs "$boot_dev" || [[ -b "$boot_dev" ]] || error "Missing Linux /boot block device"
+    fi
+    info "Copy target: root=$root_dev, boot=${boot_dev:-in-root}, EFI=$efi_dev, staging=$TEMP_STAGE_PART"
+}
+
+linux_copy_format_ext4_or_xfs() {
+    local dev="$1" src="$2" fs uuid label tool toolpath=""
+    local -a args=()
+    fs=$(blkid -s TYPE -o value "$src" 2>/dev/null || true)
+    uuid=$(blkid -s UUID -o value "$src" 2>/dev/null || true)
+    label=$(blkid -s LABEL -o value "$src" 2>/dev/null || true)
+    [[ -n "$uuid" ]] || error "Source filesystem UUID missing: $src"
+    case "$fs" in
+        ext4)
+            tool=mkfs.ext4
+            args=(-F -m 0 -U "$uuid")
+            [[ -z "$label" ]] || args+=(-L "$label")
+            ;;
+        xfs)
+            tool=mkfs.xfs
+            args=(-f -m "uuid=$uuid")
+            [[ -z "$label" ]] || args+=(-L "$label")
+            ;;
+        *) error "Unsupported Linux filesystem to recreate: $fs ($src)" ;;
+    esac
+    # Run the matching distro's formatter: Alpine's newer filesystem features
+    # are not necessarily understood by the destination image's GRUB.
+    for toolpath in "/usr/sbin/$tool" "/sbin/$tool"; do
+        [[ ! -x "$LINUX_COPY_SRC_MNT$toolpath" ]] || break
+    done
+    [[ -x "$LINUX_COPY_SRC_MNT$toolpath" ]] || error "Source Linux image has no $tool formatter"
+    mount --bind /dev "$LINUX_COPY_SRC_MNT/dev" || error "Cannot bind /dev for source formatter"
+    mount -t proc proc "$LINUX_COPY_SRC_MNT/proc" || error "Cannot mount /proc for source formatter"
+    if ! chroot "$LINUX_COPY_SRC_MNT" "$toolpath" "${args[@]}" "$dev" >/dev/null; then
+        umount "$LINUX_COPY_SRC_MNT/proc" || true
+        umount "$LINUX_COPY_SRC_MNT/dev" || true
+        error "Source Linux $tool failed while formatting $dev"
+    fi
+    umount "$LINUX_COPY_SRC_MNT/proc" || error "Cannot unmount source formatter procfs"
+    umount "$LINUX_COPY_SRC_MNT/dev" || error "Cannot unmount source formatter devfs"
+}
+
+linux_copy_mount_target() {
+    local dev="$1" where="$2" fs="$3"
+    mkdir -p "$where"
+    if [[ "$fs" == xfs ]]; then
+        mount -t xfs -o nouuid "$dev" "$where" || error "Cannot mount target XFS: $dev"
+    else
+        mount "$dev" "$where" || error "Cannot mount target filesystem: $dev"
+    fi
+}
+
+linux_copy_repair_boot_configs() {
+    local python_code="$INSTALL_TMPDIR/linux-copy-repair.py"
+    cat >"$python_code" <<'PY'
+import glob
+import os
+import re
+import sys
+
+root, uuid, boot_uuid, efi_uuid, is_lvm = sys.argv[1:]
+
+def edit_text(path, fn):
+    if not os.path.isfile(path) or os.path.islink(path):
+        return
+    with open(path, 'rb') as f:
+        content = f.read()
+    try:
+        old = content.decode('utf-8')
+    except UnicodeDecodeError:
+        return
+    new = fn(old)
+    if new != old:
+        with open(path, 'wb') as f:
+            f.write(new.encode('utf-8'))
+
+def fstab_fix(old):
+    seen = {'/': False, '/boot': False, '/boot/efi': False}
+    lines = []
+    for line in old.splitlines(keepends=True):
+        fields = line.split()
+        if not fields or line.lstrip().startswith('#') or len(fields) < 3:
+            lines.append(line)
+            continue
+        mp = fields[1]
+        if fields[2] == 'swap':
+            # Source swap is not copied. An obsolete UUID can delay boot.
+            print('DDify: source swap omitted from copied Linux system', file=sys.stderr)
+            lines.append('# DDify: source swap partition was not copied: ' + line)
+            continue
+        if mp in seen:
+            seen[mp] = True
+        if mp == '/':
+            fields[0] = 'UUID=' + uuid
+            line = '\t'.join(fields) + '\n'
+        elif mp == '/boot' and boot_uuid:
+            fields[0] = 'UUID=' + boot_uuid
+            line = '\t'.join(fields) + '\n'
+        elif mp == '/boot/efi' and efi_uuid:
+            fields[0] = 'UUID=' + efi_uuid
+            line = '\t'.join(fields) + '\n'
+        elif is_lvm == '1' and re.search(r'/dev/(?:mapper/|[^/]+/)', fields[0]):
+            # Non-root logical volumes must not be silently discarded.
+            raise RuntimeError('Additional LVM mount in fstab is unsupported: ' + line)
+        lines.append(line)
+    if not seen['/']:
+        lines.append('UUID=' + uuid + '\t/\tauto\tdefaults\t0 1\n')
+    if boot_uuid and not seen['/boot']:
+        lines.append('UUID=' + boot_uuid + '\t/boot\tauto\tdefaults\t0 2\n')
+    if efi_uuid and not seen['/boot/efi']:
+        lines.append('UUID=' + efi_uuid + '\t/boot/efi\tvfat\tdefaults\t0 2\n')
+    return ''.join(lines)
+
+fstab = os.path.join(root, 'etc/fstab')
+if os.path.exists(fstab):
+    edit_text(fstab, fstab_fix)
+else:
+    os.makedirs(os.path.dirname(fstab), exist_ok=True)
+    with open(fstab, 'w') as f:
+        f.write(fstab_fix(''))
+
+# Preserve source filesystem UUIDs; only change the root kernel arg and remove
+# root-LVM-specific dracut flags when the LVM PV is replaced by a plain partition.
+def cmdline_fix(old):
+    old = re.sub(r'(?<![A-Za-z0-9_])resume=[^\s\"\']+[ \t]*', '', old)
+    if is_lvm != '1':
+        return old
+    old = re.sub(r'(?<![A-Za-z0-9_])root=(?!\$)[^\s"\']+', 'root=UUID=' + uuid, old)
+    old = re.sub(r'(?<!\S)rd\.lvm\.(?:lv|vg|uuid)=[^\s"\']+[ \t]*', '', old)
+    old = re.sub(r'(?<!\S)resume=/dev/(?:mapper/|[^/]+/)[^\s"\']+[ \t]*', '', old)
+    return old
+
+patterns = [
+    'etc/default/grub', 'etc/default/grub.d/*.cfg', 'etc/kernel/cmdline',
+    'boot/grub2/grub.cfg', 'boot/grub/grub.cfg',
+    'boot/loader/entries/*.conf', 'boot/efi/loader/entries/*.conf',
+    'boot/efi/EFI/*/grub.cfg', 'boot/efi/EFI/*/*.cfg',
+]
+for pattern in patterns:
+    for path in glob.glob(os.path.join(root, pattern)):
+        edit_text(path, cmdline_fix)
+
+# grubenv is a fixed-size GRUB environment block padded with '#'.
+# Preserve the byte length; regular text-file replacement would corrupt it.
+if is_lvm == '1':
+    for pattern in ['boot/grub2/grubenv', 'boot/grub/grubenv', 'boot/efi/EFI/*/grubenv']:
+        for path in glob.glob(os.path.join(root, pattern)):
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            with open(path, 'rb') as f:
+                old = f.read()
+            if not old.startswith(b'# GRUB Environment Block\n') or len(old) != 1024:
+                if b'rd.lvm.' in old or b'root=/dev/mapper/' in old:
+                    raise RuntimeError('Cannot safely rewrite this GRUB environment format: ' + path)
+                continue
+            body = old.rstrip(b'#').decode('utf-8', 'replace')
+            new_body = cmdline_fix(body).encode('utf-8')
+            if len(new_body) > 1024:
+                raise RuntimeError('GRUB environment has no room for root argument update: ' + path)
+            if new_body != body.encode('utf-8'):
+                with open(path, 'wb') as f:
+                    f.write(new_body + b'#' * (1024 - len(new_body)))
+PY
+    local is_lvm=0
+    [[ "$LINUX_COPY_SRC_ROOT" != /dev/mapper/* && "$LINUX_COPY_SRC_ROOT" != /dev/dm-* ]] || is_lvm=1
+    python3 "$python_code" "$LINUX_COPY_ROOT_MNT" "$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_BOOT_UUID" "$LINUX_COPY_EFI_UUID" "$is_lvm" || error "Failed to update root filesystem and boot references"
+}
+
+linux_copy_regenerate_lvm_initramfs() {
+    [[ "$LINUX_COPY_SRC_ROOT" == /dev/mapper/* || "$LINUX_COPY_SRC_ROOT" == /dev/dm-* ]] || return 0
+    local root="$LINUX_COPY_ROOT_MNT"
+    [[ -x "$root/usr/bin/dracut" || -x "$root/usr/sbin/dracut" || -x "$root/sbin/dracut" ]] || \
+        error "LVM-to-partition conversion requires dracut inside the Linux cloud image"
+    info "Regenerating initramfs after removing source LVM root dependency"
+    mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/run"
+    mount --rbind /dev "$root/dev" || error "Could not bind /dev into target chroot"
+    mount --make-rslave "$root/dev" || true
+    mount -t proc proc "$root/proc" || error "Could not mount target /proc"
+    mount --rbind /sys "$root/sys" || error "Could not bind /sys into target chroot"
+    mount --make-rslave "$root/sys" || true
+    if ! chroot "$root" /bin/sh -c 'dracut --force --regenerate-all --no-hostonly'; then
+        umount -R "$root/sys" 2>/dev/null || true
+        umount "$root/proc" 2>/dev/null || true
+        umount -R "$root/dev" 2>/dev/null || true
+        error "dracut failed to regenerate an initramfs that can boot from a plain root partition"
+    fi
+    umount -R "$root/sys" || error "Could not unmount chroot sysfs"
+    umount "$root/proc" || error "Could not unmount chroot procfs"
+    umount -R "$root/dev" || error "Could not unmount chroot devfs"
+}
+
+linux_copy_ensure_efi_fallback() {
+    local esp="$LINUX_COPY_ROOT_MNT/boot/efi" bootfile candidate
+    case "$MACHINE_ARCH" in
+        aarch64) bootfile=BOOTAA64.EFI ;;
+        x86_64) bootfile=BOOTX64.EFI ;;
+        *) error "Unsupported UEFI architecture for Linux file-copy: $MACHINE_ARCH" ;;
+    esac
+    [[ -f "$esp/EFI/BOOT/$bootfile" ]] && return 0
+    candidate=$(find "$esp/EFI" -type f \( -iname 'grubaa64.efi' -o -iname 'grubx64.efi' -o -iname "$bootfile" \) -print -quit 2>/dev/null)
+    [[ -n "$candidate" ]] || error "Source cloud image has no UEFI fallback loader or reusable GRUB EFI binary"
+    mkdir -p "$esp/EFI/BOOT"
+    cp -p "$candidate" "$esp/EFI/BOOT/$bootfile" || error "Could not install UEFI fallback path"
+    warn "Added UEFI fallback $bootfile from $(basename "$candidate")"
+}
+
+
+linux_copy_btrfs_subvolumes() {
+    local dest_root="$1" source_top="$INSTALL_TMPDIR/linux-btrfs-source-top" \
+        dest_top="$INSTALL_TMPDIR/linux-btrfs-target-top" subvol path mp opts root_subvol="" line id default_subvol=""
+    local -a subvols=()
+    mkdir -p "$source_top" "$dest_top"
+    mount -t btrfs -o ro,subvolid=5 "$LINUX_COPY_SRC_ROOT" "$source_top" || error "Cannot mount source Btrfs top-level"
+    mount -t btrfs -o subvolid=5 "$LINUX_COPY_ROOT_TARGET" "$dest_top" || error "Cannot mount target Btrfs top-level"
+    mapfile -t subvols < <(btrfs subvolume list -o "$source_top" | sed -n 's/^.* path //p' | LC_ALL=C sort)
+    (( ${#subvols[@]} > 0 )) || error "Btrfs source has no subvolumes; unsupported cloud image layout"
+    for path in "${subvols[@]}"; do
+        [[ "$path" =~ ^[a-zA-Z0-9_@.+/-]+$ && "$path" != /* && "$path" != *../* && "$path" != .. ]] || error "Invalid source Btrfs subvolume path: $path"
+        mkdir -p "$(dirname "$dest_top/$path")"
+        btrfs subvolume create "$dest_top/$path" >/dev/null || error "Cannot create target Btrfs subvolume: $path"
+    done
+    for path in "${subvols[@]}"; do
+        info "Copying Btrfs subvolume: $path"
+        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+            "$source_top/$path/" "$dest_top/$path/" || error "Could not copy Btrfs subvolume: $path"
+    done
+    default_subvol=$(btrfs subvolume get-default "$source_top" | sed -n 's/^.* path //p' | head -n1)
+    if [[ -n "$default_subvol" && "$default_subvol" != '<FS_TREE>' ]]; then
+        id=$(btrfs subvolume list "$dest_top" | awk -v name="$default_subvol" '$0 ~ " path " name "$" {print $2; exit}')
+        [[ "$id" =~ ^[0-9]+$ ]] || error "Cannot map Btrfs default subvolume: $default_subvol"
+        btrfs subvolume set-default "$id" "$dest_top" || error "Cannot set target Btrfs default subvolume"
+    fi
+    umount "$dest_top" || error "Cannot unmount target Btrfs top-level"
+    umount "$source_top" || error "Cannot unmount source Btrfs top-level"
+
+    # Root and auxiliary mountpoints are specified by the source's fstab.
+    local fstab="$LINUX_COPY_SRC_MNT/etc/fstab" rootopts=""
+    if [[ -f "$fstab" ]]; then
+        rootopts=$(awk '$1 !~ /^#/ && $2 == "/" && $3 == "btrfs" {print $4; exit}' "$fstab")
+    fi
+    for opts in ${rootopts//,/ }; do
+        case "$opts" in subvol=*) root_subvol="${opts#subvol=}" ;; esac
+    done
+    [[ -n "$root_subvol" ]] || root_subvol=root
+    root_subvol="${root_subvol#/}"
+    [[ -d "$INSTALL_TMPDIR/linux-btrfs-target-top/$root_subvol" ]] || error "Root Btrfs subvolume missing after copy: $root_subvol"
+    mkdir -p "$dest_root"
+    mount -t btrfs -o "subvol=$root_subvol" "$LINUX_COPY_ROOT_TARGET" "$dest_root" || error "Cannot mount destination Btrfs root subvolume"
+
+    while read -r subvol mp; do
+        [[ -n "$subvol" && -n "$mp" ]] || continue
+        case "$mp" in /boot|/home|/var|/var/log) ;; *) error "Unsupported Btrfs subvolume mountpoint: $mp" ;; esac
+        subvol="${subvol#/}"
+        [[ "$subvol" =~ ^[a-zA-Z0-9_@.+/-]+$ && "$subvol" != *../* ]] || error "Invalid subvolume in fstab: $subvol"
+        mkdir -p "$dest_root$mp"
+        mount -t btrfs -o "subvol=$subvol" "$LINUX_COPY_ROOT_TARGET" "$dest_root$mp" || error "Cannot mount target Btrfs subvolume $mp"
+        LINUX_COPY_BTRFS_MOUNTS+=("$dest_root$mp")
+    done < <(awk '$1 !~ /^#/ && $3 == "btrfs" && $2 != "/" {split($4,a,","); for(i in a) if(a[i] ~ /^subvol=/) {sub(/^subvol=/,"",a[i]); print a[i], $2}}' "$fstab" | LC_ALL=C sort -k2,2)
+}
+
+linux_copy_recreate_and_copy() {
+    local root="$INSTALL_TMPDIR/linux-target" src_boot_mnt="$INSTALL_TMPDIR/linux-src-boot" \
+        src_efi_mnt="$INSTALL_TMPDIR/linux-src-efi" boot_dev= efi_dev src_boot_fs= root_available root_used
+    LINUX_COPY_ROOT_MNT="$root"
+    efi_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_EFI_PARTNUM")
+    if [[ -n "$LINUX_COPY_BOOT_PARTNUM" ]]; then
+        boot_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_BOOT_PARTNUM")
+        src_boot_fs=$(blkid -s TYPE -o value "$LINUX_COPY_SRC_BOOT")
+        [[ "$src_boot_fs" == xfs || "$src_boot_fs" == ext4 ]] || error "Unsupported /boot source filesystem: $src_boot_fs"
+    fi
+    if [[ "$LINUX_COPY_ROOT_TYPE" == btrfs ]]; then
+        local btrfs_label
+        btrfs_label=$(blkid -s LABEL -o value "$LINUX_COPY_SRC_ROOT" 2>/dev/null || true)
+        if [[ -n "$btrfs_label" ]]; then
+            mkfs.btrfs -f -L "$btrfs_label" "$LINUX_COPY_ROOT_TARGET" >/dev/null || error "Cannot create target Btrfs filesystem"
+        else
+            mkfs.btrfs -f "$LINUX_COPY_ROOT_TARGET" >/dev/null || error "Cannot create target Btrfs filesystem"
+        fi
+    else
+        linux_copy_format_ext4_or_xfs "$LINUX_COPY_ROOT_TARGET" "$LINUX_COPY_SRC_ROOT"
+    fi
+    [[ -z "$boot_dev" ]] || linux_copy_format_ext4_or_xfs "$boot_dev" "$LINUX_COPY_SRC_BOOT"
+    local efi_label
+    efi_label=$(blkid -s LABEL -o value "$LINUX_COPY_SRC_EFI" 2>/dev/null || true)
+    local fatargs=(-F 32 -i "${LINUX_COPY_EFI_UUID//-/}")
+    [[ -z "$efi_label" ]] || fatargs+=(-n "$efi_label")
+    mkfs.vfat "${fatargs[@]}" "$efi_dev" >/dev/null || error "Cannot format target EFI filesystem"
+
+    root_available=$(blockdev --getsize64 "$LINUX_COPY_ROOT_TARGET")
+    root_used=$(du -sx -B1 "$LINUX_COPY_SRC_MNT" | awk '{print $1}')
+    (( root_used + 256 * 1024 * 1024 < root_available )) || \
+        error "Source root data ($root_used bytes) does not fit into staging-safe target root ($root_available bytes)"
+
+    if [[ "$LINUX_COPY_ROOT_TYPE" == btrfs ]]; then
+        linux_copy_btrfs_subvolumes "$root"
+    else
+        linux_copy_mount_target "$LINUX_COPY_ROOT_TARGET" "$root" "$LINUX_COPY_ROOT_TYPE"
+        info "Copying Linux root filesystem, including hidden files, xattrs and ACLs"
+        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+            "$LINUX_COPY_SRC_MNT/" "$root/" || error "Failed to copy Linux root filesystem"
+    fi
+    if [[ -n "$boot_dev" ]]; then
+        linux_copy_source_mount "$LINUX_COPY_SRC_BOOT" "$src_boot_mnt" "$src_boot_fs"
+        linux_copy_mount_target "$boot_dev" "$root/boot" "$src_boot_fs"
+        info "Copying Linux /boot"
+        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+            "$src_boot_mnt/" "$root/boot/" || error "Failed to copy Linux /boot"
+    fi
+    linux_copy_source_mount "$LINUX_COPY_SRC_EFI" "$src_efi_mnt" vfat
+    mkdir -p "$root/boot/efi"
+    mount -t vfat "$efi_dev" "$root/boot/efi" || error "Failed to mount target EFI partition"
+    info "Copying EFI bootloader and metadata"
+    rsync -rt --modify-window=2 --info=progress2 "$src_efi_mnt/" "$root/boot/efi/" || error "Failed to copy EFI files"
+    [[ -f "$root/etc/os-release" ]] || error "Copied Linux root is missing /etc/os-release"
+    [[ -e "$root/bin/sh" || -e "$root/usr/bin/sh" ]] || error "Copied Linux root has no shell"
+    linux_copy_repair_boot_configs
+    linux_copy_ensure_efi_fallback
+    linux_copy_regenerate_lvm_initramfs
+    sync
+
+    umount "$root/boot/efi" || error "Failed to unmount target EFI"
+    umount "$src_efi_mnt" || error "Failed to unmount source EFI"
+    if [[ -n "$boot_dev" ]]; then
+        umount "$root/boot" || error "Failed to unmount target /boot"
+        umount "$src_boot_mnt" || error "Failed to unmount source /boot"
+    fi
+    local idx
+    for ((idx=${#LINUX_COPY_BTRFS_MOUNTS[@]}-1; idx>=0; idx--)); do
+        umount "${LINUX_COPY_BTRFS_MOUNTS[idx]}" || error "Could not unmount Btrfs subvolume ${LINUX_COPY_BTRFS_MOUNTS[idx]}"
+    done
+    umount "$root" || error "Failed to unmount target root"
+    umount "$LINUX_COPY_SRC_MNT" || error "Failed to unmount source root"
+}
+
+linux_copy_release_staging_and_grow() {
+    local root="$LINUX_COPY_ROOT_MNT" target="$LINUX_COPY_ROOT_TARGET" vg
+    # No mounted source devices may remain before NBD and staging are released.
+    for vg in "${LINUX_COPY_SOURCE_VGS[@]}"; do
+        vgchange -an "$vg" >/dev/null || error "Cannot deactivate source LVM group: $vg"
+    done
+    cleanup_qcow_nbd
+    sync
+    umount "$TEMP_STAGE_MNT" || error "Cannot unmount image staging partition"
+    TEMP_STAGE_RELEASED=1
+    sgdisk -d "$TEMP_STAGE_PART_NUM" "$DISK" >/dev/null || error "Cannot remove temporary staging GPT partition"
+    sgdisk -e "$DISK" >/dev/null || error "Cannot normalize destination GPT after removing staging"
+    reread_partition_table_strict
+    grow_last_partition_reserving_cidata
+    case "$LINUX_COPY_ROOT_TYPE" in
+        xfs)
+            linux_copy_mount_target "$target" "$root" xfs
+            xfs_growfs "$root" >/dev/null || error "Cannot expand copied Linux XFS filesystem"
+            umount "$root" || error "Cannot unmount expanded XFS filesystem" ;;
+        ext4)
+            e2fsck -pf "$target" || { rc=$?; ((rc <= 1)) || error "Target ext4 fsck failed: $rc"; }
+            resize2fs "$target" >/dev/null || error "Cannot expand copied Linux ext4 filesystem" ;;
+        btrfs)
+            # Source NBD is now gone, so reusing its filesystem UUID is safe.
+            btrfstune -U "$LINUX_COPY_ROOT_UUID" "$target" || error "Cannot restore source Btrfs UUID"
+            mount -t btrfs -o subvolid=5 "$target" "$root" || error "Cannot mount copied Btrfs for expansion"
+            btrfs filesystem resize max "$root" >/dev/null || error "Cannot expand copied Btrfs"
+            umount "$root" || error "Cannot unmount copied Btrfs" ;;
+    esac
+    TEMP_STAGE_PART=""
+    info "Linux file-copy complete; temporary staging released and root filesystem expanded"
+}
+
+installer_write_image_linux_by_copy() {
+    unmount_target_disk_filesystems "$DISK"
+    confirm_destructive_write
+    TEMP_STAGE_PART_NUM=128
+    prepare_fixed_temp_staging_partition
+    IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+    download_target_image_in_alpine "$IMG_QCOW"
+    connect_qcow_readonly_nbd "$IMG_QCOW"
+    linux_copy_scan_source
+    linux_copy_create_partitions
+    linux_copy_recreate_and_copy
+    linux_copy_release_staging_and_grow
+    QCOW_PARTITION_TABLE=gpt
+}
+
 installer_write_seed() {
     local part partuuid mnt="$INSTALL_TMPDIR/cidata"
     part=$(create_nocloud_cidata_partition)
@@ -3432,7 +3984,11 @@ do_install() {
     installer_workspace
     installer_stage_optional_inputs
     preflight_target_image_in_alpine
-    installer_write_image
+    if [[ "$TARGET_OS" == freebsd ]]; then
+        installer_write_image
+    else
+        installer_write_image_linux_by_copy
+    fi
     installer_write_seed
     run_post_install_hook
     show_partition_info
@@ -3613,8 +4169,10 @@ preflight_image_geometry() {
     if (( image_bytes > disk_bytes )); then
         warn "Image virtual size exceeds target disk; actual partition boundaries will be validated before writing"
     fi
-    if (( image_bytes > stage_safe )); then
+    if (( image_bytes > stage_safe )) && [[ "$TARGET_OS" == freebsd ]]; then
         warn "Image virtual size crosses the 3 GiB staging boundary; sparse-shadow safety is not guaranteed"
+    elif [[ "$TARGET_OS" != freebsd ]]; then
+        info "Linux target will be installed by filesystem copy (no XFS shrink or RAW shadow)"
     fi
     info "Remote QCOW2 virtual size: $image_bytes bytes (disk: $disk_bytes bytes)"
 }
