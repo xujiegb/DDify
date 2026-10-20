@@ -39,6 +39,7 @@ Options:
   --post-install-hook P  Run hook after image/NoCloud write
   --hold 1               Validate only
   --hold 2               Install but do not reboot
+  --allow-early-wipe     HIGH RISK: erase before full image verification (explicit opt-in)
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
@@ -460,7 +461,7 @@ capture_target_disk_identity() {
         error "Unable to read target disk size"
     [[ -z "$DISK_ID_PTUUID" || "$DISK_ID_PTUUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
         error "Target disk GPT GUID is invalid; refusing unattended reinstallation"
-    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" || -n "$DISK_ID_MBR_ID" ]] || \
+    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_PTUUID" || -n "$DISK_ID_MBR_ID" || -n "$DISK_ID_ANCHOR_PARTUUID" ]] || \
         error "Target disk lacks a usable WWN, serial, GPT GUID or MBR signature"
 
     if [[ -n "$DISK_ID_MBR_ID" && -z "$DISK_ID_WWN$DISK_ID_SERIAL" ]]; then
@@ -910,10 +911,28 @@ parse_ssh_key() {
     else
         text="$val"
     fi
-    local filtered
-    filtered=$(printf '%s\n' "$text" | tr -d '\r' | grep -E '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh.com) [A-Za-z0-9+/=]+([[:space:]].*)?$' || true)
-    [[ -n "$filtered" ]] || error "No supported SSH public key in input"
-    printf '%s\n' "$filtered"
+    local line tmp fingerprint accepted=""
+    command -v ssh-keygen >/dev/null 2>&1 || error "ssh-keygen is needed to validate SSH public keys"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ddify-sshkey.XXXXXX") || error "Cannot create temporary SSH-key file"
+    chmod 0600 "$tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]] && continue
+        if [[ ! "$line" =~ ^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; then
+            rm -f "$tmp"
+            error "Unsupported or malformed SSH public key"
+        fi
+        printf '%s\n' "$line" >"$tmp"
+        fingerprint=$(ssh-keygen -l -f "$tmp" 2>/dev/null) || {
+            rm -f "$tmp"
+            error "SSH public key failed cryptographic encoding validation"
+        }
+        info "Validated SSH public key: $fingerprint"
+        accepted+="${accepted:+$'\n'}$line"
+    done <<<"$text"
+    rm -f "$tmp"
+    [[ -n "$accepted" ]] || error "No supported SSH public key in input"
+    printf '%s\n' "$accepted"
 }
 
 get_default_image_url() {
@@ -1399,6 +1418,8 @@ GRUB_REBOOT_CMD=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 PASSWORD_TO_DISPLAY=""
+ALLOW_EARLY_WIPE=0
+PREFETCH_IMAGE_PATH=""
 
 find_efi_for_plan() {
     local os
@@ -1571,6 +1592,7 @@ write_install_plan() {
         printf 'POST_INSTALL_HOOK=%q\n' "$POST_INSTALL_HOOK"
         printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
         printf 'HOLD=%q\n' "$HOLD"
+        printf 'ALLOW_EARLY_WIPE=%q\n' "$ALLOW_EARLY_WIPE"
         printf 'PLAN_EFI_UUID=%q\n' "$PLAN_EFI_UUID"
     } >"$path"
     chmod 0600 "$path" 2>/dev/null || true
@@ -1583,6 +1605,8 @@ load_install_plan() {
     . "$plan"
     PASSWORD=""
     PASSWORD_HASH="${PASSWORD_HASH:-}"
+    ALLOW_EARLY_WIPE="${ALLOW_EARLY_WIPE:-0}"
+    [[ "$ALLOW_EARLY_WIPE" == 0 || "$ALLOW_EARLY_WIPE" == 1 ]] || error "Invalid destructive-staging policy"
     [[ ! -f /etc/reinstall/frpc.toml ]] || FRPC_TOML="/etc/reinstall/frpc.toml"
     [[ ! -f /etc/reinstall/post-install-hook.sh ]] || POST_INSTALL_HOOK="/etc/reinstall/post-install-hook.sh"
     info "Loaded embedded install plan"
@@ -1628,7 +1652,7 @@ ensure_grub_tools() {
     fi
 
     [[ -d /etc/grub.d ]] || error "/etc/grub.d not found"
-    GRUB_SCRIPT_PATH="/etc/grub.d/09_reinstall_alpine"
+    GRUB_SCRIPT_PATH="/etc/grub.d/41_reinstall_alpine"
 
     if [[ -f /boot/grub2/grub.cfg ]]; then
         GRUB_CFG_PATH="/boot/grub2/grub.cfg"
@@ -1782,8 +1806,12 @@ LOG="/var/log/reinstall-auto.log"
 mkdir -p /var/log
 touch "$LOG"
 # look idle at a login prompt while destructive work is running.
-if [ -w /dev/console ]; then
-    exec >/dev/console 2>&1
+if [ -w /dev/console ] && command -v mkfifo >/dev/null 2>&1; then
+    fifo=/run/reinstall-console-log.fifo
+    rm -f "$fifo"
+    mkfifo -m 0600 "$fifo"
+    tee -a "$LOG" <"$fifo" >/dev/console &
+    exec >"$fifo" 2>&1
 else
     exec >>"$LOG" 2>&1
 fi
@@ -1845,7 +1873,7 @@ REPOEOF
     start_reinstall_rescue_ssh
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
-        bash curl wget ca-certificates xz qemu-img util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
+        bash curl wget ca-certificates xz qemu-img python3 util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
         e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
     if ! grep -q '^TARGET_OS=freebsd$' /etc/reinstall/plan.env; then
         echo "[stage] apk add (Linux filesystem-copy tools)"
@@ -2208,7 +2236,10 @@ EOF
             error "Another apkovl exists on the boot filesystem: $existing_apkovl"
     done
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
-    chmod 0644 "$ALPINE_APKOVL_ABS"
+    chmod 0600 "$ALPINE_APKOVL_ABS" || error "Cannot restrict apkovl permissions"
+    if [[ "$(stat -c %a "$ALPINE_APKOVL_ABS" 2>/dev/null || stat -f %Lp "$ALPINE_APKOVL_ABS" 2>/dev/null)" != 600 ]]; then
+        warn "Boot filesystem cannot enforce owner-only apkovl access; password hash/FRPC credentials are exposed to local readers"
+    fi
     rm -rf "$tmp"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
@@ -2222,7 +2253,7 @@ install_grub_entry_for_alpine() {
         cat >"$GRUB_SCRIPT_PATH" <<EOF
 #!/bin/sh
 exec tail -n +3 \$0
-menuentry '${ALPINE_ENTRY_TITLE}' {
+menuentry '${ALPINE_ENTRY_TITLE}' --id=ddify-reinstall-alpine {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
     linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
@@ -2235,7 +2266,7 @@ EOF
         cat >"$GRUB_SCRIPT_PATH" <<EOF
 #!/bin/sh
 exec tail -n +3 \$0
-menuentry '${ALPINE_ENTRY_TITLE}' {
+menuentry '${ALPINE_ENTRY_TITLE}' --id=ddify-reinstall-alpine {
     search --no-floppy --fs-uuid --set=root ${PLAN_EFI_UUID}
     linux ${grub_boot_prefix}${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd ${grub_boot_prefix}${ALPINE_INITRAMFS_REL}
@@ -2243,12 +2274,18 @@ menuentry '${ALPINE_ENTRY_TITLE}' {
 EOF
     fi
     chmod 0755 "$GRUB_SCRIPT_PATH"
+    # A previous version placed the rescue menu ahead of normal GRUB_DEFAULT=0.
+    # Remove only the recognizable legacy entry; refuse to replace unrelated code.
+    if [[ -f /etc/grub.d/09_reinstall_alpine ]]; then
+        grep -Fq "menuentry '${ALPINE_ENTRY_TITLE}'" /etc/grub.d/09_reinstall_alpine ||             error "Conflicting legacy GRUB entry must be reviewed manually"
+        rm -f /etc/grub.d/09_reinstall_alpine
+    fi
 
     info "Regenerating GRUB config..."
     "$GRUB_MKCONFIG_CMD" -o "$GRUB_CFG_PATH" >/dev/null
 
     info "Scheduling one-time GRUB boot into: ${ALPINE_ENTRY_TITLE}"
-    "$GRUB_REBOOT_CMD" "${ALPINE_ENTRY_TITLE}"
+    "$GRUB_REBOOT_CMD" ddify-reinstall-alpine
 }
 
 freebsd_grub_arch() {
@@ -2396,6 +2433,7 @@ check_secure_boot() {
         error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
     fi
     if ! command -v mokutil >/dev/null 2>&1; then
+        [[ "${HOLD:-0}" != 1 ]] || error "--hold 1 requires existing mokutil to validate Secure Boot without installing packages"
         detect_linux_family
         case "$LINUX_FAMILY" in
             redhat)
@@ -2583,7 +2621,8 @@ create_nocloud_cidata_partition() {
     printf '%s\n' "$seed_part"
 }
 
-TEMP_STAGE_SIZE_BYTES=$((3072 * 1024 * 1024))
+TEMP_STAGE_SIZE_MIB=3072
+TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1024 * 1024))
 TEMP_STAGE_PART_NUM=1
 TEMP_STAGE_LABEL="REINSTALL_TMP"
 TEMP_STAGE_MNT="/mnt/reinstall-stage"
@@ -2650,7 +2689,7 @@ reset_disk_for_staging() {
     if [[ -n "${DISK_ID_PTUUID:-}" ]]; then
         sgdisk -U "$DISK_ID_PTUUID" "$DISK" >/dev/null || error "Failed to preserve target GPT identity"
     fi
-    sgdisk -n "${TEMP_STAGE_PART_NUM}:-3072M:0" -t "${TEMP_STAGE_PART_NUM}:8300" \
+    sgdisk -n "${TEMP_STAGE_PART_NUM}:-${TEMP_STAGE_SIZE_MIB}M:0" -t "${TEMP_STAGE_PART_NUM}:8300" \
         -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" "$DISK" >/dev/null || error "Failed to create staging partition"
     reread_partition_table_strict
 }
@@ -2681,7 +2720,7 @@ read_stage_geometry() {
     TEMP_STAGE_START_SECTOR="$first"
     TEMP_STAGE_START_BYTES=$((first * TEMP_STAGE_SECTOR_SIZE))
     actual=$(((last - first + 1) * TEMP_STAGE_SECTOR_SIZE))
-    (( actual >= TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024 )) || error "Staging partition is smaller than 3 GiB"
+    (( actual >= TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024 )) || error "Staging partition is smaller than requested ${TEMP_STAGE_SIZE_MIB} MiB"
     TEMP_STAGE_LAST_SECTOR="$last"
 }
 
@@ -2689,9 +2728,9 @@ prepare_fixed_temp_staging_partition() {
     local disk_size min_remaining=$((2 * 1024 * 1024 * 1024))
     [[ "$OS" == Linux ]] || error "Staging requires Alpine/Linux"
     disk_size=$(get_disk_size_bytes "$DISK")
-    (( disk_size > TEMP_STAGE_SIZE_BYTES + min_remaining )) || error "Target disk is too small for 3 GiB staging"
+    (( disk_size > TEMP_STAGE_SIZE_BYTES + min_remaining )) || error "Target disk cannot accommodate the requested ${TEMP_STAGE_SIZE_MIB} MiB staging"
 
-    info "Preparing 3 GiB staging partition at the end of $DISK"
+    info "Preparing ${TEMP_STAGE_SIZE_MIB} MiB staging partition at the end of $DISK"
     reset_disk_for_staging
     wait_for_stage_partition
     read_stage_geometry
@@ -2798,6 +2837,7 @@ inspect_qcow_partition_layout() {
         error "Target qcow2 does not expose a usable GPT; cannot safely use an in-disk staging partition"
     fi
 
+    verify_gpt_strict "$nbd"
     QCOW_GPT_GUID=$(printf '%s\n' "$table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
     [[ "$QCOW_GPT_GUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || \
         error "Target image has no valid GPT disk GUID"
@@ -2826,16 +2866,15 @@ inspect_qcow_partition_layout() {
 
     QCOW_PARTITION_CROSSES_STAGE=0
 
-    # A cloud image may deliberately describe a GPT/LVM layout much larger than
-    # the qcow2 payload stored on disk. Do not reject it merely because the GPT
-    # sparse-shadow path so the source is first copied into RAM/zram, resized
+    # A cloud image may have a sparse logical layout that crosses staging.
+    # This requires separate, explicitly budgeted shadow handling.
     if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
         QCOW_PARTITION_CROSSES_STAGE=1
-        warn "qcow2 GPT layout reaches the mandatory 3 GiB staging area."
+        warn "qcow2 GPT layout reaches the temporary staging area."
         warn "Using sparse RAM/zram shadow mode to avoid self-overwriting the live staging source."
     fi
 
-    # device. If qemu-img reported otherwise, treat the GPT extent as the minimum
+    # Never trust a QCOW2 virtual size smaller than its GPT partition extent.
     if [[ "$QCOW_VIRTUAL_SIZE" -lt "$QCOW_MAX_PART_END_BYTES" ]]; then
         warn "qemu-img virtual-size (${QCOW_VIRTUAL_SIZE}) is smaller than GPT partition end (${QCOW_MAX_PART_END_BYTES}); refusing to trust the smaller value for write-safety decisions."
         QCOW_VIRTUAL_SIZE="$QCOW_MAX_PART_END_BYTES"
@@ -2889,17 +2928,36 @@ preflight_target_image_in_alpine() {
     preflight_image_geometry
 }
 
+# The script never accepts decompression output beyond the negotiated workspace limit.
+bounded_image_copy() {
+    local limit="$1"
+    python3 -c '
+import sys
+limit = int(sys.argv[1]); count = 0
+while True:
+    data = sys.stdin.buffer.read(1024 * 1024)
+    if not data:
+        break
+    count += len(data)
+    if count > limit:
+        sys.exit("decompressed image exceeds staging limit")
+    sys.stdout.buffer.write(data)
+' "$limit"
+}
+
 download_target_image_in_alpine() {
     local dst="$1" tmp="${1}.part.$$" remote_size allocated digest= hash_pid= fifo=
 
     rm -f "$tmp"
     [[ "$IMG_URL" == https://* ]] || error "Target image must use HTTPS"
     [[ -n "${IMAGE_HASH_ALGO:-}" || -z "${IMAGE_HASH_EXPECTED:-}" ]] || error "Missing image checksum algorithm"
-    info "Downloading target image onto the mandatory 3 GiB staging partition: $IMG_URL"
+    info "Downloading target image to verified workspace: $IMG_URL"
+    local limit="${IMAGE_DOWNLOAD_LIMIT_BYTES:-$((2400 * 1024 * 1024))}"
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || error "Invalid image download limit"
 
     remote_size=$(http_content_length "$IMG_URL" || true)
-    if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
-        error "Remote image payload is too large for the fixed 3 GiB staging partition: ${remote_size} bytes"
+    if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt "$limit" ]]; then
+        error "Remote image exceeds available validated staging budget: ${remote_size} > ${limit} bytes"
     fi
 
     if [[ "$IMG_URL" == *.xz ]]; then
@@ -2909,7 +2967,7 @@ download_target_image_in_alpine() {
             "${IMAGE_HASH_ALGO}sum" <"$fifo" >"$INSTALL_TMPDIR/image-hash" &
             hash_pid=$!
             if ! curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
-                    tee "$fifo" | xz -dc >"$tmp"; then
+                    tee "$fifo" | xz --memlimit-decompress=256MiB -dc | bounded_image_copy "$limit" >"$tmp"; then
                 rm -f "$tmp" "$fifo"
                 wait "$hash_pid" || true
                 error "Failed to download/decompress target image"
@@ -2919,10 +2977,11 @@ download_target_image_in_alpine() {
             digest=$(awk '{print $1; exit}' "$INSTALL_TMPDIR/image-hash")
         else
             curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
-                xz -dc >"$tmp" || error "Failed to download/decompress target image"
+                xz --memlimit-decompress=256MiB -dc | bounded_image_copy "$limit" >"$tmp" ||
+                error "Failed to download/decompress target image"
         fi
     else
-        curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" -o "$tmp" ||
+        curl -fL --progress-bar --max-filesize "$limit" --proto '=https' --proto-redir '=https' "$IMG_URL" -o "$tmp" ||
             error "Failed to download target image"
         [[ -z "$IMAGE_HASH_EXPECTED" ]] ||
             digest=$("${IMAGE_HASH_ALGO}sum" "$tmp" | awk '{print $1}')
@@ -2932,12 +2991,35 @@ download_target_image_in_alpine() {
         info "Official ${IMAGE_HASH_ALGO^^} checksum verified (HTTPS manifest; signature not checked)"
     fi
 
+    local actual_bytes
+    actual_bytes=$(stat -c %s "$tmp") || error "Cannot stat downloaded image"
+    (( actual_bytes <= limit )) || error "Expanded QCOW2 exceeds staging policy: $actual_bytes bytes"
+    validate_qcow_metadata "$tmp"
     mv -f "$tmp" "$dst"
     sync
     allocated=$(du -B1 "$dst" 2>/dev/null | awk '{print $1; exit}' || true)
     info "Target qcow2 is ready on staging partition: $dst"
     [[ -n "$allocated" ]] && info "qcow2 allocated staging space: ${allocated} bytes"
     df -h "$TEMP_STAGE_MNT" || true
+}
+
+validate_qcow_metadata() {
+    local img="$1" json
+    json=$(qemu-img info -f qcow2 --output=json "$img") || error "Could not parse QCOW2 metadata"
+    python3 -c '
+import json, sys
+x = json.load(sys.stdin)
+if x.get("format") != "qcow2" or x.get("encrypted", False):
+    raise SystemExit("unsupported QCOW2 format or encryption")
+if any(k in x for k in ("backing-filename", "full-backing-filename", "backing-filename-format")):
+    raise SystemExit("external QCOW2 backing images are not supported")
+fmt = x.get("format-specific", {}).get("data", {})
+if any(k in fmt for k in ("data-file", "data-file-raw")):
+    raise SystemExit("external QCOW2 data files are not supported")
+if not isinstance(x.get("virtual-size"), int) or x["virtual-size"] <= 0:
+    raise SystemExit("invalid QCOW2 virtual size")
+' <<<"$json" || error "QCOW2 needs external resources, is encrypted, or has unsupported metadata"
+    qemu-img check -f qcow2 "$img" >/dev/null || error "QCOW2 structural check failed"
 }
 
 get_qcow_virtual_size_bytes() {
@@ -3162,7 +3244,7 @@ write_sparse_shadow_to_target_after_releasing_stage() {
     TEMP_STAGE_RELEASED=1
     sync
 
-    info "Writing sparse shadow to the target disk after releasing the 3 GiB staging partition..."
+    info "Writing sparse shadow to the target disk after releasing the temporary staging partition..."
     info "Copy length: ${disk_bytes} bytes"
 
     # A sparse copy is safe only after the entire destination was zeroed.
@@ -3201,9 +3283,9 @@ write_qcow_without_overwriting_staging() {
         return 0
     fi
 
-    # The image virtual disk extends beyond the staging boundary, but its GPT
-    # prefix; trailing free space and the source backup GPT are intentionally
-    # omitted. The backup GPT is rebuilt after staging has been released.
+    # The virtual disk extends beyond staging, but verified partitions end
+    # before it. Copy only the safe prefix, then reconstruct the backup GPT
+    # after the temporary partition has been removed.
     if (( TEMP_STAGE_START_BYTES % (4 * 1024 * 1024) == 0 )); then
         bs_arg="4M"
         count_arg=$((TEMP_STAGE_START_BYTES / (4 * 1024 * 1024)))
@@ -3231,8 +3313,7 @@ release_temp_staging_partition() {
         umount "$TEMP_STAGE_MNT" || error "Failed to unmount temporary staging partition"
     fi
 
-    # The on-disk primary GPT has already been replaced by the target image, but
-    # those stale mappings before manipulating the target GPT. This avoids
+    # Drop stale temporary partition mappings before repairing the target GPT.
     if command -v partx >/dev/null 2>&1; then
         if ! partx -d "$DISK" >/dev/null 2>&1; then
             warn "Could not immediately delete stale staging partition mappings with partx; continuing with GPT repair."
@@ -3331,6 +3412,7 @@ grow_last_partition_reserving_cidata() {
     fi
 
     reread_partition_table_strict
+    verify_gpt_strict "$DISK"
     sleep 1
 }
 
@@ -3339,7 +3421,7 @@ cleanup_install_stage() {
     # A failed file copy must release all mounts before disconnecting qemu-nbd.
     for path in "${LINUX_COPY_ROOT_MNT:-}" "${LINUX_COPY_SRC_MNT:-}" \
         "${INSTALL_TMPDIR:-}/linux-src-boot" "${INSTALL_TMPDIR:-}/linux-src-efi" \
-        "${INSTALL_TMPDIR:-}/linux-probe"         "${INSTALL_TMPDIR:-}/linux-btrfs-source-top"         "${INSTALL_TMPDIR:-}/linux-btrfs-target-top"; do
+        "${INSTALL_TMPDIR:-}/linux-probe" "${INSTALL_TMPDIR:-}/precheck-efi" "${INSTALL_TMPDIR:-}/precheck-btrfs-top" "${INSTALL_TMPDIR:-}/linux-btrfs-source-top"         "${INSTALL_TMPDIR:-}/linux-btrfs-target-top"; do
         [[ -n "$path" && "$path" != /linux-* ]] || continue
         is_mountpoint "$path" && umount -R "$path" 2>/dev/null || true
     done
@@ -3369,18 +3451,144 @@ installer_stage_optional_inputs() {
 confirm_destructive_write() {
     echo
     echo "WARNING: $DISK will be repartitioned. ALL DATA WILL BE LOST."
-    [[ "$AUTO_YES" == 1 ]] && [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}" ]] && return 0
+    [[ "$AUTO_YES" == 1 ]] && [[ -n "${DISK_ID_WWN:-}${DISK_ID_SERIAL:-}${DISK_ID_PTUUID:-}${DISK_ID_MBR_ID:-}${DISK_ID_ANCHOR_PARTUUID:-}" ]] && return 0
     read -r -p "Type yes to continue: " ans
     case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
 }
 
+# Source staging is intentionally completed in RAM, or the caller must explicitly
+# opt into legacy early-wipe staging. Space on the target disk cannot serve as a
+# pre-commit cache: destroying that disk also destroys the cache.
+installer_preflight_linux_files() {
+    local disk_bytes efi_bytes boot_bytes root_bytes root_budget source_dir top
+    local fs cmd
+    connect_qcow_readonly_nbd "$PREFETCH_IMAGE_PATH"
+    linux_copy_scan_source
+
+    source_dir="$LINUX_COPY_SRC_MNT"
+    if [[ "$LINUX_COPY_ROOT_TYPE" == btrfs ]]; then
+        top="$INSTALL_TMPDIR/precheck-btrfs-top"
+        mkdir -p "$top"
+        mount -t btrfs -o ro,subvolid=5 "$LINUX_COPY_SRC_ROOT" "$top" || error "Cannot inspect all Btrfs source subvolumes"
+        root_bytes=$(du -s -B1 "$top" | awk '{print $1}')
+        umount "$top" || error "Failed to unmount Btrfs source preflight"
+    else
+        root_bytes=$(du -sx -B1 "$source_dir" | awk '{print $1}')
+    fi
+    disk_bytes=$(get_disk_size_bytes "$DISK")
+    efi_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_EFI")
+    boot_bytes=0
+    [[ -z "$LINUX_COPY_SRC_BOOT" ]] || boot_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_BOOT")
+    root_budget=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - efi_bytes - boot_bytes - 384 * 1024 * 1024))
+    [[ "$root_bytes" =~ ^[0-9]+$ ]] || error "Cannot measure source root data before commit"
+    (( root_budget > 0 && root_bytes + root_bytes / 5 + 256 * 1024 * 1024 < root_budget )) || \
+        error "Source files require more space than temporary Linux root (data=$root_bytes, budget=$root_budget)"
+
+    # A missing guest formatter or loader must not be discovered after wiping.
+    case "$LINUX_COPY_ROOT_TYPE" in
+        xfs) cmd=mkfs.xfs ;;
+        ext4) cmd=mkfs.ext4 ;;
+        btrfs) cmd="" ;;
+    esac
+    if [[ -n "$cmd" ]]; then
+        [[ -x "$source_dir/usr/sbin/$cmd" || -x "$source_dir/sbin/$cmd" ]] || \
+            error "Source image has no matching $cmd formatter"
+    fi
+    if [[ "$LINUX_COPY_SRC_ROOT" == /dev/mapper/* || "$LINUX_COPY_SRC_ROOT" == /dev/dm-* ]]; then
+        [[ -x "$source_dir/usr/bin/dracut" || -x "$source_dir/usr/sbin/dracut" || -x "$source_dir/sbin/dracut" ]] || \
+            error "LVM image has no dracut to rebuild its initramfs"
+    fi
+    local esp="$INSTALL_TMPDIR/precheck-efi"
+    mkdir -p "$esp"
+    linux_copy_source_mount "$LINUX_COPY_SRC_EFI" "$esp" vfat
+    local efi_candidate=""
+    case "$MACHINE_ARCH" in
+        x86_64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTX64.EFI' -o -iname 'grubx64.efi' \) -print -quit 2>/dev/null) ;;
+        aarch64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTAA64.EFI' -o -iname 'grubaa64.efi' \) -print -quit 2>/dev/null) ;;
+    esac
+    [[ -n "$efi_candidate" ]] || error "Image EFI system partition has no matching $MACHINE_ARCH bootloader"
+    umount "$esp" || error "Cannot unmount EFI preflight"
+    umount "$source_dir" || error "Cannot release source root before commit"
+    local vg
+    for vg in "${LINUX_COPY_SOURCE_VGS[@]}"; do
+        vgchange -an "$vg" >/dev/null || error "Cannot deactivate preflight LVM VG: $vg"
+    done
+    LINUX_COPY_SOURCE_VGS=()
+    cleanup_qcow_nbd
+    info "Pre-commit Linux source and space checks passed (root data $root_bytes bytes)."
+}
+
+installer_preflight_freebsd_image() {
+    local disk_bytes
+    disk_bytes=$(get_disk_size_bytes "$DISK")
+    # Conservative lower bound for the beginning of the eventual temporary
+    # temporary partition; the exact geometry is checked again after commit.
+    TEMP_STAGE_START_BYTES=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - 4 * 1024 * 1024))
+    inspect_qcow_partition_layout "$PREFETCH_IMAGE_PATH"
+    [[ "$QCOW_PARTITION_TABLE" == gpt ]] || error "FreeBSD installation requires GPT"
+    # The old shadow code cannot shrink UFS. Do not start a destructive operation
+    # that could need a large unverified RAW copy or a non-existent UFS shrink.
+    (( QCOW_MAX_PART_END_BYTES + 8 * 1024 * 1024 < TEMP_STAGE_START_BYTES )) || \
+        error "FreeBSD source partitions cross the protected staging area; safe UFS install backend unavailable"
+    (( QCOW_MAX_PART_END_BYTES + 64 * 1024 * 1024 < disk_bytes )) || \
+        error "FreeBSD image leaves no safe room for CIDATA and GPT"
+    cleanup_qcow_nbd
+    info "Pre-commit FreeBSD GPT and partition-space checks passed."
+}
+
+installer_precommit_prepare() {
+    [[ "$ALLOW_EARLY_WIPE" == 0 ]] || {
+        warn "EXPLICIT HIGH-RISK MODE: target disk will be erased before the image is fully downloaded and inspected."
+        warn "If the download, checksum, QCOW2, or source-layout validation fails, the old installation cannot be recovered by this script."
+        return 0
+    }
+    # The verified image stays in RAM. Reserve only 128 MiB on the target
+    # for the temporary partition mapping/expansion protocol.
+    TEMP_STAGE_SIZE_MIB=128
+    TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1024 * 1024))
+    local mem_bytes free_bytes limit remote_size oldmnt
+    mem_bytes=$(awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    free_bytes=$(df -B1 --output=avail /run/reinstall-work | awk 'NR == 2 {print $1}')
+    [[ "$mem_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ ]] || error "Cannot budget RAM source staging"
+    limit=$((mem_bytes / 2))
+    (( free_bytes - 256 * 1024 * 1024 < limit )) && limit=$((free_bytes - 256 * 1024 * 1024))
+    (( limit > 2400 * 1024 * 1024 )) && limit=$((2400 * 1024 * 1024))
+    (( limit > 64 * 1024 * 1024 )) || error "Not enough RAM staging budget before disk commit"
+    remote_size=$(http_content_length "$IMG_URL" || true)
+    [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt 0 ]] || \
+        error "Remote image size is unknown; safe pre-commit staging requires a Content-Length"
+    (( remote_size <= limit )) || \
+        error "Image payload ($remote_size bytes) exceeds safe RAM budget ($limit); use separate rescue storage, or explicitly opt into --allow-early-wipe"
+    IMAGE_DOWNLOAD_LIMIT_BYTES="$limit"
+    PREFETCH_IMAGE_PATH="$INSTALL_TMPDIR/verified-source.qcow2"
+    oldmnt="$TEMP_STAGE_MNT"
+    TEMP_STAGE_MNT=/run/reinstall-work
+    download_target_image_in_alpine "$PREFETCH_IMAGE_PATH"
+    TEMP_STAGE_MNT="$oldmnt"
+    local usable
+    usable=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    (( usable >= 256 * 1024 * 1024 )) || \
+        error "Insufficient memory after image verification; disk was not modified"
+    if [[ "$TARGET_OS" == freebsd ]]; then
+        installer_preflight_freebsd_image
+    else
+        installer_preflight_linux_files
+    fi
+    info "Downloaded QCOW2 passed integrity/layout preflight; target disk is still untouched."
+}
+
 installer_write_image() {
+    resolve_target_disk_from_identity
     unmount_target_disk_filesystems "$DISK"
     confirm_destructive_write
     prepare_fixed_temp_staging_partition
 
-    IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
-    download_target_image_in_alpine "$IMG_QCOW"
+    if [[ -n "$PREFETCH_IMAGE_PATH" ]]; then
+        IMG_QCOW="$PREFETCH_IMAGE_PATH"
+    else
+        IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+        download_target_image_in_alpine "$IMG_QCOW"
+    fi
     inspect_qcow_partition_layout "$IMG_QCOW"
     write_qcow_without_overwriting_staging "$IMG_QCOW"
 
@@ -3405,6 +3613,7 @@ installer_write_image() {
         error "Target GPT identity differs from verified image; refusing backup GPT repair"
     [[ "$written_table" != *REINSTALL_TMP* ]] || error "Staging GPT survived image write; refusing GPT repair"
     sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT"
+    verify_gpt_strict "$DISK"
     grow_last_partition_reserving_cidata
 }
 
@@ -3442,11 +3651,25 @@ linux_copy_source_mount() {
     esac || error "Failed to mount source filesystem read-only: $dev"
 }
 
+verify_gpt_strict() {
+    local device="$1" verification
+    verification=$(LC_ALL=C sgdisk -v "$device" 2>&1) || {
+        printf '%s\n' "$verification" >&2
+        error "GPT verification command failed on $device"
+    }
+    # gdisk/s gdisk may return status 0 even when -v identified CRC problems.
+    # Only an explicit clean report is accepted; unknown output fails closed.
+    if ! grep -Eq '^[[:space:]]*No problems found\.' <<<"$verification"; then
+        printf '%s\n' "$verification" >&2
+        error "GPT integrity validation failed on $device"
+    fi
+}
+
 linux_copy_scan_source() {
     local nbd="$QCOW_NBD_DEV" table pv vg dev fs type mp path count=0
     table=$(blkid -p -s PTTYPE -o value "$nbd" 2>/dev/null || true)
     [[ "$table" == gpt ]] || error "Linux file-copy installer currently requires a GPT cloud image (detected: ${table:-unknown})"
-    sgdisk -v "$nbd" >/dev/null || error "Invalid source GPT"
+    verify_gpt_strict "$nbd"
     [[ "$(blockdev --getss "$nbd")" == "$(blockdev --getss "$DISK")" ]] || error "Source/target sector size mismatch"
 
     # Activate only the image's volume groups, if any. Alpine rescue has no VG of its own.
@@ -3454,6 +3677,20 @@ linux_copy_scan_source() {
         [[ "$fs" == LVM2_member ]] || continue
         vg=$(pvs --readonly --noheadings -o vg_name "$dev" 2>/dev/null | awk 'NF {print $1; exit}')
         [[ -n "$vg" ]] || error "Could not determine source LVM volume group on $dev"
+        # vgchange by name is unsafe when a visible host PV or clone shares
+        # that VG name. Do not activate any ambiguous group from the image.
+        local other_pv other_vg source_nodes pv_inventory
+        source_nodes=$(lsblk -pnr -o NAME "$nbd" 2>/dev/null) || error "Cannot list image LVM source devices"
+        pv_inventory=$(pvs --readonly --noheadings --separator '|' -o pv_name,vg_name 2>/dev/null) || \
+            error "Cannot enumerate LVM physical volumes before activating $vg"
+        while IFS='|' read -r other_pv other_vg; do
+            other_pv="${other_pv//[[:space:]]/}"
+            other_vg="${other_vg//[[:space:]]/}"
+            [[ "$other_vg" == "$vg" ]] || continue
+            if ! grep -Fxq -- "$other_pv" <<<"$source_nodes"; then
+                error "Volume group $vg also contains or collides with non-image PV $other_pv; refusing activation"
+            fi
+        done <<<"$pv_inventory"
         if [[ ! " ${LINUX_COPY_SOURCE_VGS[*]} " == *" $vg "* ]]; then
             vgchange -ay "$vg" >/dev/null || error "Cannot activate source LVM group: $vg"
             LINUX_COPY_SOURCE_VGS+=("$vg")
@@ -3546,9 +3783,9 @@ linux_copy_create_partitions() {
 
     LINUX_COPY_ROOT_PARTNUM="$n"
     stage_boundary=$((TEMP_STAGE_START_SECTOR - 16384))
-    sgdisk -n "$n:0:$stage_boundary" -t "$n:8300" -c "$n:Linux root" "$DISK" >/dev/null || error "Target disk lacks space for Linux root alongside 3 GiB staging"
+    sgdisk -n "$n:0:$stage_boundary" -t "$n:8300" -c "$n:Linux root" "$DISK" >/dev/null || error "Target disk lacks space for Linux root alongside staging"
     linux_copy_preserve_partuuid "$LINUX_COPY_SRC_ROOT" "$n"
-    sgdisk -v "$DISK" >/dev/null || error "Target GPT is inconsistent after partition allocation"
+    verify_gpt_strict "$DISK"
     reread_partition_table_strict
     efi_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_EFI_PARTNUM")
     root_dev=$(partition_device_for_number "$DISK" "$LINUX_COPY_ROOT_PARTNUM")
@@ -3682,11 +3919,10 @@ else:
 # root-LVM-specific dracut flags when the LVM PV is replaced by a plain partition.
 def cmdline_fix(old):
     old = re.sub(r'(?<![A-Za-z0-9_])resume=[^\s\"\']+[ \t]*', '', old)
-    if is_lvm != '1':
-        return old
     old = re.sub(r'(?<![A-Za-z0-9_])root=(?!\$)[^\s"\']+', 'root=UUID=' + uuid, old)
-    old = re.sub(r'(?<!\S)rd\.lvm\.(?:lv|vg|uuid)=[^\s"\']+[ \t]*', '', old)
-    old = re.sub(r'(?<!\S)resume=/dev/(?:mapper/|[^/]+/)[^\s"\']+[ \t]*', '', old)
+    if is_lvm == '1':
+        old = re.sub(r'(?<!\S)rd\.lvm\.(?:lv|vg|uuid)=[^\s"\']+[ \t]*', '', old)
+        old = re.sub(r'(?<!\S)resume=/dev/(?:mapper/|[^/]+/)[^\s"\']+[ \t]*', '', old)
     return old
 
 patterns = [
@@ -3701,24 +3937,23 @@ for pattern in patterns:
 
 # grubenv is a fixed-size GRUB environment block padded with '#'.
 # Preserve the byte length; regular text-file replacement would corrupt it.
-if is_lvm == '1':
-    for pattern in ['boot/grub2/grubenv', 'boot/grub/grubenv', 'boot/efi/EFI/*/grubenv']:
-        for path in glob.glob(os.path.join(root, pattern)):
-            if not os.path.isfile(path) or os.path.islink(path):
-                continue
-            with open(path, 'rb') as f:
-                old = f.read()
-            if not old.startswith(b'# GRUB Environment Block\n') or len(old) != 1024:
-                if b'rd.lvm.' in old or b'root=/dev/mapper/' in old:
-                    raise RuntimeError('Cannot safely rewrite this GRUB environment format: ' + path)
-                continue
-            body = old.rstrip(b'#').decode('utf-8', 'replace')
-            new_body = cmdline_fix(body).encode('utf-8')
-            if len(new_body) > 1024:
-                raise RuntimeError('GRUB environment has no room for root argument update: ' + path)
-            if new_body != body.encode('utf-8'):
-                with open(path, 'wb') as f:
-                    f.write(new_body + b'#' * (1024 - len(new_body)))
+for pattern in ['boot/grub2/grubenv', 'boot/grub/grubenv', 'boot/efi/EFI/*/grubenv']:
+    for path in glob.glob(os.path.join(root, pattern)):
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        with open(path, 'rb') as f:
+            old = f.read()
+        if not old.startswith(b'# GRUB Environment Block\n') or len(old) != 1024:
+            if b'rd.lvm.' in old or b'root=/dev/mapper/' in old:
+                raise RuntimeError('Cannot safely rewrite this GRUB environment format: ' + path)
+            continue
+        body = old.rstrip(b'#').decode('utf-8', 'replace')
+        new_body = cmdline_fix(body).encode('utf-8')
+        if len(new_body) > 1024:
+            raise RuntimeError('GRUB environment has no room for root argument update: ' + path)
+        if new_body != body.encode('utf-8'):
+            with open(path, 'wb') as f:
+                f.write(new_body + b'#' * (1024 - len(new_body)))
 PY
     local is_lvm=0
     [[ "$LINUX_COPY_SRC_ROOT" != /dev/mapper/* && "$LINUX_COPY_SRC_ROOT" != /dev/dm-* ]] || is_lvm=1
@@ -3749,14 +3984,14 @@ linux_copy_regenerate_lvm_initramfs() {
 }
 
 linux_copy_ensure_efi_fallback() {
-    local esp="$LINUX_COPY_ROOT_MNT/boot/efi" bootfile candidate
+    local esp="$LINUX_COPY_ROOT_MNT/boot/efi" bootfile candidate loader
     case "$MACHINE_ARCH" in
-        aarch64) bootfile=BOOTAA64.EFI ;;
-        x86_64) bootfile=BOOTX64.EFI ;;
+        aarch64) bootfile=BOOTAA64.EFI; loader=grubaa64.efi ;;
+        x86_64) bootfile=BOOTX64.EFI; loader=grubx64.efi ;;
         *) error "Unsupported UEFI architecture for Linux file-copy: $MACHINE_ARCH" ;;
     esac
     [[ -f "$esp/EFI/BOOT/$bootfile" ]] && return 0
-    candidate=$(find "$esp/EFI" -type f \( -iname 'grubaa64.efi' -o -iname 'grubx64.efi' -o -iname "$bootfile" \) -print -quit 2>/dev/null)
+    candidate=$(find "$esp/EFI" -type f \( -iname "$loader" -o -iname "$bootfile" \) -print -quit 2>/dev/null)
     [[ -n "$candidate" ]] || error "Source cloud image has no UEFI fallback loader or reusable GRUB EFI binary"
     mkdir -p "$esp/EFI/BOOT"
     cp -p "$candidate" "$esp/EFI/BOOT/$bootfile" || error "Could not install UEFI fallback path"
@@ -3771,7 +4006,7 @@ linux_copy_btrfs_subvolumes() {
     mkdir -p "$source_top" "$dest_top"
     mount -t btrfs -o ro,subvolid=5 "$LINUX_COPY_SRC_ROOT" "$source_top" || error "Cannot mount source Btrfs top-level"
     mount -t btrfs -o subvolid=5 "$LINUX_COPY_ROOT_TARGET" "$dest_top" || error "Cannot mount target Btrfs top-level"
-    mapfile -t subvols < <(btrfs subvolume list -o "$source_top" | sed -n 's/^.* path //p' | LC_ALL=C sort)
+    mapfile -t subvols < <(btrfs subvolume list "$source_top" | sed -n 's/^.* path //p' | LC_ALL=C sort)
     (( ${#subvols[@]} > 0 )) || error "Btrfs source has no subvolumes; unsupported cloud image layout"
     for path in "${subvols[@]}"; do
         [[ "$path" =~ ^[a-zA-Z0-9_@.+/-]+$ && "$path" != /* && "$path" != *../* && "$path" != .. ]] || error "Invalid source Btrfs subvolume path: $path"
@@ -3789,9 +4024,6 @@ linux_copy_btrfs_subvolumes() {
         [[ "$id" =~ ^[0-9]+$ ]] || error "Cannot map Btrfs default subvolume: $default_subvol"
         btrfs subvolume set-default "$id" "$dest_top" || error "Cannot set target Btrfs default subvolume"
     fi
-    umount "$dest_top" || error "Cannot unmount target Btrfs top-level"
-    umount "$source_top" || error "Cannot unmount source Btrfs top-level"
-
     # Root and auxiliary mountpoints are specified by the source's fstab.
     local fstab="$LINUX_COPY_SRC_MNT/etc/fstab" rootopts=""
     if [[ -f "$fstab" ]]; then
@@ -3802,7 +4034,12 @@ linux_copy_btrfs_subvolumes() {
     done
     [[ -n "$root_subvol" ]] || root_subvol=root
     root_subvol="${root_subvol#/}"
-    [[ -d "$INSTALL_TMPDIR/linux-btrfs-target-top/$root_subvol" ]] || error "Root Btrfs subvolume missing after copy: $root_subvol"
+    [[ "$root_subvol" =~ ^[a-zA-Z0-9_@.+/-]+$ && "$root_subvol" != *../* && "$root_subvol" != .. ]] || \
+        error "Invalid root Btrfs subvolume: $root_subvol"
+    btrfs subvolume show "$dest_top/$root_subvol" >/dev/null 2>&1 || \
+        error "Root Btrfs subvolume missing after copy: $root_subvol"
+    umount "$dest_top" || error "Cannot unmount target Btrfs top-level"
+    umount "$source_top" || error "Cannot unmount source Btrfs top-level"
     mkdir -p "$dest_root"
     mount -t btrfs -o "subvol=$root_subvol" "$LINUX_COPY_ROOT_TARGET" "$dest_root" || error "Cannot mount destination Btrfs root subvolume"
 
@@ -3929,8 +4166,12 @@ installer_write_image_linux_by_copy() {
     confirm_destructive_write
     TEMP_STAGE_PART_NUM=128
     prepare_fixed_temp_staging_partition
-    IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
-    download_target_image_in_alpine "$IMG_QCOW"
+    if [[ -n "$PREFETCH_IMAGE_PATH" ]]; then
+        IMG_QCOW="$PREFETCH_IMAGE_PATH"
+    else
+        IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+        download_target_image_in_alpine "$IMG_QCOW"
+    fi
     connect_qcow_readonly_nbd "$IMG_QCOW"
     linux_copy_scan_source
     linux_copy_create_partitions
@@ -3979,11 +4220,19 @@ print_install_summary() {
 do_install() {
     info "Installing $TARGET_OS ${TARGET_VER:-} to $DISK"
     info "Image: $IMG_URL"
-    [[ "$HOLD" != 1 ]] || { info "--hold 1: validation only"; return; }
+    [[ "$HOLD" != 1 ]] || {
+        info "--hold 1: running full image/source checks without modifying the target"
+        ALLOW_EARLY_WIPE=0
+    }
 
     installer_workspace
     installer_stage_optional_inputs
     preflight_target_image_in_alpine
+    installer_precommit_prepare
+    [[ "$HOLD" != 1 ]] || {
+        info "Full rescue preflight passed; target disk was not changed (--hold 1)"
+        return 0
+    }
     if [[ "$TARGET_OS" == freebsd ]]; then
         installer_write_image
     else
@@ -4043,6 +4292,7 @@ parse_host_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage ;;
+            --allow-early-wipe) ALLOW_EARLY_WIPE=1 ;;
             --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook|--hold)
                 local opt="$1"; shift
                 [[ $# -gt 0 ]] || error "Need value for $opt"
@@ -4119,6 +4369,7 @@ print_host_summary() {
     echo "Target:     $TARGET_OS ${TARGET_VER:-}"
     echo "Disk:       $DISK"
     echo "Image:      $IMG_URL"
+    echo "Staging:    $([[ "$ALLOW_EARLY_WIPE" == 1 ]] && echo 'early destructive (explicit opt-in)' || echo 'verified-before-wipe (RAM)')"
     echo "Hostname:   localhost"
     echo "SSH port:   ${SSH_PORT:-22}"
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || echo "Disk reason: $AUTO_DETECT_REASON"
@@ -4163,14 +4414,18 @@ preflight_image_geometry() {
     disk_bytes=$(get_disk_size_bytes "$DISK")
     image_bytes=$(probe_remote_qcow_virtual_size) || \
         error "Cannot read remote QCOW2 header before disk modification"
-    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -gt $((5 * 1024 * 1024 * 1024)) ]] || \
-        error "Target disk is too small for 3 GiB staging"
-    stage_safe=$((disk_bytes - 3072 * 1024 * 1024 - 64 * 1024 * 1024))
+    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -ge $((10 * 1024 * 1024 * 1024)) ]] || \
+        error "Minimum supported target disk size is 10 GiB"
+    if [[ "$ALLOW_EARLY_WIPE" == 1 ]]; then
+        stage_safe=$((disk_bytes - 3072 * 1024 * 1024 - 64 * 1024 * 1024))
+    else
+        stage_safe=$((disk_bytes - 128 * 1024 * 1024 - 64 * 1024 * 1024))
+    fi
     if (( image_bytes > disk_bytes )); then
         warn "Image virtual size exceeds target disk; actual partition boundaries will be validated before writing"
     fi
     if (( image_bytes > stage_safe )) && [[ "$TARGET_OS" == freebsd ]]; then
-        warn "Image virtual size crosses the 3 GiB staging boundary; sparse-shadow safety is not guaranteed"
+        warn "Image virtual size crosses the selected staging boundary; full image layout preflight is required"
     elif [[ "$TARGET_OS" != freebsd ]]; then
         info "Linux target will be installed by filesystem copy (no XFS shrink or RAW shadow)"
     fi
@@ -4191,6 +4446,24 @@ preflight_target_image_on_host() {
     fi
 }
 
+validate_supported_install_mode() {
+    # Verify capabilities before scheduling a rescue boot, not after disk changes.
+    case "$MACHINE_ARCH" in x86_64|aarch64) ;; *) error "Unsupported target architecture: $MACHINE_ARCH" ;; esac
+    # No BIOS path has passed first-boot verification for the current backends.
+    if [[ "$OS" == Linux && ! -d /sys/firmware/efi ]]; then
+        error "BIOS installation is not validated for these backends; UEFI is required"
+    fi
+    if [[ "$OS" == FreeBSD ]]; then
+        # FreeBSD 15.1 exposes machdep.bootmethod only on x86.
+        # AArch64 FreeBSD always boots via UEFI, but EFIRT is still required.
+        if [[ "$MACHINE_ARCH" == x86_64 ]]; then
+            [[ "$(sysctl -n machdep.bootmethod 2>/dev/null || true)" == UEFI ]] || \
+                error "FreeBSD amd64 host needs UEFI; BIOS bootstrap is unsupported"
+        fi
+        [[ -c /dev/efi ]] || error "FreeBSD host lacks /dev/efi for EFI BootNext"
+    fi
+}
+
 host_main() {
     reset_config
     [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage
@@ -4206,21 +4479,26 @@ host_main() {
     [[ "$TARGET_OS" != redhat || -n "$IMG_URL" ]] || error "redhat requires --img URL"
     [[ "$IMG_URL" != http://* ]] || error "HTTP image URLs are not supported; use HTTPS"
     detect_os_arch
-    [[ "$HOLD" == 1 ]] || ensure_dependencies
+    validate_supported_install_mode
+    if [[ "$HOLD" == 1 ]]; then
+        have_any_downloader || error "--hold 1 needs curl or wget for image metadata validation"
+    else
+        ensure_dependencies
+    fi
     local key
     for key in "${SSH_KEY_ARGS[@]}"; do append_ssh_key "$key"; done
     prepare_target_disk
-    [[ "$HOLD" == 1 ]] || check_secure_boot
+    check_secure_boot
     prepare_credentials
     if [[ -z "$IMG_URL" ]]; then
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
         IMAGE_BUILTIN=1
     fi
-    if [[ "$HOLD" != 1 ]]; then
-        preflight_target_image_on_host
-        preflight_image_geometry
-    fi
+    preflight_target_image_on_host
+    preflight_image_geometry
     print_host_summary
+    warn "Rescue boot currently uses DHCPv4; static IP, VLAN and bonding are not migrated. Verify DHCP access before reboot."
+    warn "The apkovl contains password hash/configuration on the boot filesystem; FAT filesystems cannot enforce 0600 access."
     [[ "$DISK_AUTO_SELECTED" != 1 ]] || print_disk_candidates
     if [[ "$HOLD" != 1 ]]; then
         local answer choice=1 i
@@ -4236,7 +4514,10 @@ host_main() {
         [[ "$answer" == "$choice" ]] || error "Destructive operation cancelled (use --disk to choose another device)"
     fi
 
-    [[ "$HOLD" != 1 ]] || return 0
+    [[ "$HOLD" != 1 ]] || {
+        info "--hold 1 (host): image URL/header and host capability checked; full download/source verification requires Alpine rescue."
+        return 0
+    }
     PASSWORD_TO_DISPLAY=""
     prepare_and_boot_alpine_ram
 }
@@ -4261,7 +4542,8 @@ installer_main() {
     detect_os_arch
     load_install_plan
     [[ "$hold_override" == 0 ]] || HOLD="$hold_override"
-    [[ "$HOLD" == 1 ]] || ensure_dependencies
+    ensure_dependencies
+    validate_supported_install_mode
 
     [[ -z "$DISK" || "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
     [[ -n "$DISK" ]] || error "Install plan contains no target disk"
