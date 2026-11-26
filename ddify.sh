@@ -2414,7 +2414,12 @@ install_freebsd_bootnext_entry() {
     before=$(efi_entry_numbers)
     efibootmgr -a -c -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
         error "Failed to create UEFI boot entry"
-    num=$(comm -13 <(printf '%s\n' "$before") <(efi_entry_numbers) | head -n1)
+    # Compare boot entry numbers without process substitution.
+    num=$(printf '%s\n' "$(efi_entry_numbers)" | awk -v before="$before" '
+        BEGIN { n=split(before,a,"\n"); for(i=1;i<=n;i++) seen[a[i]]=1 }
+        NF && !($0 in seen) { result=$0; count++ }
+        END { if(count==1) print result; else exit 1 }
+    ') || error "Expected exactly one new UEFI boot entry"
     match_ere "$num" '^[0-9A-F]{4}$' || error "Could not uniquely determine new UEFI boot entry"
 
     # -c prepends the new entry to BootOrder; preserve the user's original order.
