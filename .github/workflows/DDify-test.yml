@@ -28,6 +28,9 @@ jobs:
         run: |
           set -eu
           if [ -n "$RHEL_IMAGE_URL" ]; then
+              case "$RHEL_IMAGE_URL" in
+                  *[!A-Za-z0-9._~:/%+-]*) echo 'Invalid character in RHEL URL' >&2; exit 1 ;;
+              esac
               # URLs are sent as literal arguments to the serial root shell.
               # Never pass signed URLs, tokens, or embedded credentials into logs.
               printf '%s\n' "$RHEL_IMAGE_URL" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/%+-]+\.qcow2$' ||
