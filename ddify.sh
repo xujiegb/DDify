@@ -357,7 +357,9 @@ normalize_disk_wwn() {
 
 freebsd_disk_partition_uuids() {
     local d="${1#/dev/}"
-    gpart list "$d" 2>/dev/null | awk -v disk="$d" '
+    local inventory
+    inventory=$(gpart list "$d" 2>/dev/null) || return 1
+    printf '%s\n' "$inventory" | awk -v disk="$d" '
         /^[[:space:]]*[0-9]+\. Name:/ { provider=$3 }
         /^[[:space:]]*rawuuid:/ {
             prefix=disk "p"
@@ -460,7 +462,9 @@ DDIFY_INPUT_1
 }
 
 disk_contains_anchor_partuuid() {
-    local disk="$1" want="$(to_lower "$2")" uuids count
+    local disk="$1" want uuids count
+    want=$(to_lower "$2") || return 1
+    [ -n "$want" ] || return 1
     if [ "$OS" = FreeBSD ]; then
         uuids=$(freebsd_disk_partition_uuids "$disk") || return 1
     else
@@ -489,16 +493,42 @@ resolve_target_disk_from_identity() {
         error "No strong target disk identity recorded; refusing destructive write"
     { [ -z "${DISK_ID_ANCHOR_PARTUUID:-}" ] || match_ere "$DISK_ID_ANCHOR_PARTUUID" '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'; } || \
         error "Invalid saved GPT partition identity"
+    # Native FreeBSD uses GEOM and diskinfo directly. Do not round-trip
+    # empty WWN/serial fields through a delimited read on different shells.
+    if [ "$OS" = FreeBSD ]; then
+        local native_disk native_size native_serial
+        for native_disk in $(sysctl -n kern.disks 2>/dev/null); do
+            path="/dev/$native_disk"
+            [ -c "$path" ] || [ -b "$path" ] || continue
+            native_size=$(get_disk_size_bytes "$path") || continue
+            [ "$native_size" = "$DISK_ID_SIZE" ] || continue
+            disk_contains_anchor_partuuid "$path" "$DISK_ID_ANCHOR_PARTUUID" || continue
+            native_serial=$(diskinfo -s "$path" 2>/dev/null || true)
+            if [ -n "$DISK_ID_SERIAL" ]; then
+                [ "$native_serial" = "$DISK_ID_SERIAL" ] || continue
+            fi
+            matches=$((matches + 1))
+            matched_disk=$path
+        done
+    else
     while IFS='|' read -r path wwn serial size model ptuuid mbr_id; do
         if [ -n "${DISK_ID_ANCHOR_PARTUUID:-}" ]; then
             [ "$size" = "$DISK_ID_SIZE" ] || continue
-            disk_contains_anchor_partuuid "$path" "$DISK_ID_ANCHOR_PARTUUID" && { matches=$((matches + 1)); matched_disk=$path; }
+            disk_contains_anchor_partuuid "$path" "$DISK_ID_ANCHOR_PARTUUID" || continue
+            # An available serial is a second identity check; never accept a
+            # mismatched physical disk merely because a GPT was cloned.
+            if [ -n "$DISK_ID_SERIAL" ] && [ -n "$serial" ]; then
+                [ "$DISK_ID_SERIAL" = "$serial" ] || continue
+            fi
+            matches=$((matches + 1))
+            matched_disk=$path
         else
             disk_identity_matches "$wwn" "$serial" "$size" "$model" "$ptuuid" "$mbr_id" && { matches=$((matches + 1)); matched_disk=$path; }
         fi
     done <<DDIFY_INPUT_2
 $(list_disk_identities)
 DDIFY_INPUT_2
+    fi
 
     [ "$matches" -eq 1 ] || error "Saved target identity matched $matches disks; refusing destructive write"
     { [ -z "${DISK:-}" ] || [ "$DISK" = "$matched_disk" ]; } || info "Target disk path changed: $DISK -> $matched_disk"
@@ -943,58 +973,6 @@ $SSH_KEYS_ALL
 DDIFY_INPUT_18
 }
 
-seed_account_freebsd() {
-    echo "disable_root: false"
-    echo "ssh_pwauth: $([ -n "$PASSWORD_HASH" ] && echo true || echo false)"
-
-    if [ -n "$SSH_KEYS_ALL" ]; then
-        echo "users:"
-        echo "  - name: root"
-        echo "    ssh_authorized_keys:"
-        emit_ssh_keys "      "
-    fi
-
-    [ -n "$PASSWORD_HASH" ] || return 0
-    cat <<EOF
-
-chpasswd:
-  expire: false
-  users:
-    - name: root
-      password: "${PASSWORD_HASH}"
-EOF
-}
-
-seed_account_linux() {
-    cat <<'EOF'
-preserve_hostname: false
-hostname: localhost
-prefer_fqdn_over_hostname: false
-growpart:
-  mode: auto
-  devices: [/]
-resize_rootfs: true
-EOF
-
-    { [ -n "$PASSWORD_HASH" ] || [ -n "$SSH_KEYS_ALL" ]; } || return 0
-
-    echo "ssh_pwauth: $([ -n "$PASSWORD_HASH" ] && echo true || echo false)"
-    echo "disable_root: false"
-    echo "users:"
-    echo "  - name: root"
-
-    if [ -n "$PASSWORD_HASH" ]; then
-        echo "    lock_passwd: false"
-        echo "    hashed_passwd: \"${PASSWORD_HASH}\""
-    else
-        echo "    lock_passwd: true"
-    fi
-
-    [ -n "$SSH_KEYS_ALL" ] || return 0
-    echo "    ssh_authorized_keys:"
-    emit_ssh_keys "      "
-}
-
 seed_write_files() {
     local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml" owner="root:root"
     if [ "$os" = freebsd ]; then
@@ -1335,6 +1313,82 @@ EOF
     seed_runcmd_cleanup_cidata "$os" "$cidata_partuuid"
 }
 
+# nuageinit supports a native executable user-data script. Keep the FreeBSD
+# first-boot path separate from Linux cloud-init's YAML dialect.
+write_freebsd_seed_script() {
+    local user="$1" partuuid="$2" frpc_b64="$3" auth_hash="$PASSWORD_HASH" permit auth
+    if [ -n "$auth_hash" ]; then
+        permit=yes; auth=yes
+    else
+        permit=prohibit-password; auth=no
+        # Give root a random, undisclosed password hash to avoid account-lock
+        # semantics preventing key-only access. SSH password auth stays off.
+        auth_hash=$(openssl rand -hex 32 | openssl passwd -6 -stdin) ||
+            error "Cannot generate disabled-password root credential"
+    fi
+    {
+        printf '%s\n' '#!/bin/sh' 'set -eu' 'umask 077'
+        plan_assignment ddify_root_hash "$auth_hash"
+        plan_assignment ddify_root_keys "$SSH_KEYS_ALL"
+        plan_assignment ddify_port "${SSH_PORT:-22}"
+        plan_assignment ddify_web_port "$WEB_PORT"
+        plan_assignment ddify_permit "$permit"
+        plan_assignment ddify_auth "$auth"
+        plan_assignment ddify_frpc_b64 "$frpc_b64"
+        cat <<'FREEBSD_BOOT'
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+exec >>/var/log/ddify-firstboot.log 2>&1
+echo "DDify: FreeBSD firstboot started"
+echo "DDify: FreeBSD firstboot started" >/dev/console || true
+printf '%s\n' "$ddify_root_hash" | pw usermod root -H 0
+if [ -n "$ddify_root_keys" ]; then
+    mkdir -p /root/.ssh
+    chmod 0700 /root/.ssh
+    printf '%s\n' "$ddify_root_keys" >/root/.ssh/authorized_keys
+    chmod 0600 /root/.ssh/authorized_keys
+    chown -R root:wheel /root/.ssh
+fi
+cfg=/etc/ssh/sshd_config
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' 0
+awk -v permit="$ddify_permit" -v auth="$ddify_auth" -v port="$ddify_port" '
+    BEGIN {
+        print "PermitRootLogin " permit
+        print "PasswordAuthentication " auth
+        print "KbdInteractiveAuthentication " auth
+        print "PubkeyAuthentication yes"
+        print "Port " port
+    }
+    /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|Port)[[:space:]]+/ {next}
+    {print}
+' "$cfg" >"$tmp"
+ssh-keygen -A
+/usr/sbin/sshd -t -f "$tmp"
+cat "$tmp" >"$cfg"
+/usr/sbin/sshd -t
+sysrc sshd_enable=YES
+service sshd restart || service sshd start
+if [ -n "$ddify_web_port" ]; then
+    printf '%s\n' "$ddify_web_port" >/etc/reinstall-web-port
+    chmod 0644 /etc/reinstall-web-port
+fi
+if [ -n "$ddify_frpc_b64" ]; then
+    printf '%s' "$ddify_frpc_b64" | base64 -d >/etc/frpc.toml
+    chmod 0600 /etc/frpc.toml
+    (frpc -c /etc/frpc.toml || /usr/local/bin/frpc -c /etc/frpc.toml || true) &
+fi
+# The partition boundary was expanded in Alpine. FreeBSD grows UFS in place.
+growfs -y / || echo "DDify: UFS expansion needs inspection" >&2
+FREEBSD_BOOT
+        # Reuse the UUID-checked cleanup body, stripping only YAML indentation.
+        seed_runcmd_cleanup_cidata_freebsd "$partuuid" | sed '1d; s/^      //'
+        printf '%s\n' 'echo "DDify: FreeBSD firstboot completed"' \
+            'echo "DDify: FreeBSD firstboot completed" >/dev/console || true'
+    } >"$user"
+    sh -n "$user" || error "Generated FreeBSD firstboot script is invalid"
+}
+
 write_nocloud_seed() {
     local os="$1" meta="$2" user="$3" cidata_partuuid="${4:-}" frpc_b64=""
 
@@ -1347,15 +1401,16 @@ EOF
     { [ -z "${FRPC_PRESENT:-}" ] || [ -z "${FRPC_TOML:-}" ] || ! [ -f "$FRPC_TOML" ]; } || \
         frpc_b64=$(base64 <"$FRPC_TOML" | tr -d '\n')
 
-    {
-        echo "#cloud-config"
-        case "$os" in
-            freebsd) seed_account_freebsd ;;
-            *)       seed_account_linux ;;
-        esac
-        seed_write_files "$os" "$frpc_b64"
-        seed_runcmd "$os" "$frpc_b64" "$cidata_partuuid"
-    } >"$user"
+    if [ "$os" = freebsd ]; then
+        write_freebsd_seed_script "$user" "$cidata_partuuid" "$frpc_b64"
+    else
+        {
+            echo "#cloud-config"
+            seed_account_linux
+            seed_write_files "$os" "$frpc_b64"
+            seed_runcmd "$os" "$frpc_b64" "$cidata_partuuid"
+        } >"$user"
+    fi
 }
 
 # ----------------- bootstrap state -----------------
@@ -1870,7 +1925,7 @@ REPOEOF
         e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
     if ! grep -q '^TARGET_OS=freebsd$' /etc/reinstall/plan.env; then
         echo "[stage] apk add (Linux filesystem-copy tools)"
-        apk add --no-cache rsync btrfs-progs
+        apk add --no-cache rsync btrfs-progs btrfs-progs-extra
         for cmd in rsync mkfs.btrfs btrfstune btrfs xfs_growfs; do
             command -v "$cmd" >/dev/null 2>&1 || {
                 echo "Linux file-copy dependency is missing: $cmd" >&2
@@ -4090,8 +4145,11 @@ installer_write_seed() {
 
     { [ -n "$FRPC_TOML" ] && [ -f "$FRPC_TOML" ]; } && FRPC_PRESENT=1 || FRPC_PRESENT=""
     write_nocloud_seed "$TARGET_OS" "$mnt/meta-data" "$mnt/user-data" "$partuuid"
+    [ -s "$mnt/meta-data" ] && [ -s "$mnt/user-data" ] || error "Incomplete NoCloud seed"
     sync
     umount "$mnt" || error "Failed to unmount CIDATA"
+    [ "$(blkid -p -s LABEL -o value "$part")" = CIDATA ] || error "NoCloud FAT volume label was not persisted"
+    info "Verified on-disk NoCloud volume label and seed files"
 }
 
 print_install_summary() {
