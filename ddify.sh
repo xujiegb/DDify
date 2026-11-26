@@ -973,6 +973,33 @@ $SSH_KEYS_ALL
 DDIFY_INPUT_18
 }
 
+seed_account_linux() {
+    cat <<'EOF'
+preserve_hostname: false
+hostname: localhost
+prefer_fqdn_over_hostname: false
+growpart:
+  mode: auto
+  devices: [/]
+resize_rootfs: true
+EOF
+
+    { [ -n "$PASSWORD_HASH" ] || [ -n "$SSH_KEYS_ALL" ]; } || return 0
+    echo "ssh_pwauth: $([ -n "$PASSWORD_HASH" ] && echo true || echo false)"
+    echo "disable_root: false"
+    echo "users:"
+    echo "  - name: root"
+    if [ -n "$PASSWORD_HASH" ]; then
+        echo "    lock_passwd: false"
+        echo "    hashed_passwd: \"${PASSWORD_HASH}\""
+    else
+        echo "    lock_passwd: true"
+    fi
+    [ -n "$SSH_KEYS_ALL" ] || return 0
+    echo "    ssh_authorized_keys:"
+    emit_ssh_keys "      "
+}
+
 seed_write_files() {
     local os="$1" frpc_b64="$2" frpc_path="/etc/frp/frpc.toml" owner="root:root"
     if [ "$os" = freebsd ]; then
@@ -2369,8 +2396,12 @@ DDIFY_INPUT_12
 patch_alpine_grub_efi() {
     local tmp="$1" release="$2" volid marker offset old_cfg new_cfg old_len new_len patch
     volid="alpine-virt ${release} ${ALPINE_NETBOOT_ARCH}"
-    printf -v old_cfg 'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n' "$volid"
-    printf -v new_cfg 'search --no-floppy --fs-uuid --set=root %s\nset prefix=($root)%s/grub\n' "$PLAN_EFI_UUID" "$ALPINE_BOOT_DIR_REL"
+    # Command substitution strips trailing newlines; append a sentinel so
+    # the exact binary configuration length (including the LF) is preserved.
+    old_cfg=$(printf 'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n.' "$volid")
+    old_cfg=${old_cfg%.}
+    new_cfg=$(printf 'search --no-floppy --fs-uuid --set=root %s\nset prefix=($root)%s/grub\n.' "$PLAN_EFI_UUID" "$ALPINE_BOOT_DIR_REL")
+    new_cfg=${new_cfg%.}
     old_len=${#old_cfg}; new_len=${#new_cfg}
     [ "$(( new_len <= old_len ))" -ne 0 ] || error "Patched GRUB early config is too large"
 
