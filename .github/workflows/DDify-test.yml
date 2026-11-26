@@ -91,7 +91,7 @@ jobs:
           grep -Fq "UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/fstab"
           grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/default/grub"
           grep -Fq 'root=$root' "$LINUX_COPY_ROOT_MNT/etc/default/grub"
-          ! grep -Fq 'rd.lvm.lv=' "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          if grep -Fq 'rd.lvm.lv=' "$LINUX_COPY_ROOT_MNT/etc/default/grub"; then exit 1; fi
           grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$envfile"
           [ "$(wc -c < "$envfile")" -eq 1024 ]
           EOF
