@@ -10,7 +10,7 @@ permissions:
   contents: read
 jobs:
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} (UEFI amd64)
+    name: ${{ matrix.source }} -> ${{ matrix.target }} (1 GiB RAM, ${{ matrix.disk_label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -18,11 +18,18 @@ jobs:
       matrix:
         source: [rocky, freebsd]
         target: [rocky, freebsd]
+        include:
+          - source: rocky
+            disk_bytes: '10737418240'
+            disk_label: '10 GiB'
+          - source: freebsd
+            disk_bytes: '10000000000'
+            disk_label: '10 GB'
     env:
       SOURCE_OS: ${{ matrix.source }}
       TARGET_OS: ${{ matrix.target }}
       VM_RAM_MIB: '1024'
-      VM_DISK_BYTES: '10000000000'
+      VM_DISK_BYTES: ${{ matrix.disk_bytes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,10 +111,15 @@ jobs:
           qemu-img check "$name"
           mv "$name" disk.qcow2
           # The source is the same disk later reinstalled by DDify.
+          # Rocky GenericCloud has a 10 GiB virtual disk; retain it intact.
+          # FreeBSD cases still test the smaller decimal 10 GB capacity.
           # Never shrink an official source filesystem blindly to fit the VPS.
           source_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
           [ "$source_bytes" -le "$DISK_BYTES" ] || fail "Source virtual disk exceeds requested $DISK_BYTES bytes: $source_bytes"
-          qemu-img resize disk.qcow2 "$DISK_BYTES"
+          if [ "$source_bytes" -lt "$DISK_BYTES" ]; then qemu-img resize disk.qcow2 "$DISK_BYTES"; fi
+          actual_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
+          [ "$actual_bytes" -eq "$DISK_BYTES" ] || fail "Unexpected disk geometry: $actual_bytes"
+          printf 'Guest resources: %s MiB RAM, %s bytes disk\n' "$RAM" "$actual_bytes"
           qemu-img info disk.qcow2 | tee "$LOG/source-image.txt"
           ssh-keygen -q -t ed25519 -N '' -f source-key
           ssh-keygen -q -t ed25519 -N '' -f target-key
@@ -304,7 +316,7 @@ jobs:
               rocky) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
               freebsd) ssh_guest target 'test -c /dev/efi && layout=$(gpart show -l) && ! printf "%s\n" "$layout" | grep -w CIDATA' ;;
           esac
-          echo "PASS: $SOURCE_OS -> $TARGET_OS (1 GiB RAM, 10 GB disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
+          echo "PASS: $SOURCE_OS -> $TARGET_OS (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
       - name: Upload logs even when installation fails
         if: always()
         uses: actions/upload-artifact@v4
