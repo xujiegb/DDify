@@ -3020,8 +3020,8 @@ validate_qcow_metadata() {
         type == "object" and
         .format == "qcow2" and
         ((.encrypted // false) == false) and
-        (has("backing-filename") or has("full-backing-filename") or has("backing-filename-format") | not) and
-        (."format-specific".data // {} | (has("data-file") or has("data-file-raw") | not)) and
+        ((has("backing-filename") or has("full-backing-filename") or has("backing-filename-format")) | not) and
+        (."format-specific".data // {} | ((has("data-file") or has("data-file-raw")) | not)) and
         (."virtual-size" | type == "number") and
         (."virtual-size" > 0 and (."virtual-size" | floor) == ."virtual-size")
     ' >/dev/null || error "QCOW2 needs external resources, is encrypted, or has unsupported metadata"
@@ -3767,12 +3767,12 @@ linux_copy_filter_cmdline() {
     if [ "$is_lvm" = 1 ]; then
         sed -E \
             -e "s/(^|[^[:alnum:]_])resume=[^[:space:]\"']+[[:blank:]]*/\\1/g" \
-            -e "s/(^|[^[:alnum:]_])root=[^$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g" \
+            -e "s/(^|[^[:alnum:]_])root=[^\$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g" \
             -e "s/(^|[[:space:]])rd\\.lvm\\.(lv|vg|uuid)=[^[:space:]\"']+[[:blank:]]*/\\1/g"
     else
         sed -E \
             -e "s/(^|[^[:alnum:]_])resume=[^[:space:]\"']+[[:blank:]]*/\\1/g" \
-            -e "s/(^|[^[:alnum:]_])root=[^$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g"
+            -e "s/(^|[^[:alnum:]_])root=[^\$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g"
     fi
 }
 
