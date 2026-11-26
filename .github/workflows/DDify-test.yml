@@ -101,6 +101,29 @@ jobs:
           write_freebsd_seed_script "$work/freebsd-user-data" 11111111-2222-3333-4444-555555555555 ""
           sh -n "$work/freebsd-user-data"
           grep -Fq 'DDify: FreeBSD firstboot completed' "$work/freebsd-user-data"
+          FRPC_PRESENT=""
+          FRPC_TOML=""
+          write_nocloud_seed rocky "$work/linux-meta-data" "$work/linux-user-data" 11111111-2222-3333-4444-555555555555
+          grep -Fxq '#cloud-config' "$work/linux-user-data"
+          grep -Fxq '  - name: root' "$work/linux-user-data"
+          grep -Fq "$SSH_KEYS_ALL" "$work/linux-user-data"
+          grep -Fxq '    lock_passwd: true' "$work/linux-user-data"
+          grep -Fxq 'runcmd:' "$work/linux-user-data"
+          grep -Fq '/etc/reinstall-web-port' "$work/linux-user-data"
+          # Synthetic EFI binary: verify exact byte offsets, preserved LF,
+          # unchanged surrounding bytes and no change in the binary length.
+          ALPINE_NETBOOT_ARCH=x86_64
+          PLAN_EFI_UUID=AAAA-BBBB
+          ALPINE_BOOT_DIR_REL=/REINSTALL/alpine
+          ALPINE_FREEBSD_GRUB_EFI_ABS="$work/fixture.efi"
+          release=3.22.6
+          printf 'MZ\000fixture\nsearch --no-floppy --set=root --label "alpine-virt %s x86_64"\nset prefix=($root)/boot/grub\nEND\000' "$release" > "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          size=$(wc -c < "$ALPINE_FREEBSD_GRUB_EFI_ABS")
+          patch_alpine_grub_efi "$work" "$release"
+          [ "$(wc -c < "$ALPINE_FREEBSD_GRUB_EFI_ABS")" -eq "$size" ]
+          grep -aFq 'search --no-floppy --fs-uuid --set=root AAAA-BBBB' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          grep -aFq 'set prefix=($root)/REINSTALL/alpine/grub' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          [ "$(tail -c 4 "$ALPINE_FREEBSD_GRUB_EFI_ABS" | od -An -tx1 | tr -d ' \n')" = 454e4400 ]
           EOF
           sh "$helper_dir/test.sh"
           busybox ash "$helper_dir/test.sh"
