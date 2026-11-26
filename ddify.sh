@@ -1601,7 +1601,7 @@ mount_efi_for_plan() {
 # Preserve quotes, newlines and empty values without Bash printf %q.
 plan_assignment() (
     name=$1 value=$2
-    case "$name" in ''|*[!A-Z0-9_]*) exit 1 ;; esac
+    case "$name" in ''|[0-9]*|*[!A-Za-z0-9_]*) exit 1 ;; esac
     printf '%s=' "$name"
     case "$value" in
         ''|*[!A-Za-z0-9_./:-]*)
