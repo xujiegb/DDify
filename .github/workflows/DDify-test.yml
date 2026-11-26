@@ -94,6 +94,13 @@ jobs:
           if grep -Fq 'rd.lvm.lv=' "$LINUX_COPY_ROOT_MNT/etc/default/grub"; then exit 1; fi
           grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$envfile"
           [ "$(wc -c < "$envfile")" -eq 1024 ]
+          PASSWORD_HASH=""
+          SSH_KEYS_ALL="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey ci"
+          SSH_PORT=22
+          WEB_PORT=18080
+          write_freebsd_seed_script "$work/freebsd-user-data" 11111111-2222-3333-4444-555555555555 ""
+          sh -n "$work/freebsd-user-data"
+          grep -Fq 'DDify: FreeBSD firstboot completed' "$work/freebsd-user-data"
           EOF
           sh "$helper_dir/test.sh"
           busybox ash "$helper_dir/test.sh"
@@ -269,7 +276,7 @@ jobs:
                   # BASIC-CLOUDINIT uses base-system nuageinit, not Python cloud-init.
                   # rc removes /firstboot only after its firstboot services run.
                   end=$(($(date +%s)+900))
-                  until ssh_guest "$key" 'test -x /usr/libexec/nuageinit && test ! -e /firstboot && test ! -e /firstboot-reboot && test -s /var/log/nuageinit.log && grep -Fq "Executing '\''runcmd'\''" /var/log/nuageinit.log' >/dev/null 2>&1; do
+                  until ssh_guest "$key" 'test -x /usr/libexec/nuageinit && test ! -e /firstboot && test ! -e /firstboot-reboot && test -s /var/log/nuageinit.log && grep -Eq "Executing (user_data script|'\''runcmd'\'')" /var/log/nuageinit.log' >/dev/null 2>&1; do
                       kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during FreeBSD initialization'
                       [ "$(date +%s)" -lt "$end" ] || {
                           ssh_guest "$key" 'ls -l /firstboot* /var/log/nuageinit.log; cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt" 2>&1 || true
@@ -300,7 +307,7 @@ jobs:
           collect_guest() {
               local key=$1 tag=$2
               ssh_guest "$key" 'uname -a; df -h; if [ "$(uname -s)" = FreeBSD ]; then freebsd-version -ku; gpart show -l; efibootmgr -v; else cat /etc/os-release; lsblk -f; findmnt /; efibootmgr -v; fi' > "$LOG/$tag-system.txt" 2>&1 || true
-              ssh_guest "$key" 'if [ "$(uname -s)" = FreeBSD ]; then cat /var/log/nuageinit.log; else cat /var/log/cloud-init.log /var/log/cloud-init-output.log; fi' > "$LOG/$tag-cloud-init.log" 2>&1 || true
+              ssh_guest "$key" 'if [ "$(uname -s)" = FreeBSD ]; then cat /var/log/nuageinit.log /var/log/ddify-firstboot.log 2>/dev/null; else cat /var/log/cloud-init.log /var/log/cloud-init-output.log; fi' > "$LOG/$tag-cloud-init.log" 2>&1 || true
           }
           start_vm seed
           wait_os source "$SOURCE_OS" 900
@@ -327,14 +334,19 @@ jobs:
           case "$TARGET_OS" in rocky) version=10;; freebsd) version=15;; esac
           # Explicit disk confirmation is 1. The disposable VM exercises disk staging.
           # This firmware is the non-Secure-Boot OVMF image; no enrolled keys.
-          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify.sh $TARGET_OS $version --allow-early-wipe --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
+          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup sh -c 'env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify.sh $TARGET_OS $version --allow-early-wipe --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1; rc=\$?; printf \"%s\\n\" \"\$rc\" > /var/tmp/ddify-host.rc' </dev/null >/dev/null 2>&1 &"
           end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
-              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*' "$LOG/serial.log"; then fail 'DDify installer reported failure on serial console'; fi
+              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$LOG/serial.log"; then fail 'DDify rescue reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1 && ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port 2>/dev/null)" = 18080' >/dev/null 2>&1; then break; fi
               if ssh_guest source 'test -f /var/tmp/ddify-host.log' >/dev/null 2>&1; then
                   ssh_guest source 'cat /var/tmp/ddify-host.log' > "$LOG/host-install.log.tmp" 2>/dev/null && mv "$LOG/host-install.log.tmp" "$LOG/host-install.log" || true
+                  host_rc=$(ssh_guest source 'cat /var/tmp/ddify-host.rc 2>/dev/null' 2>/dev/null || true)
+                  case "$host_rc" in ''|0) ;; *[!0-9]*) ;; *) cat "$LOG/host-install.log"; fail "DDify host failed with rc=$host_rc" ;; esac
+              fi
+              if assert_os target "$TARGET_OS" >/dev/null 2>&1; then
+                  collect_guest target initializing
               fi
               if ssh_guest target 'test -f /var/log/reinstall-auto.log' >/dev/null 2>&1; then
                   ssh_guest target 'cat /var/log/reinstall-auto.log' > "$LOG/rescue.log.tmp" 2>/dev/null && mv "$LOG/rescue.log.tmp" "$LOG/rescue.log" || true
@@ -344,6 +356,7 @@ jobs:
               sleep 10
           done
           cloud_wait target first-boot
+          if [ "$TARGET_OS" = freebsd ]; then ssh_guest target 'grep -Fq "DDify: FreeBSD firstboot completed" /var/log/ddify-firstboot.log'; fi
           collect_guest target first-boot
           first=$(boot_id target)
           ssh_guest target 'if [ "$(uname -s)" = FreeBSD ]; then shutdown -r now; else systemctl reboot; fi' || true
