@@ -164,7 +164,10 @@ jobs:
                   kill "$PID" 2>/dev/null || true
                   wait "$PID" 2>/dev/null || true
               fi
-              if [ "$rc" -ne 0 ]; then tail -c 24000 "$LOG/serial.log" 2>/dev/null || true; fi
+              if [ "$rc" -ne 0 ]; then
+                  tail -c 24000 "$LOG/serial.log" 2>/dev/null || true
+                  tail -c 4000 "$LOG/qemu.log" 2>/dev/null || true
+              fi
               rm -f "$WORK/source-key" "$WORK/target-key" "$WORK/user-data" "$WORK/seed.iso"
               exec >&3 2>&4
               wait "$logger_pid" || true
@@ -211,7 +214,7 @@ jobs:
           # Ephemeral password is for the disposable SOURCE serial console only.
           # Password authentication over SSH stays disabled.
           SOURCE_CONSOLE_PASSWORD=$(openssl rand -hex 24)
-          echo "::add-mask::$SOURCE_CONSOLE_PASSWORD"
+          echo "::add-mask::$SOURCE_CONSOLE_PASSWORD" >&3
           export SOURCE_CONSOLE_PASSWORD
           root_hash=$(printf '%s\n' "$SOURCE_CONSOLE_PASSWORD" | openssl passwd -6 -stdin)
           printf '%s\n' "$SCRIPT_REF" | grep -Eq '^[0-9a-f]{40}$' || fail 'Invalid script commit SHA'
@@ -408,11 +411,13 @@ jobs:
           }
           # Markers are split in the command so terminal echo cannot fake success.
           proc checked {command label seconds} {
+              global spawn_id
               set timeout $seconds
+              set pattern [format {DDIFY_%s:([0-9]+)\r?\n} $label]
               set line [format {%s; rc=$?; printf 'DDIFY_%%s:%%s\n' '%s' "$rc"} $command $label]
               send -- "$line\r"
               expect {
-                  -re [format {DDIFY_%s:([0-9]+)\r?\n} $label] {
+                  -re $pattern {
                       if {$expect_out(1,string) ne "0"} { die "$label failed with rc=$expect_out(1,string)" }
                       puts "SERIAL: $label OK"
                   }
