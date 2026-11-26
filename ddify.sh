@@ -241,7 +241,6 @@ have_any_downloader() {
 missing_deps_linux_common() {
     local missing=()
 
-    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
     command -v tar >/dev/null 2>&1 || missing+=("tar")
@@ -253,7 +252,6 @@ missing_deps_linux_common() {
 missing_deps_freebsd_host() {
     local missing=()
 
-    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
     command -v tar >/dev/null 2>&1 || missing+=("tar")
@@ -269,7 +267,6 @@ install_deps_redhat() {
 
     for item in "$@"; do
         case "$item" in
-            qemu-img)   pkgs+=("qemu-img") ;;
             xz)         pkgs+=("xz") ;;
             file)       pkgs+=("file") ;;
             tar)        pkgs+=("tar") ;;
@@ -291,7 +288,6 @@ install_deps_debian() {
 
     for item in "$@"; do
         case "$item" in
-            qemu-img)   pkgs+=("qemu-utils") ;;
             xz)         pkgs+=("xz-utils") ;;
             file)       pkgs+=("file") ;;
             tar)        pkgs+=("tar") ;;
@@ -313,7 +309,6 @@ install_deps_freebsd_host() {
 
     for item in "$@"; do
         case "$item" in
-            qemu-img)          pkgs+=("qemu-tools") ;;
             xz)                pkgs+=("xz") ;;
             file)              pkgs+=("file") ;;
             tar)               : ;;
@@ -1568,32 +1563,51 @@ mount_efi_for_plan() {
     PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
 }
 
+# Portable assignment quoting: the rescue init sources this plan with /bin/sh.
+# Preserve quotes, newlines and empty values without Bash printf %q.
+plan_assignment() (
+    name=$1 value=$2
+    case "$name" in ''|*[!A-Z0-9_]*) exit 1 ;; esac
+    printf '%s=' "$name"
+    case "$value" in
+        ''|*[!A-Za-z0-9_./:-]*)
+            printf "'"
+            while :; do
+                case "$value" in
+                    *"'"*) printf '%s' "${value%%\'*}"; printf '%s' "'\\''"; value=${value#*\'} ;;
+                    *) printf "%s'\n" "$value"; break ;;
+                esac
+            done ;;
+        *) printf '%s\n' "$value" ;;
+    esac
+)
+
 write_install_plan() {
     local path="$1"
     mkdir -p "$(dirname "$path")"
     {
-        printf 'TARGET_OS=%q\n' "$TARGET_OS"
-        printf 'TARGET_VER=%q\n' "$TARGET_VER"
-        printf 'DISK=%q\n' "$DISK"
-        printf 'DISK_ID_WWN=%q\n' "${DISK_ID_WWN:-}"
-        printf 'DISK_ID_SERIAL=%q\n' "${DISK_ID_SERIAL:-}"
-        printf 'DISK_ID_SIZE=%q\n' "${DISK_ID_SIZE:-}"
-        printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
-        printf 'DISK_ID_PTUUID=%q\n' "${DISK_ID_PTUUID:-}"
-        printf 'DISK_ID_MBR_ID=%q\n' "${DISK_ID_MBR_ID:-}"
-        printf 'DISK_ID_ANCHOR_PARTUUID=%q\n' "${DISK_ID_ANCHOR_PARTUUID:-}"
-        printf 'IMG_URL=%q\n' "$IMG_URL"
-        printf 'IMAGE_BUILTIN=%q\n' "${IMAGE_BUILTIN:-0}"
-        printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
-        printf "SSH_KEYS_ALL='%s'\n" "${SSH_KEYS_ALL//\'/\'\\\'\'}"
-        printf 'SSH_PORT=%q\n' "$SSH_PORT"
-        printf 'WEB_PORT=%q\n' "$WEB_PORT"
-        printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
-        printf 'POST_INSTALL_HOOK=%q\n' "$POST_INSTALL_HOOK"
-        printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
-        printf 'HOLD=%q\n' "$HOLD"
-        printf 'ALLOW_EARLY_WIPE=%q\n' "$ALLOW_EARLY_WIPE"
-        printf 'PLAN_EFI_UUID=%q\n' "$PLAN_EFI_UUID"
+        plan_assignment TARGET_OS "$TARGET_OS"
+        plan_assignment TARGET_VER "$TARGET_VER"
+        plan_assignment DISK "$DISK"
+        plan_assignment DISK_ID_WWN "${DISK_ID_WWN:-}"
+        plan_assignment DISK_ID_SERIAL "${DISK_ID_SERIAL:-}"
+        plan_assignment DISK_ID_SIZE "${DISK_ID_SIZE:-}"
+        plan_assignment DISK_ID_MODEL "${DISK_ID_MODEL:-}"
+        plan_assignment DISK_ID_PTUUID "${DISK_ID_PTUUID:-}"
+        plan_assignment DISK_ID_MBR_ID "${DISK_ID_MBR_ID:-}"
+        plan_assignment DISK_ID_ANCHOR_PARTUUID "${DISK_ID_ANCHOR_PARTUUID:-}"
+        plan_assignment IMG_URL "$IMG_URL"
+        plan_assignment IMAGE_BUILTIN "${IMAGE_BUILTIN:-0}"
+        plan_assignment PASSWORD_HASH "$PASSWORD_HASH"
+        plan_assignment SSH_KEYS_ALL "$SSH_KEYS_ALL"
+        plan_assignment SSH_PORT "$SSH_PORT"
+        plan_assignment WEB_PORT "$WEB_PORT"
+        plan_assignment FRPC_TOML "$FRPC_TOML"
+        plan_assignment POST_INSTALL_HOOK "$POST_INSTALL_HOOK"
+        plan_assignment AUTO_PASSWORD "$AUTO_PASSWORD"
+        plan_assignment HOLD "$HOLD"
+        plan_assignment ALLOW_EARLY_WIPE "$ALLOW_EARLY_WIPE"
+        plan_assignment PLAN_EFI_UUID "$PLAN_EFI_UUID"
     } >"$path"
     chmod 0600 "$path" 2>/dev/null || true
 }
@@ -2043,14 +2057,13 @@ setup_zram_swap() {
 }
 
 setup_work_tmpfs() {
-    local mem_kb mem_bytes zram_bytes work_bytes reserve
+    local mem_kb mem_bytes work_bytes reserve
 
     mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
     mem_bytes=$((mem_kb * 1024))
-    zram_bytes="$(cat /run/reinstall-zram-bytes 2>/dev/null || echo 0)"
     reserve=201326592
-    # zram is compressed swap, not physical RAM; bound tmpfs and watch MemAvailable.
-    work_bytes=$((mem_bytes + zram_bytes / 2 - reserve))
+    # Logical compressed swap is not extra physical RAM.
+    work_bytes=$((mem_bytes - reserve))
     [ "$work_bytes" -gt 536870912 ] || work_bytes=536870912
 
     mkdir -p /run/reinstall-work
@@ -2934,9 +2947,6 @@ preflight_target_image_in_alpine() {
     curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
         error "Target image URL is not reachable before disk modification"
     preflight_image_geometry
-    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
-        calculate_disk_staging_budget
-    fi
 }
 
 # The script never accepts decompression output beyond the negotiated workspace limit.
@@ -3041,241 +3051,8 @@ get_qcow_virtual_size_bytes() {
         head -n1
 }
 
-connect_raw_rw_nbd() {
-    local img="$1" n dev size
-
-    command -v qemu-nbd >/dev/null 2>&1 || error "qemu-nbd is required for sparse-shadow preparation"
-    modprobe nbd max_part=64 >/dev/null 2>&1 || error "Could not load nbd kernel module"
-    mdev -s 2>/dev/null || true
-
-    for n in $(seq 0 15); do
-        dev="/dev/nbd$n"
-        [[ -b "$dev" ]] || continue
-        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
-        [[ "$size" == "0" ]] || continue
-
-        if qemu-nbd --connect="$dev" --format=raw "$img" >/dev/null 2>&1; then
-            QCOW_NBD_DEV="$dev"
-            sleep 1
-            command -v partx >/dev/null 2>&1 && {
-                partx -u "$dev" >/dev/null 2>&1 || partx -a "$dev" >/dev/null 2>&1 || true
-            }
-            mdev -s 2>/dev/null || true
-            return 0
-        fi
-    done
-
-    error "Could not allocate a free NBD device for sparse-shadow preparation"
-}
-
-shadow_last_partition() {
-    local nbd="$1" line best_end=0 pnum pstart pend pcode
-    SHADOW_PART_NUM="" SHADOW_PART_START="" SHADOW_PART_END="" SHADOW_PART_CODE=""
-
-    while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+([[:xdigit:]]{4})([[:space:]]|$) ]] || continue
-        pnum="${BASH_REMATCH[1]}"
-        pstart="${BASH_REMATCH[2]}"
-        pend="${BASH_REMATCH[3]}"
-        pcode="${BASH_REMATCH[4]^^}"
-        (( pend > best_end )) || continue
-        best_end="$pend"
-        SHADOW_PART_NUM="$pnum"
-        SHADOW_PART_START="$pstart"
-        SHADOW_PART_END="$pend"
-        SHADOW_PART_CODE="$pcode"
-    done < <(sgdisk -p "$nbd" 2>/dev/null)
-
-    [[ -n "$SHADOW_PART_NUM" ]] || error "Could not identify final GPT partition in sparse shadow"
-    case "$SHADOW_PART_CODE" in
-        EF00|EF02|8200|A502) error "Cannot shrink a trailing EFI/BIOS/swap partition" ;;
-        FFFF) error "Cannot shrink a partition with an unknown GPT type" ;;
-    esac
-}
-shadow_partition_node() {
-    local nbd="$1" num="$2" dev i
-    dev=$(partition_device_for_number "$nbd" "$num")
-
-    for i in 1 2 3 4 5; do
-        [[ -b "$dev" ]] && { echo "$dev"; return; }
-        partx -u "$nbd" >/dev/null 2>&1 || true
-        mdev -s 2>/dev/null || true
-        ensure_linux_block_node_from_sysfs "$dev" && { echo "$dev"; return; }
-        sleep 1
-    done
-    error "Could not create sparse-shadow partition node: $dev"
-}
-
-shadow_resize_lvm() {
-    local dev="$1" bytes="$2"
-    pvs --noheadings -o pv_name "$dev" 2>/dev/null | grep -Fq "$dev" || return 1
-    info "Shrinking LVM PV to ${bytes} bytes"
-    pvresize --yes --setphysicalvolumesize "${bytes}B" "$dev" || \
-        error "LVM allocated extents do not fit on the target disk"
-    return 0
-}
-
-shadow_resize_xfs() {
-    local dev="$1" bytes="$2" block_size blocks fs_bytes
-    block_size=$(xfs_db -r -c 'sb 0' -c 'p blocksize' "$dev" 2>/dev/null | awk -F'= *' '/blocksize =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
-    blocks=$(xfs_db -r -c 'sb 0' -c 'p dblocks' "$dev" 2>/dev/null | awk -F'= *' '/dblocks =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
-    [[ "$block_size" =~ ^[0-9]+$ && "$blocks" =~ ^[0-9]+$ ]] || error "Could not read XFS size on $dev"
-    fs_bytes=$((block_size * blocks))
-    (( fs_bytes <= bytes )) || error "XFS uses ${fs_bytes} bytes and cannot be shrunk to ${bytes} bytes"
-    info "XFS already fits inside the new partition boundary"
-}
-
-shadow_resize_ext() {
-    local dev="$1" bytes="$2" block_size blocks fs_bytes target_blocks rc=0
-    block_size=$(dumpe2fs -h "$dev" 2>/dev/null | awk -F': *' '/^Block size:/ {print $2; exit}')
-    blocks=$(dumpe2fs -h "$dev" 2>/dev/null | awk -F': *' '/^Block count:/ {print $2; exit}')
-    [[ "$block_size" =~ ^[0-9]+$ && "$blocks" =~ ^[0-9]+$ ]] || error "Could not read ext filesystem size on $dev"
-    fs_bytes=$((block_size * blocks))
-    (( fs_bytes > bytes )) || { info "ext filesystem already fits inside the new partition boundary"; return; }
-
-    target_blocks=$((bytes / block_size - 256))
-    (( target_blocks > 0 )) || error "Target partition is too small for ext filesystem"
-    e2fsck -f -p "$dev" >/dev/null 2>&1 || rc=$?
-    (( rc <= 1 )) || error "e2fsck failed before ext shrink (rc=$rc)"
-    info "Shrinking ext filesystem to ${target_blocks} blocks"
-    resize2fs "$dev" "$target_blocks" >/dev/null || error "resize2fs failed"
-}
-
-shadow_resize_payload() {
-    local dev="$1" bytes="$2" type
-    shadow_resize_lvm "$dev" "$bytes" && return
-
-    type=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)
-    info "Final partition content: ${type:-unknown} (GPT type $SHADOW_PART_CODE)"
-    case "$type" in
-        xfs)              shadow_resize_xfs "$dev" "$bytes" ;;
-        ext2|ext3|ext4)   shadow_resize_ext "$dev" "$bytes" ;;
-        *) error "Cannot safely shrink final partition content '${type:-unknown}'" ;;
-    esac
-}
-
-shadow_resize_gpt() {
-    local nbd="$1" num="$2" start="$3" end="$4" info_text type_guid unique_guid attrs name
-    info_text=$(sgdisk -i "$num" "$nbd" 2>/dev/null) || error "Failed to inspect GPT partition $num"
-    type_guid=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$info_text")
-    unique_guid=$(awk '/Partition unique GUID:/ {print $4; exit}' <<<"$info_text")
-    attrs=$(awk '/Attribute flags:/ {print $3; exit}' <<<"$info_text")
-    name=$(sed -n "s/^Partition name: '\(.*\)'$/\1/p" <<<"$info_text" | head -n1)
-
-    sgdisk -d "$num" "$nbd" >/dev/null || error "Failed to delete GPT partition $num"
-    sgdisk -n "${num}:${start}:${end}" "$nbd" >/dev/null || error "Failed to recreate GPT partition $num"
-    sgdisk -t "${num}:${type_guid}" "$nbd" >/dev/null || error "Failed to restore GPT type"
-    [[ -z "$unique_guid" ]] || sgdisk -u "${num}:${unique_guid}" "$nbd" >/dev/null || error "Failed to restore PARTUUID"
-    [[ -z "$name" ]] || sgdisk -c "${num}:${name}" "$nbd" >/dev/null || error "Failed to restore partition name"
-    [[ -z "$attrs" || "$attrs" == 0000000000000000 ]] || sgdisk -A "${num}:=:${attrs}" "$nbd" >/dev/null || error "Failed to restore GPT attributes"
-}
-
-prepare_sparse_shadow_for_target() {
-    local img="$1" shadow="$2" nbd sector target_sector disk_bytes total reserve target_end partdev part_bytes allocated
-
-    rm -f "$shadow"
-    local available_bytes tmpfs_free image_bytes
-    available_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
-    tmpfs_free=$(df -B1 --output=avail /run/reinstall-work | awk 'NR==2 {print $1; exit}')
-    image_bytes=$(du -B1 "$img" | awk '{print $1; exit}')
-    [[ "$available_bytes" =~ ^[0-9]+$ && "$tmpfs_free" =~ ^[0-9]+$ && "$image_bytes" =~ ^[0-9]+$ ]] || \
-        error "Could not evaluate available sparse-shadow memory"
-    (( available_bytes >= 201326592 )) || \
-        error "Less than 192 MiB MemAvailable before sparse-shadow conversion"
-    (( tmpfs_free >= image_bytes + 134217728 )) || \
-        error "Sparse-shadow tmpfs headroom is lower than the compressed QCOW2 allocation; refusing high-risk conversion"
-    info "Creating bounded sparse RAM/zram shadow"
-    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" &
-    local convert_pid=$! available_kb pressure=0 free_now
-    while kill -0 "$convert_pid" 2>/dev/null; do
-        available_kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
-        free_now=$(df -B1 --output=avail /run/reinstall-work | awk 'NR==2 {print $1; exit}')
-        if [[ ! "$available_kb" =~ ^[0-9]+$ || ! "$free_now" =~ ^[0-9]+$ ]] || \
-           (( available_kb < 98304 || free_now < 134217728 )); then
-            pressure=1
-            kill "$convert_pid" 2>/dev/null || true
-            break
-        fi
-        sleep 1
-    done
-    if ! wait "$convert_pid" || (( pressure )); then
-        error "Insufficient RAM/zram for sparse-shadow; refusing an unsafe partial write"
-    fi
-    allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}')
-    [[ "$allocated" =~ ^[0-9]+$ ]] || error "Cannot verify completed sparse-shadow allocation"
-    qemu-img compare -f qcow2 -F raw "$img" "$shadow" >/dev/null || \
-        error "Sparse RAW shadow does not match source QCOW2; refusing write"
-    info "Sparse shadow: logical=$(stat -c %s "$shadow") allocated=${allocated} bytes"
-
-    connect_raw_rw_nbd "$shadow"
-    nbd="$QCOW_NBD_DEV"
-    sector=$(blockdev --getss "$nbd")
-    target_sector=$(blockdev --getss "$DISK")
-    [[ "$sector" == "$target_sector" ]] || error "Image/target sector-size mismatch"
-
-    disk_bytes=$(get_disk_size_bytes "$DISK")
-    total=$((disk_bytes / sector))
-    reserve=$(((32 * 1024 * 1024 + sector - 1) / sector))
-    local image_sectors last_usable gpt_tail
-    image_sectors=$(($(blockdev --getsize64 "$nbd") / sector))
-    last_usable=$(sgdisk -p "$nbd" | awk '/last usable sector is/ {print $NF; exit}')
-    [[ "$last_usable" =~ ^[0-9]+$ ]] || error "Cannot determine GPT last usable sector"
-    gpt_tail=$((image_sectors - last_usable))
-    (( gpt_tail >= 2 && gpt_tail <= 1024 )) || error "Invalid source GPT tail geometry"
-    target_end=$((total - gpt_tail - reserve))
-    (( target_end > 2048 )) || error "Target disk is too small for GPT + CIDATA"
-
-    shadow_last_partition "$nbd"
-    (( SHADOW_PART_END > target_end )) || { cleanup_qcow_nbd; return; }
-
-    info "Final partition: $SHADOW_PART_NUM sectors $SHADOW_PART_START..$SHADOW_PART_END -> $target_end"
-    partdev=$(shadow_partition_node "$nbd" "$SHADOW_PART_NUM")
-    part_bytes=$(((target_end - SHADOW_PART_START + 1) * sector))
-    (( part_bytes > 0 )) || error "Target disk ends before the final image partition starts"
-
-    shadow_resize_payload "$partdev" "$part_bytes"
-    shadow_resize_gpt "$nbd" "$SHADOW_PART_NUM" "$SHADOW_PART_START" "$target_end"
-    sync
-    cleanup_qcow_nbd
-    info "Sparse-shadow payload and GPT now fit the target disk"
-}
-
-write_sparse_shadow_to_target_after_releasing_stage() {
-    local shadow="$1" disk_bytes
-
-    disk_bytes=$(get_disk_size_bytes "$DISK" || true)
-    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -gt 0 ]] || \
-        error "Could not determine target disk size for sparse-shadow write"
-
-    # A sparse file may legitimately contain holes, but must cover the entire disk.
-    truncate -s "$disk_bytes" "$shadow" || error "Failed to size sparse shadow"
-    [[ "$(stat -c %s "$shadow")" == "$disk_bytes" ]] || error "Sparse shadow is shorter than the target disk"
-
-    release_temp_staging_partition
-    TEMP_STAGE_RELEASED=1
-    sync
-
-    info "Writing sparse shadow to the target disk after releasing the temporary staging partition..."
-    info "Copy length: ${disk_bytes} bytes"
-
-    # A sparse copy is safe only after the entire destination was zeroed.
-    # BLKZEROOUT guarantees zeros; plain blkdiscard and dd conv=sparse do not.
-    if command -v blkdiscard >/dev/null 2>&1 && blkdiscard --zeroout "$DISK"; then
-        info "Destination zeroed; transferring sparse data extents"
-        qemu-img convert -p -n --target-is-zero -S 4k -f raw -O raw "$shadow" "$DISK" || \
-            error "Sparse conversion failed after target zeroing"
-    else
-        info "Zeroout unavailable; writing every byte to avoid stale target data"
-        dd if="$shadow" of="$DISK" bs=16M iflag=count_bytes count="$disk_bytes" \
-            status=progress conv=fsync || error "Failed to write sparse shadow to target disk"
-    fi
-
-    sync
-    rm -f "$shadow"
-}
-
 write_qcow_without_overwriting_staging() {
-    local img="$1" bs_arg count_arg shadow
+    local img="$1" bs_arg count_arg
 
     [[ -n "$TEMP_STAGE_START_BYTES" ]] || error "Temporary staging boundary is unknown"
     TEMP_STAGE_RELEASED=0
@@ -3644,7 +3421,7 @@ inspect_freebsd_raw() {
 }
 
 installer_write_freebsd_raw() {
-    local img written_guid
+    local img written_guid written_table
     resolve_target_disk_from_identity
     unmount_target_disk_filesystems "$DISK"
     confirm_destructive_write
@@ -3662,8 +3439,10 @@ installer_write_freebsd_raw() {
         dd of="$DISK" bs=1M iflag=fullblock conv=notrunc,fsync status=progress ||
         error "FreeBSD RAW disk write failed"
     release_temp_staging_partition
-    written_guid=$(sgdisk -p "$DISK" 2>/dev/null | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
+    written_table=$(sgdisk -p "$DISK" 2>&1) || error "Cannot read written RAW GPT"
+    written_guid=$(printf '%s\n' "$written_table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
     [ "$written_guid" = "$QCOW_GPT_GUID" ] || error "Written RAW GPT identity mismatch"
+    case "$written_table" in *REINSTALL_TMP*) error "Temporary GPT survived RAW write" ;; esac
     sgdisk -e "$DISK" >/dev/null || error "Failed to repair RAW backup GPT"
     verify_gpt_strict "$DISK"
     grow_last_partition_reserving_cidata
@@ -3716,7 +3495,7 @@ installer_precommit_prepare() {
     else
         installer_preflight_linux_files
     fi
-    info "Downloaded QCOW2 passed integrity/layout preflight; target disk is still untouched."
+    info "Downloaded image passed integrity/layout preflight; target disk is still untouched."
 }
 
 installer_write_image() {
@@ -4308,6 +4087,7 @@ linux_copy_release_staging_and_grow() {
 }
 
 installer_write_image_linux_by_copy() {
+    resolve_target_disk_from_identity
     unmount_target_disk_filesystems "$DISK"
     confirm_destructive_write
     TEMP_STAGE_PART_NUM=128
