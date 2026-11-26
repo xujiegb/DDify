@@ -163,7 +163,7 @@ jobs:
               local key=$1; shift
               timeout "${SSH_TIMEOUT:-45s}" ssh -T -p 2222 -i "$WORK/$key-key" -o IdentitiesOnly=yes -o BatchMode=yes \
                   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-                  -o LogLevel=ERROR root@127.0.0.1 "$@"
+                  -o LogLevel=ERROR root@127.0.0.1 'export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH;' "$@"
           }
           assert_os() {
               local key=$1 os=$2
@@ -181,8 +181,24 @@ jobs:
               done
           }
           cloud_wait() {
-              local key=$1 tag=${2:-$1}
-              SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' | tee "$LOG/cloud-init-$tag.txt"
+              local key=$1 tag=${2:-$1} os end
+              if [[ "$key" == source ]]; then os=$SOURCE_OS; else os=$TARGET_OS; fi
+              if [[ "$os" == freebsd ]]; then
+                  # BASIC-CLOUDINIT uses base-system nuageinit, not Python cloud-init.
+                  # rc removes /firstboot only after its firstboot services run.
+                  end=$((SECONDS+900))
+                  until ssh_guest "$key" 'test -x /usr/libexec/nuageinit && test ! -e /firstboot && test ! -e /firstboot-reboot && test -s /var/log/nuageinit.log && grep -Fq "Executing '\''runcmd'\''" /var/log/nuageinit.log' >/dev/null 2>&1; do
+                      kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during FreeBSD initialization'
+                      ((SECONDS < end)) || {
+                          ssh_guest "$key" 'ls -l /firstboot* /var/log/nuageinit.log; cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt" 2>&1 || true
+                          fail 'FreeBSD firstboot/nuageinit did not complete'
+                      }
+                      sleep 10
+                  done
+                  ssh_guest "$key" 'cat /var/log/nuageinit.log' | tee "$LOG/nuageinit-$tag.txt"
+              else
+                  SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' | tee "$LOG/cloud-init-$tag.txt"
+              fi
           }
           boot_id() {
               ssh_guest "$1" 'if [ "$(uname -s)" = FreeBSD ]; then sysctl -n kern.boottime; else cat /proc/sys/kernel/random/boot_id; fi'
@@ -200,7 +216,7 @@ jobs:
           collect_guest() {
               local key=$1 tag=$2
               ssh_guest "$key" 'uname -a; df -h; if [ "$(uname -s)" = FreeBSD ]; then freebsd-version -ku; gpart show -l; efibootmgr -v; else cat /etc/os-release; lsblk -f; findmnt /; efibootmgr -v; fi' > "$LOG/$tag-system.txt" 2>&1 || true
-              ssh_guest "$key" 'cat /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null' > "$LOG/$tag-cloud-init.log" 2>&1 || true
+              ssh_guest "$key" 'if [ "$(uname -s)" = FreeBSD ]; then cat /var/log/nuageinit.log; else cat /var/log/cloud-init.log /var/log/cloud-init-output.log; fi' > "$LOG/$tag-cloud-init.log" 2>&1 || true
           }
           start_vm seed
           wait_os source "$SOURCE_OS" 900
