@@ -188,21 +188,8 @@ DDIFY_LSBLK
 # ----------------- host preparation -----------------
 
 hash_password() {
-    local plain="$1"
-    if command -v openssl >/dev/null 2>&1; then
-        printf '%s\n' "$plain" | openssl passwd -6 -stdin
-    elif command -v python3 >/dev/null 2>&1 && python3 -c 'import passlib.hash' 2>/dev/null; then
-        printf '%s' "$plain" | python3 -c 'import sys; from passlib.hash import sha512_crypt; print(sha512_crypt.hash(sys.stdin.read()))'
-    elif command -v perl >/dev/null 2>&1; then
-        printf '%s\n' "$plain" | perl -e '
-            chomp(my $pw = <STDIN>);
-            my @chars = ("a".."z", "A".."Z", 0..9, ".", "/");
-            my $salt = join "", map { $chars[int rand @chars] } 1..16;
-            print crypt($pw, "\$6\$rounds=5000\$$salt\$") . "\n";
-        '
-    else
-        error "Password hashing requires openssl, python3 with passlib, or perl"
-    fi
+    command -v openssl >/dev/null 2>&1 || error "Password hashing requires openssl"
+    printf '%s\n' "$1" | openssl passwd -6 -stdin
 }
 
 detect_os_arch() {
@@ -270,6 +257,7 @@ have_any_downloader() {
 
 missing_deps_linux_common() {
     command -v xz >/dev/null 2>&1 || printf '%s\n' xz
+    command -v openssl >/dev/null 2>&1 || printf '%s\n' openssl
     command -v file >/dev/null 2>&1 || printf '%s\n' file
     command -v tar >/dev/null 2>&1 || printf '%s\n' tar
     have_any_downloader || printf '%s\n' downloader
@@ -291,7 +279,7 @@ install_host_dependencies() {
             *:downloader) packages="$packages curl" ;;
             freebsd:tar) error "FreeBSD base tar is unavailable" ;;
             freebsd:efibootmgr) error "FreeBSD base efibootmgr is unavailable" ;;
-            *:xz|*:file|*:tar) packages="$packages $item" ;;
+            *:xz|*:file|*:tar|*:openssl) packages="$packages $item" ;;
             *) error "Unrecognized dependency: $item" ;;
         esac
     done
@@ -1878,12 +1866,12 @@ REPOEOF
     start_reinstall_rescue_ssh
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
-        curl wget ca-certificates xz qemu-img python3 util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
+        curl wget ca-certificates xz qemu-img jq util-linux blkid lsblk findmnt coreutils grep sed gawk findutils file tar \
         e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
     if ! grep -q '^TARGET_OS=freebsd$' /etc/reinstall/plan.env; then
         echo "[stage] apk add (Linux filesystem-copy tools)"
-        apk add --no-cache rsync btrfs-progs python3
-        for cmd in rsync python3 mkfs.btrfs btrfstune btrfs xfs_growfs; do
+        apk add --no-cache rsync btrfs-progs
+        for cmd in rsync mkfs.btrfs btrfstune btrfs xfs_growfs; do
             command -v "$cmd" >/dev/null 2>&1 || {
                 echo "Linux file-copy dependency is missing: $cmd" >&2
                 exit 1
@@ -1894,7 +1882,7 @@ REPOEOF
     blkid -V 2>&1 | grep -qi util-linux || { echo "Full util-linux blkid is required" >&2; exit 1; }
 
     # Fail here with a precise message instead of reaching the destructive stage
-    for cmd in sgdisk sfdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
+    for cmd in sgdisk sfdisk mkfs.ext4 qemu-img qemu-nbd jq xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
             echo "Installed matching packages:"
@@ -2961,18 +2949,10 @@ preflight_target_image_in_alpine() {
 # The script never accepts decompression output beyond the negotiated workspace limit.
 bounded_image_copy() {
     local limit="$1"
-    python3 -c '
-import sys
-limit = int(sys.argv[1]); count = 0
-while True:
-    data = sys.stdin.buffer.read(1024 * 1024)
-    if not data:
-        break
-    count += len(data)
-    if count > limit:
-        sys.exit("decompressed image exceeds staging limit")
-    sys.stdout.buffer.write(data)
-' "$limit"
+    match_ere "$limit" '^[0-9]+$' && [ "$limit" -gt 0 ] || return 1
+    # Copy at most one excess byte; the caller rejects oversized output by
+    # stat and pipefail rejects a prematurely terminated decoder/downloader.
+    head -c "$((limit + 1))"
 }
 
 download_target_image_in_alpine() {
@@ -3036,30 +3016,20 @@ download_target_image_in_alpine() {
 validate_qcow_metadata() {
     local img="$1" json
     json=$(qemu-img info -f qcow2 --output=json "$img") || error "Could not parse QCOW2 metadata"
-    python3 -c '
-import json, sys
-x = json.load(sys.stdin)
-if x.get("format") != "qcow2" or x.get("encrypted", False):
-    raise SystemExit("unsupported QCOW2 format or encryption")
-if any(k in x for k in ("backing-filename", "full-backing-filename", "backing-filename-format")):
-    raise SystemExit("external QCOW2 backing images are not supported")
-fmt = x.get("format-specific", {}).get("data", {})
-if any(k in fmt for k in ("data-file", "data-file-raw")):
-    raise SystemExit("external QCOW2 data files are not supported")
-if not isinstance(x.get("virtual-size"), int) or x["virtual-size"] <= 0:
-    raise SystemExit("invalid QCOW2 virtual size")
-' <<DDIFY_JSON || error "QCOW2 needs external resources, is encrypted, or has unsupported metadata"
-$json
-DDIFY_JSON
+    printf '%s\n' "$json" | jq -e '
+        type == "object" and
+        .format == "qcow2" and
+        ((.encrypted // false) == false) and
+        (has("backing-filename") or has("full-backing-filename") or has("backing-filename-format") | not) and
+        (."format-specific".data // {} | (has("data-file") or has("data-file-raw") | not)) and
+        (."virtual-size" | type == "number") and
+        (."virtual-size" > 0 and (."virtual-size" | floor) == ."virtual-size")
+    ' >/dev/null || error "QCOW2 needs external resources, is encrypted, or has unsupported metadata"
     qemu-img check -f qcow2 "$img" >/dev/null || error "QCOW2 structural check failed"
 }
 
 get_qcow_virtual_size_bytes() {
-    local path="$1"
-
-    qemu-img info --output=json "$path" 2>/dev/null | \
-        sed -n 's/^[[:space:]]*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | \
-        head -n1
+    qemu-img info --output=json "$1" 2>/dev/null | jq -er '."virtual-size" | select(type == "number" and . > 0 and floor == .)'
 }
 
 write_qcow_without_overwriting_staging() {
@@ -3789,118 +3759,90 @@ linux_copy_mount_target() {
     fi
 }
 
+# Rewrite literal kernel arguments, not GRUB variables such as root=$root.
+# GNU sed is installed in the Alpine rescue environment; use the same filter
+# for text configurations and the unpadded portion of GRUB environment blocks.
+linux_copy_filter_cmdline() {
+    local uuid="$1" is_lvm="$2"
+    if [ "$is_lvm" = 1 ]; then
+        sed -E \
+            -e "s/(^|[^[:alnum:]_])resume=[^[:space:]\"']+[[:blank:]]*/\\1/g" \
+            -e "s/(^|[^[:alnum:]_])root=[^$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g" \
+            -e "s/(^|[[:space:]])rd\\.lvm\\.(lv|vg|uuid)=[^[:space:]\"']+[[:blank:]]*/\\1/g"
+    else
+        sed -E \
+            -e "s/(^|[^[:alnum:]_])resume=[^[:space:]\"']+[[:blank:]]*/\\1/g" \
+            -e "s/(^|[^[:alnum:]_])root=[^$[:space:]\"'][^[:space:]\"']*/\\1root=UUID=$uuid/g"
+    fi
+}
+
 linux_copy_repair_boot_configs() {
-    local python_code="$INSTALL_TMPDIR/linux-copy-repair.py"
-    cat >"$python_code" <<'PY'
-import glob
-import os
-import re
-import sys
+    local root="$LINUX_COPY_ROOT_MNT" uuid="$LINUX_COPY_ROOT_UUID" boot_uuid="$LINUX_COPY_BOOT_UUID"
+    local efi_uuid="$LINUX_COPY_EFI_UUID" is_lvm=0 path size pad tmp fstab
+    match_ere "$uuid" '^[[:xdigit:]-]+$' || error "Invalid root filesystem UUID"
+    case "$LINUX_COPY_SRC_ROOT" in /dev/mapper/*|/dev/dm-*) is_lvm=1 ;; esac
+    tmp="$INSTALL_TMPDIR/linux-boot-repair.tmp"
+    fstab="$root/etc/fstab"
+    mkdir -p "$root/etc"
+    [ ! -L "$fstab" ] || error "Refusing to rewrite a symlinked fstab"
+    [ -e "$fstab" ] || : >"$fstab"
+    [ -f "$fstab" ] || error "Target fstab is not a regular file"
+    awk -v uuid="$uuid" -v boot="$boot_uuid" -v efi="$efi_uuid" -v lvm="$is_lvm" '
+        BEGIN { OFS="\t" }
+        /^[[:space:]]*#/ || NF<3 { print; next }
+        $3=="swap" { print "# DDify: source swap partition was not copied: " $0; next }
+        $2=="/" { $1="UUID=" uuid; root_seen=1; print; next }
+        $2=="/boot" { boot_seen=1; if(boot!="") $1="UUID=" boot; print; next }
+        $2=="/boot/efi" { efi_seen=1; if(efi!="") $1="UUID=" efi; print; next }
+        lvm==1 && $1 ~ /\/dev\/(mapper\/|[^/]+\/)/ {
+            print "Unsupported additional LVM mount: " $0 > "/dev/stderr"
+            bad=1; exit 1
+        }
+        { print }
+        END {
+            if(bad) exit 1
+            if(!root_seen) print "UUID=" uuid, "/", "auto", "defaults", 0, 1
+            if(boot!="" && !boot_seen) print "UUID=" boot, "/boot", "auto", "defaults", 0, 2
+            if(efi!="" && !efi_seen) print "UUID=" efi, "/boot/efi", "vfat", "defaults", 0, 2
+        }
+    ' "$fstab" >"$tmp" || error "Failed to repair target fstab"
+    cat "$tmp" >"$fstab" || error "Cannot write target fstab"
 
-root, uuid, boot_uuid, efi_uuid, is_lvm = sys.argv[1:]
+    for path in "$root/etc/default/grub" "$root/etc/default/grub.d/"*.cfg \
+        "$root/etc/kernel/cmdline" "$root/boot/grub2/grub.cfg" "$root/boot/grub/grub.cfg" \
+        "$root/boot/loader/entries/"*.conf "$root/boot/efi/loader/entries/"*.conf \
+        "$root/boot/efi/EFI/"*/*.cfg; do
+        [ -f "$path" ] && [ ! -L "$path" ] || continue
+        linux_copy_filter_cmdline "$uuid" "$is_lvm" <"$path" >"$tmp" || error "Cannot repair $path"
+        if ! cmp -s "$path" "$tmp"; then
+            cat "$tmp" >"$path" || error "Cannot update $path"
+        fi
+    done
 
-def edit_text(path, fn):
-    if not os.path.isfile(path) or os.path.islink(path):
-        return
-    with open(path, 'rb') as f:
-        content = f.read()
-    try:
-        old = content.decode('utf-8')
-    except UnicodeDecodeError:
-        return
-    new = fn(old)
-    if new != old:
-        with open(path, 'wb') as f:
-            f.write(new.encode('utf-8'))
-
-def fstab_fix(old):
-    seen = {'/': False, '/boot': False, '/boot/efi': False}
-    lines = []
-    for line in old.splitlines(keepends=True):
-        fields = line.split()
-        if not fields or line.lstrip().startswith('#') or len(fields) < 3:
-            lines.append(line)
+    # GRUB uses an exact 1024-byte block padded with '#' bytes. Strip only
+    # trailing padding, rewrite kernel arguments, and restore the byte length.
+    for path in "$root/boot/grub2/grubenv" "$root/boot/grub/grubenv" "$root/boot/efi/EFI/"*/grubenv; do
+        [ -f "$path" ] && [ ! -L "$path" ] || continue
+        size=$(wc -c <"$path")
+        if [ "$size" -ne 1024 ] || [ "$(head -n 1 "$path")" != '# GRUB Environment Block' ]; then
+            if grep -Eq 'rd\.lvm\.|root=/dev/mapper/' "$path"; then
+                error "Cannot safely repair unknown GRUB environment format: $path"
+            fi
             continue
-        mp = fields[1]
-        if fields[2] == 'swap':
-            # Source swap is not copied. An obsolete UUID can delay boot.
-            print('DDify: source swap omitted from copied Linux system', file=sys.stderr)
-            lines.append('# DDify: source swap partition was not copied: ' + line)
-            continue
-        if mp in seen:
-            seen[mp] = True
-        if mp == '/':
-            fields[0] = 'UUID=' + uuid
-            line = '\t'.join(fields) + '\n'
-        elif mp == '/boot' and boot_uuid:
-            fields[0] = 'UUID=' + boot_uuid
-            line = '\t'.join(fields) + '\n'
-        elif mp == '/boot/efi' and efi_uuid:
-            fields[0] = 'UUID=' + efi_uuid
-            line = '\t'.join(fields) + '\n'
-        elif is_lvm == '1' and re.search(r'/dev/(?:mapper/|[^/]+/)', fields[0]):
-            # Non-root logical volumes must not be silently discarded.
-            raise RuntimeError('Additional LVM mount in fstab is unsupported: ' + line)
-        lines.append(line)
-    if not seen['/']:
-        lines.append('UUID=' + uuid + '\t/\tauto\tdefaults\t0 1\n')
-    if boot_uuid and not seen['/boot']:
-        lines.append('UUID=' + boot_uuid + '\t/boot\tauto\tdefaults\t0 2\n')
-    if efi_uuid and not seen['/boot/efi']:
-        lines.append('UUID=' + efi_uuid + '\t/boot/efi\tvfat\tdefaults\t0 2\n')
-    return ''.join(lines)
-
-fstab = os.path.join(root, 'etc/fstab')
-if os.path.exists(fstab):
-    edit_text(fstab, fstab_fix)
-else:
-    os.makedirs(os.path.dirname(fstab), exist_ok=True)
-    with open(fstab, 'w') as f:
-        f.write(fstab_fix(''))
-
-# Preserve source filesystem UUIDs; only change the root kernel arg and remove
-# root-LVM-specific dracut flags when the LVM PV is replaced by a plain partition.
-def cmdline_fix(old):
-    old = re.sub(r'(?<![A-Za-z0-9_])resume=[^\s\"\']+[ \t]*', '', old)
-    old = re.sub(r'(?<![A-Za-z0-9_])root=(?!\$)[^\s"\']+', 'root=UUID=' + uuid, old)
-    if is_lvm == '1':
-        old = re.sub(r'(?<!\S)rd\.lvm\.(?:lv|vg|uuid)=[^\s"\']+[ \t]*', '', old)
-        old = re.sub(r'(?<!\S)resume=/dev/(?:mapper/|[^/]+/)[^\s"\']+[ \t]*', '', old)
-    return old
-
-patterns = [
-    'etc/default/grub', 'etc/default/grub.d/*.cfg', 'etc/kernel/cmdline',
-    'boot/grub2/grub.cfg', 'boot/grub/grub.cfg',
-    'boot/loader/entries/*.conf', 'boot/efi/loader/entries/*.conf',
-    'boot/efi/EFI/*/grub.cfg', 'boot/efi/EFI/*/*.cfg',
-]
-for pattern in patterns:
-    for path in glob.glob(os.path.join(root, pattern)):
-        edit_text(path, cmdline_fix)
-
-# grubenv is a fixed-size GRUB environment block padded with '#'.
-# Preserve the byte length; regular text-file replacement would corrupt it.
-for pattern in ['boot/grub2/grubenv', 'boot/grub/grubenv', 'boot/efi/EFI/*/grubenv']:
-    for path in glob.glob(os.path.join(root, pattern)):
-        if not os.path.isfile(path) or os.path.islink(path):
-            continue
-        with open(path, 'rb') as f:
-            old = f.read()
-        if not old.startswith(b'# GRUB Environment Block\n') or len(old) != 1024:
-            if b'rd.lvm.' in old or b'root=/dev/mapper/' in old:
-                raise RuntimeError('Cannot safely rewrite this GRUB environment format: ' + path)
-            continue
-        body = old.rstrip(b'#').decode('utf-8', 'replace')
-        new_body = cmdline_fix(body).encode('utf-8')
-        if len(new_body) > 1024:
-            raise RuntimeError('GRUB environment has no room for root argument update: ' + path)
-        if new_body != body.encode('utf-8'):
-            with open(path, 'wb') as f:
-                f.write(new_body + b'#' * (1024 - len(new_body)))
-PY
-    local is_lvm=0
-    { { case "$LINUX_COPY_SRC_ROOT" in /dev/mapper/*) false ;; *) true ;; esac; } && { case "$LINUX_COPY_SRC_ROOT" in /dev/dm-*) false ;; *) true ;; esac; }; } || is_lvm=1
-    python3 "$python_code" "$LINUX_COPY_ROOT_MNT" "$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_BOOT_UUID" "$LINUX_COPY_EFI_UUID" "$is_lvm" || error "Failed to update root filesystem and boot references"
+        fi
+        sed -z 's/#*$//' "$path" | linux_copy_filter_cmdline "$uuid" "$is_lvm" >"$tmp" ||
+            error "Cannot repair GRUB environment: $path"
+        size=$(wc -c <"$tmp")
+        [ "$size" -le 1024 ] || error "Updated GRUB environment exceeds 1024 bytes"
+        pad=$((1024 - size))
+        head -c "$pad" /dev/zero | tr '\000' '#' >>"$tmp" ||
+            error "Cannot restore GRUB environment padding"
+        [ "$(wc -c <"$tmp")" -eq 1024 ] || error "Invalid GRUB environment block size"
+        if ! cmp -s "$path" "$tmp"; then
+            cat "$tmp" >"$path" || error "Cannot update GRUB environment"
+        fi
+    done
+    rm -f "$tmp"
 }
 
 linux_copy_regenerate_lvm_initramfs() {
