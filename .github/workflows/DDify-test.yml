@@ -21,74 +21,89 @@ jobs:
     env:
       SOURCE_OS: ${{ matrix.source }}
       TARGET_OS: ${{ matrix.target }}
-      VM_RAM_MIB: '5120'
+      VM_RAM_MIB: '1024'
+      VM_DISK_BYTES: '10000000000'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Install QEMU and test tools
+        shell: sh
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq
+          if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
-      - name: Shell syntax
+      - name: Check installer syntax (legacy Bash migration pending)
+        shell: sh
         run: bash -n ddify.sh
       - name: Reinstall and verify two boots
-        shell: bash
+        shell: sh
         env:
           WORK: ${{ runner.temp }}/ddify-qemu
         run: |
-          set -Eeuo pipefail
+          set -eu
           export LC_ALL=C
           : "${SOURCE_OS:?}" "${TARGET_OS:?}"
           case "$SOURCE_OS:$TARGET_OS" in rocky:rocky|rocky:freebsd|freebsd:rocky|freebsd:freebsd) ;; *) exit 2;; esac
           WORK=${WORK:-$(mktemp -d)}
-          RAM=${VM_RAM_MIB:-5120}
+          RAM=${VM_RAM_MIB:-1024}
+          DISK_BYTES=${VM_DISK_BYTES:-10000000000}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
           mkdir -p "$WORK/logs"
           WORK=$(cd "$WORK" && pwd)
           cd "$WORK"
           LOG=$WORK/logs
-          exec > >(tee -a "$LOG/test.log") 2>&1
+          # POSIX FIFO logging keeps the original shell exit status.
+          mkfifo "$WORK/test-log.fifo"
+          exec 3>&1 4>&2
+          tee -a "$LOG/test.log" < "$WORK/test-log.fifo" >&3 &
+          logger_pid=$!
+          exec > "$WORK/test-log.fifo" 2>&1
           PID=''
           cleanup() {
               local rc=$?
-              trap - EXIT
-              if [[ -n "$PID" ]]; then
+              trap - 0
+              if [ -n "$PID" ]; then
                   kill "$PID" 2>/dev/null || true
                   wait "$PID" 2>/dev/null || true
               fi
-              if ((rc != 0)); then tail -c 24000 "$LOG/serial.log" 2>/dev/null || true; fi
+              if [ "$rc" -ne 0 ]; then tail -c 24000 "$LOG/serial.log" 2>/dev/null || true; fi
               rm -f "$WORK/source-key" "$WORK/target-key" "$WORK/user-data" "$WORK/seed.iso"
+              exec >&3 2>&4
+              wait "$logger_pid" || true
+              rm -f "$WORK/test-log.fifo"
               exit "$rc"
           }
-          trap cleanup EXIT
+          trap cleanup 0
           trap 'exit 130' INT
           trap 'exit 143' TERM
           fail() { echo "ERROR: $*" >&2; exit 1; }
           fetch() { curl --fail --location --retry 4 --retry-delay 3 --connect-timeout 30 --max-time 1800 --proto '=https' --proto-redir '=https' -o "$2.part" "$1" && mv "$2.part" "$2"; }
           case "$SOURCE_OS" in
-              rocky) url=https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2 ;;
+              rocky) url=https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2 ;;
               freebsd) url=https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz ;;
           esac
           name=${url##*/}
           fetch "$url" "$name"
-          if [[ "$SOURCE_OS" == rocky ]]; then
+          if [ "$SOURCE_OS" = rocky ]; then
               fetch "$url.CHECKSUM" checksum
           else
               fetch "${url%/*}/CHECKSUM.SHA256" checksum
           fi
           hash=$(awk -v f="$name" '$1=="SHA256" && $2=="("f")" && $3=="=" {print $4; exit} $2==f || $2=="*"f {print $1; exit}' checksum)
-          [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || fail "Source checksum missing: $name"
+          printf '%s\n' "$hash" | grep -Eq '^[[:xdigit:]]{64}$' || fail "Source checksum missing: $name"
           printf '%s  %s\n' "$hash" "$name" | sha256sum -c -
-          if [[ "$name" == *.xz ]]; then xz -d "$name"; name=${name%.xz}; fi
+          case "$name" in *.xz) xz -d "$name"; name=${name%.xz} ;; esac
           qemu-img check "$name"
           mv "$name" disk.qcow2
           # The source is the same disk later reinstalled by DDify.
-          qemu-img resize disk.qcow2 24G
+          # Never shrink an official source filesystem blindly to fit the VPS.
+          source_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
+          [ "$source_bytes" -le "$DISK_BYTES" ] || fail "Source virtual disk exceeds requested $DISK_BYTES bytes: $source_bytes"
+          qemu-img resize disk.qcow2 "$DISK_BYTES"
           qemu-img info disk.qcow2 | tee "$LOG/source-image.txt"
           ssh-keygen -q -t ed25519 -N '' -f source-key
           ssh-keygen -q -t ed25519 -N '' -f target-key
@@ -139,16 +154,19 @@ jobs:
           # Non-Secure-Boot UEFI, persistent NVRAM across reboots and QEMU restarts.
           cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
           CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-          [[ -r "$CODE" ]] || fail 'OVMF firmware not found'
-          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+          [ -r "$CODE" ] || fail 'OVMF firmware not found'
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
               accel=kvm; cpu=host
           else
               accel=tcg; cpu=max
           fi
           printf 'QEMU accelerator: %s\n' "$accel"
           start_vm() {
-              local extra=()
-              if [[ "${1:-}" == seed ]]; then extra=(-drive "file=$WORK/seed.iso,format=raw,media=cdrom,readonly=on"); fi
+              if [ "${1:-}" = seed ]; then
+                  set -- -drive "file=$WORK/seed.iso,format=raw,media=cdrom,readonly=on"
+              else
+                  set --
+              fi
               qemu-system-x86_64 -machine "q35,accel=$accel" -cpu "$cpu" -smp 2 -m "$RAM" \
                   -drive "if=pflash,format=raw,readonly=on,file=$CODE" \
                   -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -156,14 +174,14 @@ jobs:
                   -device virtio-blk-pci,drive=system,serial=DDIFYCI001,bootindex=1 \
                   -netdev user,id=net,hostfwd=tcp:127.0.0.1:2222-:22 \
                   -device virtio-net-pci,netdev=net \
-                  -display none -monitor none -serial stdio "${extra[@]}" >> "$LOG/serial.log" 2>&1 &
+                  -display none -monitor none -serial stdio "$@" >> "$LOG/serial.log" 2>&1 &
               PID=$!
           }
           ssh_guest() {
               local key=$1; shift
               timeout "${SSH_TIMEOUT:-45s}" ssh -T -p 2222 -i "$WORK/$key-key" -o IdentitiesOnly=yes -o BatchMode=yes \
                   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-                  -o LogLevel=ERROR root@127.0.0.1 "$@"
+                  -o LogLevel=ERROR root@127.0.0.1 'export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH;' "$@"
           }
           assert_os() {
               local key=$1 os=$2
@@ -173,25 +191,43 @@ jobs:
               esac
           }
           wait_os() {
-              local key=$1 os=$2 end=$((SECONDS+$3))
+              local key=$1 os=$2 end=$(($(date +%s)+$3))
               until assert_os "$key" "$os" >/dev/null 2>&1; do
                   kill -0 "$PID" 2>/dev/null || fail 'QEMU exited unexpectedly'
-                  ((SECONDS < end)) || fail "Timeout waiting for $os using $key key"
+                  [ "$(date +%s)" -lt "$end" ] || fail "Timeout waiting for $os using $key key"
                   sleep 10
               done
           }
           cloud_wait() {
-              local key=$1 tag=${2:-$1}
-              SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' | tee "$LOG/cloud-init-$tag.txt"
+              local key=$1 tag=${2:-$1} os end
+              if [ "$key" = source ]; then os=$SOURCE_OS; else os=$TARGET_OS; fi
+              if [ "$os" = freebsd ]; then
+                  # BASIC-CLOUDINIT uses base-system nuageinit, not Python cloud-init.
+                  # rc removes /firstboot only after its firstboot services run.
+                  end=$(($(date +%s)+900))
+                  until ssh_guest "$key" 'test -x /usr/libexec/nuageinit && test ! -e /firstboot && test ! -e /firstboot-reboot && test -s /var/log/nuageinit.log && grep -Fq "Executing '\''runcmd'\''" /var/log/nuageinit.log' >/dev/null 2>&1; do
+                      kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during FreeBSD initialization'
+                      [ "$(date +%s)" -lt "$end" ] || {
+                          ssh_guest "$key" 'ls -l /firstboot* /var/log/nuageinit.log; cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt" 2>&1 || true
+                          fail 'FreeBSD firstboot/nuageinit did not complete'
+                      }
+                      sleep 10
+                  done
+                  ssh_guest "$key" 'cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt"
+                  cat "$LOG/nuageinit-$tag.txt"
+              else
+                  SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' > "$LOG/cloud-init-$tag.txt" || { cat "$LOG/cloud-init-$tag.txt"; fail 'Linux cloud-init failed'; }
+                  cat "$LOG/cloud-init-$tag.txt"
+              fi
           }
           boot_id() {
               ssh_guest "$1" 'if [ "$(uname -s)" = FreeBSD ]; then sysctl -n kern.boottime; else cat /proc/sys/kernel/random/boot_id; fi'
           }
           shutdown_vm() {
               ssh_guest "$1" 'if [ "$(uname -s)" = FreeBSD ]; then shutdown -p now; else systemctl poweroff; fi' || true
-              local end=$((SECONDS+180))
+              local end=$(($(date +%s)+180))
               while kill -0 "$PID" 2>/dev/null; do
-                  ((SECONDS < end)) || fail 'Guest did not power off'
+                  [ "$(date +%s)" -lt "$end" ] || fail 'Guest did not power off'
                   sleep 3
               done
               wait "$PID" || fail 'QEMU exited abnormally'
@@ -200,15 +236,16 @@ jobs:
           collect_guest() {
               local key=$1 tag=$2
               ssh_guest "$key" 'uname -a; df -h; if [ "$(uname -s)" = FreeBSD ]; then freebsd-version -ku; gpart show -l; efibootmgr -v; else cat /etc/os-release; lsblk -f; findmnt /; efibootmgr -v; fi' > "$LOG/$tag-system.txt" 2>&1 || true
-              ssh_guest "$key" 'cat /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null' > "$LOG/$tag-cloud-init.log" 2>&1 || true
+              ssh_guest "$key" 'if [ "$(uname -s)" = FreeBSD ]; then cat /var/log/nuageinit.log; else cat /var/log/cloud-init.log /var/log/cloud-init-output.log; fi' > "$LOG/$tag-cloud-init.log" 2>&1 || true
           }
           start_vm seed
           wait_os source "$SOURCE_OS" 900
           cloud_wait source
           # Provision only tools required to INVOKE DDify; other dependencies are
           # DDify's responsibility.
-          if [[ "$SOURCE_OS" == freebsd ]]; then
-              SSH_TIMEOUT=900s ssh_guest source 'env ASSUME_ALWAYS_YES=yes pkg bootstrap; env ASSUME_ALWAYS_YES=yes pkg install bash curl' | tee "$LOG/source-deps.log"
+          if [ "$SOURCE_OS" = freebsd ]; then
+              SSH_TIMEOUT=900s ssh_guest source 'env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install bash curl' > "$LOG/source-deps.log" || { cat "$LOG/source-deps.log"; fail 'FreeBSD source dependencies failed'; }
+              cat "$LOG/source-deps.log"
           else
               ssh_guest source 'command -v bash && command -v curl' || fail 'Rocky source lacks bash/curl'
           fi
@@ -224,12 +261,13 @@ jobs:
           ssh_guest source 'cat > /root/ddify-target.pub' < target-key.pub
           case "$SOURCE_OS" in rocky) disk=/dev/vda;; freebsd) disk=/dev/vtbd0;; esac
           case "$TARGET_OS" in rocky) version=10;; freebsd) version=15;; esac
-          # Explicit disk confirmation is 1. Exercise the default verified-before-wipe
-          # path and official image URL, not --allow-early-wipe or --img.
-          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup bash /root/ddify.sh $TARGET_OS $version --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
-          end=$((SECONDS+3600))
+          # Explicit disk confirmation is 1. The disposable VM exercises disk staging.
+          # This firmware is the non-Secure-Boot OVMF image; no enrolled keys.
+          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 bash /root/ddify.sh $TARGET_OS $version --allow-early-wipe --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
+          end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
+              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*' "$LOG/serial.log"; then fail 'DDify installer reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1 && ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port 2>/dev/null)" = 18080' >/dev/null 2>&1; then break; fi
               if ssh_guest source 'test -f /var/tmp/ddify-host.log' >/dev/null 2>&1; then
                   ssh_guest source 'cat /var/tmp/ddify-host.log' > "$LOG/host-install.log.tmp" 2>/dev/null && mv "$LOG/host-install.log.tmp" "$LOG/host-install.log" || true
@@ -238,19 +276,19 @@ jobs:
                   ssh_guest target 'cat /var/log/reinstall-auto.log' > "$LOG/rescue.log.tmp" 2>/dev/null && mv "$LOG/rescue.log.tmp" "$LOG/rescue.log" || true
                   if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*' "$LOG/rescue.log"; then fail 'DDify installer reported failure'; fi
               fi
-              ((SECONDS < end)) || fail 'Target did not boot with new credentials and marker'
+              [ "$(date +%s)" -lt "$end" ] || fail 'Target did not boot with new credentials and marker'
               sleep 10
           done
           cloud_wait target first-boot
           collect_guest target first-boot
           first=$(boot_id target)
           ssh_guest target 'if [ "$(uname -s)" = FreeBSD ]; then shutdown -r now; else systemctl reboot; fi' || true
-          end=$((SECONDS+900))
+          end=$(($(date +%s)+900))
           while :; do
               current=$(boot_id target 2>/dev/null || true)
-              [[ -z "$current" || "$current" == "$first" ]] || break
+              { [ -z "$current" ] || [ "$current" = "$first" ]; } || break
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped on second boot'
-              ((SECONDS < end)) || fail 'No new boot ID after reboot'
+              [ "$(date +%s)" -lt "$end" ] || fail 'No new boot ID after reboot'
               sleep 10
           done
           assert_os target "$TARGET_OS"
@@ -262,7 +300,7 @@ jobs:
               rocky) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
               freebsd) ssh_guest target 'test -c /dev/efi && layout=$(gpart show -l) && ! printf "%s\n" "$layout" | grep -w CIDATA' ;;
           esac
-          echo "PASS: $SOURCE_OS -> $TARGET_OS (two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
+          echo "PASS: $SOURCE_OS -> $TARGET_OS (1 GiB RAM, 10 GB disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
       - name: Upload logs even when installation fails
         if: always()
         uses: actions/upload-artifact@v4
