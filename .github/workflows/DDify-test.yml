@@ -49,6 +49,54 @@ jobs:
           busybox ash -n ddify.sh
           sh ddify.sh --help
           busybox ash ddify.sh --help
+      - name: Exercise non-destructive shell helpers
+        shell: sh
+        run: |
+          set -eu
+          helper_dir=$(mktemp -d)
+          trap 'rm -rf "$helper_dir"' 0
+          # Load the functions only; never execute host_main or touch a disk.
+          sed '/^main "\$@"$/d' ddify.sh > "$helper_dir/functions.sh"
+          export DDIFY_HELPER_DIR="$helper_dir"
+          cat > "$helper_dir/test.sh" <<'EOF'
+          set -eu
+          . "$DDIFY_HELPER_DIR/functions.sh"
+          work=$(mktemp -d "$DDIFY_HELPER_DIR/run.XXXXXX")
+          value="key 'quoted' \$value"
+          plan_assignment DDIFY_TEST_VALUE "$value" > "$work/plan"
+          . "$work/plan"
+          [ "$DDIFY_TEST_VALUE" = "$value" ]
+          printf '%s' abcde | bounded_image_copy 3 > "$work/bounded"
+          [ "$(wc -c < "$work/bounded")" -eq 4 ]
+          qemu-img create -q -f qcow2 "$work/base.qcow2" 16M
+          validate_qcow_metadata "$work/base.qcow2"
+          qemu-img create -q -f qcow2 -F qcow2 -b "$work/base.qcow2" "$work/backed.qcow2"
+          if (validate_qcow_metadata "$work/backed.qcow2"); then
+              echo 'Unexpected acceptance of an external backing file' >&2
+              exit 1
+          fi
+          INSTALL_TMPDIR="$work"
+          LINUX_COPY_ROOT_MNT="$work/root"
+          LINUX_COPY_SRC_ROOT=/dev/mapper/test-root
+          LINUX_COPY_ROOT_UUID=11111111-2222-3333-4444-555555555555
+          LINUX_COPY_BOOT_UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+          LINUX_COPY_EFI_UUID=AAAA-BBBB
+          mkdir -p "$LINUX_COPY_ROOT_MNT/etc/default" "$LINUX_COPY_ROOT_MNT/boot/grub2"
+          printf '/dev/mapper/test-root / xfs defaults 0 0\n/dev/mapper/test-swap none swap defaults 0 0\n' > "$LINUX_COPY_ROOT_MNT/etc/fstab"
+          printf '%s\n' 'GRUB_CMDLINE_LINUX="root=/dev/mapper/test-root rd.lvm.lv=test/root resume=/dev/mapper/test-swap quiet"' 'GRUB_VAR="root=$root"' > "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          envfile="$LINUX_COPY_ROOT_MNT/boot/grub2/grubenv"
+          printf '%s\n' '# GRUB Environment Block' 'kernelopts=root=/dev/mapper/test-root rd.lvm.lv=test/root quiet' > "$envfile"
+          head -c "$((1024 - $(wc -c < "$envfile")))" /dev/zero | tr '\000' '#' >> "$envfile"
+          linux_copy_repair_boot_configs
+          grep -Fq "UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/fstab"
+          grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          grep -Fq 'root=$root' "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          ! grep -Fq 'rd.lvm.lv=' "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$envfile"
+          [ "$(wc -c < "$envfile")" -eq 1024 ]
+          EOF
+          sh "$helper_dir/test.sh"
+          busybox ash "$helper_dir/test.sh"
       - name: Reinstall and verify two boots
         shell: sh
         env:
