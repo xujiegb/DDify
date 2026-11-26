@@ -31,13 +31,17 @@ jobs:
         shell: sh
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq busybox
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
-      - name: Check installer syntax (legacy Bash migration pending)
+      - name: Validate installer with sh and BusyBox ash
         shell: sh
-        run: bash -n ddify.sh
+        run: |
+          sh -n ddify.sh
+          busybox ash -n ddify.sh
+          sh ddify.sh --help
+          busybox ash ddify.sh --help
       - name: Reinstall and verify two boots
         shell: sh
         env:
@@ -241,13 +245,13 @@ jobs:
           start_vm seed
           wait_os source "$SOURCE_OS" 900
           cloud_wait source
-          # Provision only tools required to INVOKE DDify; other dependencies are
+          # Provision only the downloader needed to invoke DDify; other dependencies are
           # DDify's responsibility.
           if [ "$SOURCE_OS" = freebsd ]; then
-              SSH_TIMEOUT=900s ssh_guest source 'env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install bash curl' > "$LOG/source-deps.log" || { cat "$LOG/source-deps.log"; fail 'FreeBSD source dependencies failed'; }
+              SSH_TIMEOUT=900s ssh_guest source 'env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl' > "$LOG/source-deps.log" || { cat "$LOG/source-deps.log"; fail 'FreeBSD source dependencies failed'; }
               cat "$LOG/source-deps.log"
           else
-              ssh_guest source 'command -v bash && command -v curl' || fail 'Rocky source lacks bash/curl'
+              ssh_guest source 'command -v sh && command -v curl' || fail 'Rocky source lacks sh/curl'
           fi
           ssh_guest source 'touch /var/tmp/ddify-old-system-marker'
           collect_guest source source
@@ -263,7 +267,7 @@ jobs:
           case "$TARGET_OS" in rocky) version=10;; freebsd) version=15;; esac
           # Explicit disk confirmation is 1. The disposable VM exercises disk staging.
           # This firmware is the non-Secure-Boot OVMF image; no enrolled keys.
-          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 bash /root/ddify.sh $TARGET_OS $version --allow-early-wipe --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
+          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify.sh $TARGET_OS $version --allow-early-wipe --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
           end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
