@@ -22,7 +22,6 @@ jobs:
       SOURCE_OS: ${{ matrix.source }}
       TARGET_OS: ${{ matrix.target }}
       VM_RAM_MIB: '5120'
-      WORK: ${{ runner.temp }}/ddify-qemu
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +37,8 @@ jobs:
         run: bash -n ddify.sh
       - name: Reinstall and verify two boots
         shell: bash
+        env:
+          WORK: ${{ runner.temp }}/ddify-qemu
         run: |
           set -Eeuo pipefail
           export LC_ALL=C
