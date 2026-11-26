@@ -30,7 +30,7 @@ Usage:
 
 Options:
   --disk DEVICE          Target disk; auto-detected when omitted
-  --img URL              Override qcow2/qcow2.xz image URL
+  --img URL              Override qcow2/qcow2.xz or FreeBSD raw.xz image URL
   --password PASSWORD    Root password
   --ssh-key KEY          Public key, file, URL, github:user or gitlab:user; repeatable
   --ssh-port PORT        SSH port (default 22)
@@ -39,7 +39,7 @@ Options:
   --post-install-hook P  Run hook after image/NoCloud write
   --hold 1               Validate only
   --hold 2               Install but do not reboot
-  --allow-early-wipe     HIGH RISK: erase before full image verification (explicit opt-in)
+  --allow-early-wipe     Low-memory disk staging; erase before full image verification (explicit opt-in)
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
@@ -939,12 +939,12 @@ get_default_image_url() {
     local key="$1:$2:$MACHINE_ARCH"
 
     case "$key" in
-        freebsd:14:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
-        freebsd:14:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/aarch64/Latest/FreeBSD-14.5-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
-        freebsd:15:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
-        freebsd:15:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
-        rocky:10:x86_64)    echo "https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2" ;;
-        rocky:10:aarch64)   echo "https://download.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-EC2-LVM.latest.aarch64.qcow2" ;;
+        freebsd:14:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw.xz" ;;
+        freebsd:14:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/aarch64/Latest/FreeBSD-14.5-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.raw.xz" ;;
+        freebsd:15:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw.xz" ;;
+        freebsd:15:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.raw.xz" ;;
+        rocky:10:x86_64)    echo "https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2" ;;
+        rocky:10:aarch64)   echo "https://download.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2" ;;
         almalinux:10:x86_64)  echo "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2" ;;
         almalinux:10:aarch64) echo "https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-latest.aarch64.qcow2" ;;
         fedora:44:x86_64)   echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2" ;;
@@ -2425,7 +2425,20 @@ install_freebsd_bootnext_entry() {
 }
 
 check_secure_boot() {
-    [[ "$OS" == Linux ]] || return 0
+    if [ "$OS" = FreeBSD ]; then
+        # efivar returns the one-byte UEFI global SecureBoot variable.
+        local sb
+        sb=$(efivar -N -b -p -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot 2>/dev/null | od -An -tu1 | tr -d '[:space:]') || sb=
+        case "$sb" in
+            0) info "Secure Boot disabled (FreeBSD EFI variable)"; return 0 ;;
+            1) error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported" ;;
+            *) if [ "${DDIFY_ASSUME_SECURE_BOOT_DISABLED:-0}" = 1 ]; then
+                   warn "FreeBSD Secure Boot state unknown; using explicitly confirmed disabled state"
+                   return 0
+               fi
+               error "FreeBSD Secure Boot status unknown; verify firmware settings before reinstalling" ;;
+        esac
+    fi
     local value="" status="" kernel_messages=""
     [[ -d /sys/firmware/efi ]] || return 0
     kernel_messages=$(dmesg 2>/dev/null || true)
@@ -2871,7 +2884,7 @@ inspect_qcow_partition_layout() {
     if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
         QCOW_PARTITION_CROSSES_STAGE=1
         warn "qcow2 GPT layout reaches the temporary staging area."
-        warn "Using sparse RAM/zram shadow mode to avoid self-overwriting the live staging source."
+        warn "Overlapping staging will be refused; no full RAW shadow is allocated."
     fi
 
     # Never trust a QCOW2 virtual size smaller than its GPT partition extent.
@@ -2920,12 +2933,10 @@ preflight_target_image_in_alpine() {
     info "Checking target image URL before modifying the disk"
     curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
         error "Target image URL is not reachable before disk modification"
-    local remote_size
-    remote_size=$(http_content_length "$IMG_URL" || true)
-    if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
-        error "Image download size exceeds the staging policy before disk modification"
-    fi
     preflight_image_geometry
+    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
+        calculate_disk_staging_budget
+    fi
 }
 
 # The script never accepts decompression output beyond the negotiated workspace limit.
@@ -2952,7 +2963,7 @@ download_target_image_in_alpine() {
     [[ "$IMG_URL" == https://* ]] || error "Target image must use HTTPS"
     [[ -n "${IMAGE_HASH_ALGO:-}" || -z "${IMAGE_HASH_EXPECTED:-}" ]] || error "Missing image checksum algorithm"
     info "Downloading target image to verified workspace: $IMG_URL"
-    local limit="${IMAGE_DOWNLOAD_LIMIT_BYTES:-$((2400 * 1024 * 1024))}"
+    local limit="${IMAGE_DOWNLOAD_LIMIT_BYTES:?missing image staging limit}"
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || error "Invalid image download limit"
 
     remote_size=$(http_content_length "$IMG_URL" || true)
@@ -2967,7 +2978,7 @@ download_target_image_in_alpine() {
             "${IMAGE_HASH_ALGO}sum" <"$fifo" >"$INSTALL_TMPDIR/image-hash" &
             hash_pid=$!
             if ! curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
-                    tee "$fifo" | xz --memlimit-decompress=256MiB -dc | bounded_image_copy "$limit" >"$tmp"; then
+                    tee "$fifo" | xz --threads=1 --memlimit-decompress=128MiB -dc | bounded_image_copy "$limit" >"$tmp"; then
                 rm -f "$tmp" "$fifo"
                 wait "$hash_pid" || true
                 error "Failed to download/decompress target image"
@@ -2977,7 +2988,7 @@ download_target_image_in_alpine() {
             digest=$(awk '{print $1; exit}' "$INSTALL_TMPDIR/image-hash")
         else
             curl -fL --progress-bar --proto '=https' --proto-redir '=https' "$IMG_URL" |
-                xz --memlimit-decompress=256MiB -dc | bounded_image_copy "$limit" >"$tmp" ||
+                xz --threads=1 --memlimit-decompress=128MiB -dc | bounded_image_copy "$limit" >"$tmp" ||
                 error "Failed to download/decompress target image"
         fi
     else
@@ -3269,11 +3280,8 @@ write_qcow_without_overwriting_staging() {
     [[ -n "$TEMP_STAGE_START_BYTES" ]] || error "Temporary staging boundary is unknown"
     TEMP_STAGE_RELEASED=0
 
-    if [[ "${QCOW_PARTITION_CROSSES_STAGE:-0}" == "1" ]]; then
-        shadow="/run/reinstall-work/target-shadow.raw"
-        prepare_sparse_shadow_for_target "$img" "$shadow"
-        write_sparse_shadow_to_target_after_releasing_stage "$shadow"
-        return 0
+    if [ "${QCOW_PARTITION_CROSSES_STAGE:-0}" = 1 ]; then
+        error "QCOW2 partitions overlap protected staging; refusing full RAW shadow allocation"
     fi
 
     if [[ "$QCOW_VIRTUAL_SIZE" -le "$TEMP_STAGE_START_BYTES" ]]; then
@@ -3536,6 +3544,131 @@ installer_preflight_freebsd_image() {
     info "Pre-commit FreeBSD GPT and partition-space checks passed."
 }
 
+# ----------------- bounded low-memory image backends -----------------
+
+image_is_freebsd_raw() {
+    [ "$TARGET_OS" = freebsd ] || return 1
+    case "$IMG_URL" in *.raw.xz) return 0 ;; *) return 1 ;; esac
+}
+
+# Disk staging is deliberately destructive and remains explicit opt-in.
+# RAW.xz stays compressed until the final disk write. Plain QCOW2 is
+# accessed in place via NBD. Compressed custom QCOW2 needs expansion space.
+calculate_disk_staging_budget() {
+    local payload bytes disk_bytes
+    payload=$(http_content_length "$IMG_URL") || error "Cannot determine image transfer size"
+    case "$payload" in ''|*[!0-9]*) error "Missing image Content-Length" ;; esac
+    [ "$payload" -gt 0 ] || error "Empty image"
+    if image_is_freebsd_raw; then
+        bytes=$((payload + 192 * 1024 * 1024))
+    else
+        case "$IMG_URL" in
+            *.qcow2.xz)
+                # The decompressed length is not known from HTTP Content-Length.
+                # Keep the existing bounded fallback for custom compressed QCOW2.
+                bytes=$((3072 * 1024 * 1024)) ;;
+            *) bytes=$((payload + 192 * 1024 * 1024)) ;;
+        esac
+    fi
+    TEMP_STAGE_SIZE_MIB=$(((bytes + 1048575) / 1048576))
+    [ "$TEMP_STAGE_SIZE_MIB" -ge 256 ] || TEMP_STAGE_SIZE_MIB=256
+    TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1048576))
+    disk_bytes=$(get_disk_size_bytes "$DISK") || error "Cannot read disk size"
+    [ "$disk_bytes" -gt $((TEMP_STAGE_SIZE_BYTES + 2 * 1024 * 1024 * 1024)) ] ||
+        error "Disk cannot accommodate the image staging partition"
+    [ "$payload" -lt "$TEMP_STAGE_SIZE_BYTES" ] || error "Image transfer exceeds staging partition"
+    info "Disk staging budget: $TEMP_STAGE_SIZE_MIB MiB (download $payload bytes)"
+}
+
+set_disk_download_limit() {
+    local available
+    available=$(df -B1 --output=avail "$TEMP_STAGE_MNT" | awk 'NR==2 {print $1}')
+    case "$available" in ''|*[!0-9]*) error "Cannot determine staging filesystem space" ;; esac
+    [ "$available" -gt $((32 * 1048576)) ] || error "Insufficient staging filesystem space"
+    IMAGE_DOWNLOAD_LIMIT_BYTES=$((available - 32 * 1048576))
+}
+
+# Download the compressed RAW file once. Verify the publisher checksum before
+# decompressing or writing any image bytes to the target system area.
+download_freebsd_raw() {
+    local dst="$1" tmp="$1.part" digest limit actual
+    limit=${IMAGE_DOWNLOAD_LIMIT_BYTES:?missing image staging limit}
+    rm -f "$tmp"
+    curl -fL --proto '=https' --proto-redir '=https' --max-filesize "$limit" \
+        "$IMG_URL" -o "$tmp" || error "Failed to download compressed FreeBSD RAW image"
+    actual=$(stat -c %s "$tmp") || error "Cannot read RAW payload length"
+    [ "$actual" -le "$limit" ] || error "RAW payload exceeds staging budget"
+    [ -n "${IMAGE_HASH_EXPECTED:-}" ] || error "FreeBSD RAW requires an official checksum"
+    digest=$(sha256sum "$tmp" | awk '{print $1}') || error "Cannot hash RAW payload"
+    [ "$digest" = "$IMAGE_HASH_EXPECTED" ] || error "FreeBSD RAW checksum mismatch"
+    mv -f "$tmp" "$dst"
+    sync
+    info "Verified compressed FreeBSD RAW image"
+}
+
+# Validate both GPT copies in a sparse metadata-only file. Only the first and
+# final MiB of the RAW disk are retained; xz processes the entire stream and
+# verifies its integrity. No full RAW or QCOW2 is allocated in RAM.
+inspect_freebsd_raw() {
+    local img="$1" layout="$INSTALL_TMPDIR/raw-gpt.layout" size tail_offset table end
+    size=$(xz --robot --list "$img" | awk '$1=="totals" {print $5; exit}') ||
+        error "Cannot inspect XZ index"
+    case "$size" in ''|*[!0-9]*) error "Invalid RAW virtual size" ;; esac
+    [ "$size" -ge 2097152 ] && [ $((size % 512)) -eq 0 ] ||
+        error "Invalid RAW sector geometry"
+    [ "$size" -le $((TEMP_STAGE_START_BYTES - 8 * 1048576)) ] ||
+        error "RAW image would overlap protected staging; refusing write"
+    rm -f "$layout"
+    truncate -s "$size" "$layout" || error "Cannot allocate sparse GPT metadata"
+    tail_offset=$((size / 512 - 2048))
+    # The outer installer currently enables pipefail. Both dd and tail must
+    # consume the same stream; fullblock prevents a short pipe read.
+    if ! xz --threads=1 --memlimit-decompress=128MiB -dc "$img" | (
+        dd of="$layout" bs=1048576 count=1 iflag=fullblock conv=notrunc status=none &&
+        tail -c 1048576 | dd of="$layout" bs=512 seek="$tail_offset" conv=notrunc status=none
+    ); then
+        rm -f "$layout"
+        error "FreeBSD RAW integrity/GPT metadata extraction failed"
+    fi
+    verify_gpt_strict "$layout"
+    table=$(sgdisk -p "$layout") || error "Cannot read RAW GPT"
+    QCOW_GPT_GUID=$(printf '%s\n' "$table" | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
+    [ -n "$QCOW_GPT_GUID" ] || error "RAW GPT has no disk identifier"
+    end=$(printf '%s\n' "$table" | awk '/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ {if($3>max)max=$3} END {if(max)printf "%.0f\n",max}')
+    case "$end" in ''|*[!0-9]*) error "Cannot determine RAW partition boundaries" ;; esac
+    [ $(((end + 1) * 512)) -lt "$size" ] || error "RAW partition exceeds image size"
+    QCOW_PARTITION_TABLE=gpt
+    RAW_IMAGE_BYTES=$size
+    rm -f "$layout"
+    info "Verified RAW GPT and bounded image size: $RAW_IMAGE_BYTES bytes"
+}
+
+installer_write_freebsd_raw() {
+    local img written_guid
+    resolve_target_disk_from_identity
+    unmount_target_disk_filesystems "$DISK"
+    confirm_destructive_write
+    prepare_fixed_temp_staging_partition
+    if [ -n "$PREFETCH_IMAGE_PATH" ]; then
+        img=$PREFETCH_IMAGE_PATH
+    else
+        set_disk_download_limit
+        img="$TEMP_STAGE_MNT/image.raw.xz"
+        download_freebsd_raw "$img"
+    fi
+    inspect_freebsd_raw "$img"
+    info "Writing verified FreeBSD RAW stream (no full decompressed image)"
+    xz --threads=1 --memlimit-decompress=128MiB -dc "$img" |
+        dd of="$DISK" bs=1M iflag=fullblock conv=notrunc,fsync status=progress ||
+        error "FreeBSD RAW disk write failed"
+    release_temp_staging_partition
+    written_guid=$(sgdisk -p "$DISK" 2>/dev/null | awk '/^Disk identifier \(GUID\):/ {print $4; exit}')
+    [ "$written_guid" = "$QCOW_GPT_GUID" ] || error "Written RAW GPT identity mismatch"
+    sgdisk -e "$DISK" >/dev/null || error "Failed to repair RAW backup GPT"
+    verify_gpt_strict "$DISK"
+    grow_last_partition_reserving_cidata
+}
+
 installer_precommit_prepare() {
     [[ "$ALLOW_EARLY_WIPE" == 0 ]] || {
         warn "EXPLICIT HIGH-RISK MODE: target disk will be erased before the image is fully downloaded and inspected."
@@ -3547,12 +3680,13 @@ installer_precommit_prepare() {
     TEMP_STAGE_SIZE_MIB=128
     TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1024 * 1024))
     local mem_bytes free_bytes limit remote_size oldmnt
-    mem_bytes=$(awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    mem_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
     free_bytes=$(df -B1 --output=avail /run/reinstall-work | awk 'NR == 2 {print $1}')
     [[ "$mem_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ ]] || error "Cannot budget RAM source staging"
-    limit=$((mem_bytes / 2))
+    # Reserve physical memory for the rescue OS, XZ and filesystem tools.
+    # Never treat logical zram capacity as real RAM.
+    limit=$((mem_bytes - 384 * 1024 * 1024))
     (( free_bytes - 256 * 1024 * 1024 < limit )) && limit=$((free_bytes - 256 * 1024 * 1024))
-    (( limit > 2400 * 1024 * 1024 )) && limit=$((2400 * 1024 * 1024))
     (( limit > 64 * 1024 * 1024 )) || error "Not enough RAM staging budget before disk commit"
     remote_size=$(http_content_length "$IMG_URL" || true)
     [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt 0 ]] || \
@@ -3563,13 +3697,21 @@ installer_precommit_prepare() {
     PREFETCH_IMAGE_PATH="$INSTALL_TMPDIR/verified-source.qcow2"
     oldmnt="$TEMP_STAGE_MNT"
     TEMP_STAGE_MNT=/run/reinstall-work
-    download_target_image_in_alpine "$PREFETCH_IMAGE_PATH"
+    if image_is_freebsd_raw; then
+        PREFETCH_IMAGE_PATH="$INSTALL_TMPDIR/verified-source.raw.xz"
+        download_freebsd_raw "$PREFETCH_IMAGE_PATH"
+    else
+        download_target_image_in_alpine "$PREFETCH_IMAGE_PATH"
+    fi
     TEMP_STAGE_MNT="$oldmnt"
     local usable
     usable=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
     (( usable >= 256 * 1024 * 1024 )) || \
         error "Insufficient memory after image verification; disk was not modified"
-    if [[ "$TARGET_OS" == freebsd ]]; then
+    if image_is_freebsd_raw; then
+        TEMP_STAGE_START_BYTES=$(($(get_disk_size_bytes "$DISK") - TEMP_STAGE_SIZE_BYTES - 4 * 1048576))
+        inspect_freebsd_raw "$PREFETCH_IMAGE_PATH"
+    elif [ "$TARGET_OS" = freebsd ]; then
         installer_preflight_freebsd_image
     else
         installer_preflight_linux_files
@@ -3587,6 +3729,7 @@ installer_write_image() {
         IMG_QCOW="$PREFETCH_IMAGE_PATH"
     else
         IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+        set_disk_download_limit
         download_target_image_in_alpine "$IMG_QCOW"
     fi
     inspect_qcow_partition_layout "$IMG_QCOW"
@@ -3666,6 +3809,9 @@ verify_gpt_strict() {
 }
 
 linux_copy_scan_source() {
+    # Preflight and installation each scan the source independently.
+    LINUX_COPY_SRC_ROOT= LINUX_COPY_SRC_BOOT= LINUX_COPY_SRC_EFI=
+    LINUX_COPY_ROOT_TYPE= LINUX_COPY_ROOT_UUID= LINUX_COPY_BOOT_UUID= LINUX_COPY_EFI_UUID=
     local nbd="$QCOW_NBD_DEV" table pv vg dev fs type mp path count=0
     table=$(blkid -p -s PTTYPE -o value "$nbd" 2>/dev/null || true)
     [[ "$table" == gpt ]] || error "Linux file-copy installer currently requires a GPT cloud image (detected: ${table:-unknown})"
@@ -4170,6 +4316,7 @@ installer_write_image_linux_by_copy() {
         IMG_QCOW="$PREFETCH_IMAGE_PATH"
     else
         IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+        set_disk_download_limit
         download_target_image_in_alpine "$IMG_QCOW"
     fi
     connect_qcow_readonly_nbd "$IMG_QCOW"
@@ -4225,20 +4372,27 @@ do_install() {
         ALLOW_EARLY_WIPE=0
     }
 
+    info "[1/5] Prepare rescue workspace and verify image metadata"
     installer_workspace
     installer_stage_optional_inputs
     preflight_target_image_in_alpine
+    info "[2/5] Prepare bounded image staging and pre-commit checks"
     installer_precommit_prepare
     [[ "$HOLD" != 1 ]] || {
         info "Full rescue preflight passed; target disk was not changed (--hold 1)"
         return 0
     }
-    if [[ "$TARGET_OS" == freebsd ]]; then
+    info "[3/5] Install operating system"
+    if image_is_freebsd_raw; then
+        installer_write_freebsd_raw
+    elif [ "$TARGET_OS" = freebsd ]; then
         installer_write_image
     else
         installer_write_image_linux_by_copy
     fi
+    info "[4/5] Write NoCloud configuration"
     installer_write_seed
+    info "[5/5] Final checks and cleanup"
     run_post_install_hook
     show_partition_info
     print_install_summary
@@ -4412,12 +4566,19 @@ probe_remote_qcow_virtual_size() {
 preflight_image_geometry() {
     local disk_bytes image_bytes stage_safe
     disk_bytes=$(get_disk_size_bytes "$DISK")
+    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -ge 10000000000 ]] || \
+        error "Minimum supported target disk size is 10 GB (decimal)"
+    if image_is_freebsd_raw; then
+        # XZ virtual length and both GPT copies are checked on the verified file.
+        if [ "$ALLOW_EARLY_WIPE" = 1 ]; then calculate_disk_staging_budget; fi
+        info "FreeBSD RAW backend: compressed payload staged, full layout checked before image write"
+        return 0
+    fi
     image_bytes=$(probe_remote_qcow_virtual_size) || \
         error "Cannot read remote QCOW2 header before disk modification"
-    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -ge $((10 * 1024 * 1024 * 1024)) ]] || \
-        error "Minimum supported target disk size is 10 GiB"
     if [[ "$ALLOW_EARLY_WIPE" == 1 ]]; then
-        stage_safe=$((disk_bytes - 3072 * 1024 * 1024 - 64 * 1024 * 1024))
+        calculate_disk_staging_budget
+        stage_safe=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - 64 * 1024 * 1024))
     else
         stage_safe=$((disk_bytes - 128 * 1024 * 1024 - 64 * 1024 * 1024))
     fi
@@ -4493,6 +4654,9 @@ host_main() {
     if [[ -z "$IMG_URL" ]]; then
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
         IMAGE_BUILTIN=1
+    fi
+    if image_is_freebsd_raw && [ "$IMAGE_BUILTIN" != 1 ]; then
+        error "Custom RAW images require a trusted checksum; use the built-in FreeBSD RAW URL or a QCOW2 override"
     fi
     preflight_target_image_on_host
     preflight_image_geometry
