@@ -1,6 +1,12 @@
 name: DDify Test
 on:
   workflow_dispatch:
+    inputs:
+      rhel_image_url:
+        description: 'Optional public HTTPS RHEL QCOW2 URL (no credentials or query tokens)'
+        required: false
+        type: string
+        default: ''
   pull_request:
     paths: ['ddify.sh', '.github/workflows/DDify-test.yml']
   push:
@@ -9,25 +15,51 @@ on:
 permissions:
   contents: read
 jobs:
+  matrix:
+    name: Select source and target systems
+    runs-on: ubuntu-24.04
+    outputs:
+      cases: ${{ steps.cases.outputs.cases }}
+    steps:
+      - id: cases
+        shell: sh
+        env:
+          RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
+        run: |
+          set -eu
+          if [ -n "$RHEL_IMAGE_URL" ]; then
+              # URLs are sent as literal arguments to the serial root shell.
+              # Never pass signed URLs, tokens, or embedded credentials into logs.
+              printf '%s\n' "$RHEL_IMAGE_URL" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/%+-]+\.qcow2$' ||
+                  { echo 'RHEL image must be a public HTTPS QCOW2 URL without query parameters' >&2; exit 1; }
+              rhel=true
+          else
+              rhel=false
+              echo 'RHEL custom-image cases not scheduled: no RHEL image URL supplied.'
+          fi
+          cases=$(jq -cn --argjson rhel "$rhel" '
+            [{source:"rocky",disk_bytes:"10737418240",disk_label:"10 GiB"},
+             {source:"freebsd",disk_bytes:"10000000000",disk_label:"10 GB"}] as $sources |
+            ([{target:"rocky",version:"10"},{target:"almalinux",version:"10"},
+              {target:"fedora",version:"44"},{target:"freebsd",version:"14"},
+              {target:"freebsd",version:"15"},{target:"debian",version:"13"}]
+              + (if $rhel then [{target:"redhat",version:""}] else [] end)) as $targets |
+            {include:[$sources[] as $source | $targets[] as $target | $source + $target]}
+          ')
+          printf 'cases=%s\n' "$cases" >> "$GITHUB_OUTPUT"
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} (1 GiB RAM, ${{ matrix.disk_label }})
+    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (1 GiB RAM, ${{ matrix.disk_label }})
+    needs: matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        source: [rocky, freebsd]
-        target: [rocky, freebsd]
-        include:
-          - source: rocky
-            disk_bytes: '10737418240'
-            disk_label: '10 GiB'
-          - source: freebsd
-            disk_bytes: '10000000000'
-            disk_label: '10 GB'
+      matrix: ${{ fromJSON(needs.matrix.outputs.cases) }}
     env:
       SOURCE_OS: ${{ matrix.source }}
       TARGET_OS: ${{ matrix.target }}
+      TARGET_VERSION: ${{ matrix.version }}
+      RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
       VM_RAM_MIB: '1024'
       VM_DISK_BYTES: ${{ matrix.disk_bytes }}
       SCRIPT_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
@@ -139,7 +171,12 @@ jobs:
           set -eu
           export LC_ALL=C
           : "${SOURCE_OS:?}" "${TARGET_OS:?}"
-          case "$SOURCE_OS:$TARGET_OS" in rocky:rocky|rocky:freebsd|freebsd:rocky|freebsd:freebsd) ;; *) exit 2;; esac
+          case "$SOURCE_OS" in rocky|freebsd) ;; *) exit 2 ;; esac
+          case "$TARGET_OS:${TARGET_VERSION:-}" in
+              rocky:10|almalinux:10|fedora:44|freebsd:14|freebsd:15|debian:13) ;;
+              redhat:) [ -n "$RHEL_IMAGE_URL" ] || exit 2 ;;
+              *) exit 2 ;;
+          esac
           WORK=${WORK:-$(mktemp -d)}
           RAM=${VM_RAM_MIB:-1024}
           DISK_BYTES=${VM_DISK_BYTES:-10000000000}
@@ -220,7 +257,13 @@ jobs:
           printf '%s\n' "$SCRIPT_REF" | grep -Eq '^[0-9a-f]{40}$' || fail 'Invalid script commit SHA'
           printf '%s\n' "$SCRIPT_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || fail 'Invalid script repository'
           [ "$(git -C "$REPO" rev-parse HEAD)" = "$SCRIPT_REF" ] || fail 'Checkout does not match download commit'
-          SCRIPT_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/$SCRIPT_REF/ddify.sh"
+          # main tests the documented URL; PRs must test their own unmerged
+          # script, not the old main. The checksum rejects any moving-ref race.
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              SCRIPT_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/main/ddify.sh"
+          else
+              SCRIPT_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/$SCRIPT_REF/ddify.sh"
+          fi
           SCRIPT_SHA256=$(sha256sum "$REPO/ddify.sh" | awk '{print $1}')
           export SCRIPT_URL SCRIPT_SHA256
           echo "Guest will download $SCRIPT_URL (SHA256 $SCRIPT_SHA256)"
@@ -314,10 +357,22 @@ jobs:
                   -o LogLevel=ERROR root@127.0.0.1 'export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH;' "$@"
           }
           assert_os() {
-              local key=$1 os=$2
+              local key=$1 os=$2 version expected_id
+              if [ "$key" = source ]; then
+                  case "$os" in rocky) version=10 ;; freebsd) version=15 ;; *) return 1 ;; esac
+              else
+                  version=${TARGET_VERSION:-}
+              fi
               case "$os" in
-                  rocky) ssh_guest "$key" 'test "$(uname -s)" = Linux && . /etc/os-release && test "$ID" = rocky && case "$VERSION_ID" in 10|10.*) true;; *) false;; esac' ;;
-                  freebsd) ssh_guest "$key" 'test "$(uname -s)" = FreeBSD && case "$(freebsd-version -u)" in 15.*) true;; *) false;; esac' ;;
+                  freebsd)
+                      ssh_guest "$key" "test \"\$(uname -s)\" = FreeBSD && case \"\$(freebsd-version -u)\" in $version|$version.*) true;; *) false;; esac"
+                      ;;
+                  rocky|almalinux|fedora|debian|redhat)
+                      expected_id=$os
+                      [ "$os" != redhat ] || expected_id=rhel
+                      ssh_guest "$key" "test \"\$(uname -s)\" = Linux && . /etc/os-release && test \"\$ID\" = '$expected_id' && case \"\$VERSION_ID\" in ${version:-*}|${version:-*}.*) true;; *) false;; esac"
+                      ;;
+                  *) return 1 ;;
               esac
           }
           wait_os() {
@@ -379,7 +434,7 @@ jobs:
           start_vm
           wait_os source "$SOURCE_OS" 900
           case "$SOURCE_OS" in rocky) DDIFY_DISK=/dev/vda;; freebsd) DDIFY_DISK=/dev/vtbd0;; esac
-          case "$TARGET_OS" in rocky) DDIFY_VERSION=10;; freebsd) DDIFY_VERSION=15;; esac
+          DDIFY_VERSION=${TARGET_VERSION:-}
           DDIFY_TARGET_KEY=$(awk '{print $1" "$2}' target-key.pub)
           export DDIFY_DISK DDIFY_VERSION DDIFY_TARGET_KEY
           # Drive the emulated UART, not SSH, QMP guest execution or file injection.
@@ -426,15 +481,23 @@ jobs:
               }
           }
           checked {test "$(id -u)" = 0 && test -f /var/tmp/ddify-old-system-marker && uname -a} ROOT 60
-          # FreeBSD has fetch in base, so no package install is needed to pull DDify.
-          set download [format {cd /root && if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 --proto '=https' --proto-redir '=https' -o ddify.sh '%s'; else fetch -o ddify.sh '%s'; fi} $env(SCRIPT_URL) $env(SCRIPT_URL)]
+          # Run the public installation command inside the guest, not the runner.
+          # FreeBSD has neither curl nor wget in base; provision curl only if
+          # neither downloader exists, via this same serial root session.
+          checked {if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then if [ "$(uname -s)" = FreeBSD ]; then env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl; else false; fi; fi} DOWNLOADER 900
+          set download [format {cd /root && (curl -fL --retry 3 --proto '=https' --proto-redir '=https' -O '%s' || wget --https-only -O ddify.sh '%s')} $env(SCRIPT_URL) $env(SCRIPT_URL)]
           checked $download DOWNLOAD 300
           set verify [format {if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum /root/ddify.sh | cut -d ' ' -f1); else actual=$(sha256 -q /root/ddify.sh); fi; test "$actual" = '%s' && sh -n /root/ddify.sh} $env(SCRIPT_SHA256)]
           checked $verify CHECKSUM 60
           checked [format {umask 077; printf '%%s\n' '%s' > /root/ddify-target.pub} $env(DDIFY_TARGET_KEY)] TARGET_KEY 60
           # The installer itself handles dependency setup and disk confirmation.
           # The OVMF firmware here is explicitly non-Secure-Boot.
-          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify.sh %s %s --allow-early-wipe --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $env(TARGET_OS) $env(DDIFY_VERSION) $env(DDIFY_DISK)]
+          if {$env(TARGET_OS) eq "redhat"} {
+              set target [format {redhat --img='%s'} $env(RHEL_IMAGE_URL)]
+          } else {
+              set target [format {%s %s} $env(TARGET_OS) $env(DDIFY_VERSION)]
+          }
+          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s --allow-early-wipe --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $env(DDIFY_DISK)]
           send -- "$command\r"
           set timeout 1800
           expect {
@@ -489,15 +552,15 @@ jobs:
           if ssh_guest source true >/dev/null 2>&1; then fail 'Old source SSH key still grants root access'; fi
           collect_guest target second-boot
           case "$TARGET_OS" in
-              rocky) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
+              rocky|almalinux|fedora|debian|redhat) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
               freebsd) ssh_guest target 'test -c /dev/efi && layout=$(gpart show -l) && ! printf "%s\n" "$layout" | grep -w CIDATA' ;;
           esac
-          echo "PASS: $SOURCE_OS -> $TARGET_OS (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
+          echo "PASS: $SOURCE_OS -> $TARGET_OS ${TARGET_VERSION:-custom} (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
       - name: Upload logs even when installation fails
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}
+          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}
           path: ${{ runner.temp }}/ddify-qemu/logs/
           if-no-files-found: warn
           retention-days: 7
