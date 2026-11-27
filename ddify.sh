@@ -4303,6 +4303,7 @@ linux_copy_release_staging_and_grow() {
     for vg in $LINUX_COPY_SOURCE_VGS; do
         vgchange -an "$vg" >/dev/null || error "Cannot deactivate source LVM group: $vg"
     done
+    LINUX_COPY_SOURCE_VGS=""
     cleanup_qcow_nbd || error "Cannot disconnect validated source NBD"
     sync
     umount "$TEMP_STAGE_MNT" || error "Cannot unmount image staging partition"
