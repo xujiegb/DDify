@@ -148,7 +148,7 @@ Usage:
   $SCRIPT_NAME redhat --img URL [options]
 
 Options:
-  --disk DEVICE          Target disk; auto-detected when omitted
+  --disk DEVICE          Target disk; automatically selected when omitted
   --img URL              Override qcow2/qcow2.xz or FreeBSD raw.xz image URL
   --password PASSWORD    Root password (alias: --passwd)
   --ssh-key KEY          Public key, file, URL, github:user or gitlab:user; repeatable
@@ -863,7 +863,7 @@ print_disk_candidates() {
     [ -n "$DISK_CANDIDATE_LINES" ] || return 0
     ui_heading "  Detected disks"
     printf '%s\n' "$DISK_CANDIDATE_LINES" >&2
-    ui_field "Recommended" "$AUTO_DETECTED_DISK"
+    ui_field "Auto-selected" "$AUTO_DETECTED_DISK"
     ui_field "Reason" "$AUTO_DETECT_REASON"
 }
 
@@ -4660,22 +4660,16 @@ ui_image_settings() {
 }
 
 ui_disk_settings() {
-    local override origin=CLI
+    local origin=CLI
     if [ -z "$DISK" ]; then
         ui_task "Detect current system disk" disk-detect auto_detect_disk
         origin=auto
-        if [ "$UI_TTY" = 1 ]; then
-            print_disk_candidates
-            override=$(ui_prompt "Target disk path (Enter = recommended)") || error "Disk selection cancelled"
-            if [ -n "$override" ]; then
-                DISK="$override"
-                DISK_AUTO_SELECTED=0
-                origin=TUI
-            fi
-        fi
     fi
     ui_task "Validate target disk" disk prepare_target_disk
     ui_setting "Target disk" "$DISK" "$origin"
+    if [ "$origin" = auto ]; then
+        ui_field "Reason" "$AUTO_DETECT_REASON"
+    fi
     ui_task "Check disk capacity" capacity validate_target_capacity
 }
 
