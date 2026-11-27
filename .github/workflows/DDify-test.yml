@@ -100,6 +100,40 @@ jobs:
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
+      - name: Validate persistent Expect UART reader
+        shell: sh
+        run: |
+          set -eu
+          expect <<'EXPECT_SMOKE'
+          log_user 0
+          set timeout 10
+          spawn -noecho sh -c {printf 'first\r\n'; sleep 1; printf 'second\r\n'; sleep 1; printf 'third\r\n'}
+          set received ""
+          expect {
+              -re {.+} {
+                  append received $expect_out(0,string)
+                  exp_continue
+              }
+              full_buffer {
+                  append received $expect_out(buffer)
+                  exp_continue
+              }
+              eof {}
+              timeout { puts stderr "UART reader smoke test timed out"; exit 1 }
+          }
+          foreach marker {first second third} {
+              if {[string first $marker $received] < 0} {
+                  puts stderr "UART reader lost marker: $marker"
+                  exit 1
+              }
+          }
+          set result [wait]
+          if {[lindex $result 2] != 0 || [lindex $result 3] != 0} {
+              puts stderr "UART producer failed: $result"
+              exit 1
+          }
+          puts "Persistent Expect UART reader smoke test passed"
+          EXPECT_SMOKE
       - name: Validate installer with sh and BusyBox ash
         shell: sh
         run: |
@@ -647,7 +681,7 @@ jobs:
           set timeout -1
           expect {
               eof {}
-              -re {[\s\S]+} { exp_continue }
+              -re {.+} { exp_continue }
               full_buffer { exp_continue }
           }
           catch {close}
