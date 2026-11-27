@@ -215,12 +215,31 @@ jobs:
               grep -Fq 'Cannot read kernel mount inventory' "$work/mount-failed"
           )
           (
+              # Boot media release must touch only the target's actual apkovl mount.
+              lsblk() { printf '253:0 vda disk\n253:2 vda2 part\n253:3 vda3 part\n'; }
+              findmnt() {
+                  case "$*" in
+                      *MAJ:MIN,TARGET*) printf '253:2 /media/vda2\n253:3 /mnt/data\n254:2 /media/vdb2\n' ;;
+                      *FSTYPE*) printf 'tmpfs\n' ;;
+                      *'/media/vda2') printf '253:2\n' ;;
+                      *) return 2 ;;
+                  esac
+              }
+              rescue_boot_overlay_present() { [ "$1" = /media/vda2 ]; }
+              umount() { printf '%s\n' "$1" >> "$work/boot-unmounts"; }
+              release_rescue_boot_media /dev/nonexistent
+              [ "$(cat "$work/boot-unmounts")" = /media/vda2 ]
+              umount() { return 1; }
+              if (release_rescue_boot_media /dev/nonexistent); then exit 1; fi
+          )
+          (
               DISK=/dev/nonexistent TARGET_OS=debian TEMP_STAGE_SIZE_BYTES=134217728
               get_disk_size_bytes() { printf '9499999744\n'; }
               resolve_target_disk_from_identity() { :; }
               validate_target_disk() { :; }
               ensure_supported_sector_size() { :; }
               confirm_destructive_write() { :; }
+              release_rescue_boot_media() { :; }
               assert_target_disk_idle() { error 'simulated busy disk'; }
               prepare_fixed_temp_staging_partition() { touch "$work/unexpected-wipe"; }
               if (commit_disk_and_prepare_source); then exit 1; fi
