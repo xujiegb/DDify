@@ -221,7 +221,7 @@ jobs:
                   case "$*" in
                       *MAJ:MIN,TARGET*) printf '253:2 /media/vda2\n253:3 /mnt/data\n254:2 /media/vdb2\n' ;;
                       *FSTYPE*) printf 'tmpfs\n' ;;
-                      *'/media/vda2') printf '253:2\n' ;;
+                      *'/media/vda2') printf ' 253:2 \n' ;;
                       *) return 2 ;;
                   esac
               }
@@ -229,6 +229,24 @@ jobs:
               umount() { printf '%s\n' "$1" >> "$work/boot-unmounts"; }
               release_rescue_boot_media /dev/nonexistent
               [ "$(cat "$work/boot-unmounts")" = /media/vda2 ]
+              findmnt() {
+                  case "$*" in
+                      *MAJ:MIN,TARGET*) printf '253:2 /media/vda2\n' ;;
+                      *FSTYPE*) printf 'tmpfs\n' ;;
+                      *'/media/vda2') printf '253:3\n' ;;
+                      *) return 2 ;;
+                  esac
+              }
+              if (release_rescue_boot_media /dev/nonexistent); then exit 1; fi
+              [ "$(cat "$work/boot-unmounts")" = /media/vda2 ]
+              findmnt() {
+                  case "$*" in
+                      *MAJ:MIN,TARGET*) printf '253:2 /media/vda2\n' ;;
+                      *FSTYPE*) printf 'tmpfs\n' ;;
+                      *'/media/vda2') printf '253:2\n' ;;
+                      *) return 2 ;;
+                  esac
+              }
               umount() { return 1; }
               if (release_rescue_boot_media /dev/nonexistent); then exit 1; fi
           )
