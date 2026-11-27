@@ -44,7 +44,6 @@ Options:
   --post-install-hook P  Run hook after image/NoCloud write
   --hold 1               Validate prerequisites only; do not erase or install
   --hold 2               Install but do not reboot
-  --allow-early-wipe     Default disk staging; retained for command-line compatibility
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
@@ -4437,7 +4436,6 @@ parse_host_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage ;;
-            --allow-early-wipe) : ;; # Compatibility flag; disk staging is always enabled.
             --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook|--hold)
                 local opt="$1"; shift
                 [ $# -gt 0 ] || error "Need value for $opt"
