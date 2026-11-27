@@ -73,11 +73,30 @@ jobs:
           persist-credentials: false
           repository: ${{ env.SCRIPT_REPO }}
           ref: ${{ env.SCRIPT_REF }}
-      - name: Install QEMU and test tools
+      - name: Install Ubuntu 26.04 amd64v3 QEMU and test tools
         shell: sh
         run: |
+          set -eu
+          test "$(dpkg --print-architecture)" = amd64
+          /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported' ||
+              { echo 'Runner CPU does not support x86-64-v3' >&2; exit 1; }
+          printf '%s\n' 'APT::Architecture-Variants "amd64v3";' |
+              sudo tee /etc/apt/apt.conf.d/99enable-amd64v3
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq busybox expect socat
+          # Reinstall already-present tools as well, so preinstalled baseline
+          # packages do not silently bypass selection of optimized variants.
+          tools='qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq busybox expect socat'
+          sudo apt-get install -y --reinstall --no-install-recommends $tools
+          apt-config dump | grep -F 'amd64v3'
+          echo 'Installed test-tool architecture variants:'
+          dpkg-query -W -f='${Package}\t${Architecture}\t${Architecture-Variant}\n' $tools
+          # QEMU is the main workload; require actual optimized executables,
+          # not merely an APT configuration or a v3-capable guest CPU.
+          for pkg in qemu-system-x86 qemu-utils; do
+              variant=$(dpkg-query -W -f='${Architecture-Variant}' "$pkg")
+              [ "$variant" = amd64v3 ] ||
+                  { echo "$pkg installed variant: ${variant:-baseline}; expected amd64v3" >&2; exit 1; }
+          done
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
