@@ -2454,57 +2454,109 @@ build_freebsd_grub_efi() {
     info "Prepared FreeBSD UEFI bootstrap: $ALPINE_FREEBSD_GRUB_EFI_ABS"
 }
 
-efi_entry_numbers() {
-    local title="${1:-}"
-    efibootmgr -v 2>/dev/null | awk -v title="$title" '
-        /^[[:space:]]*[+*]?Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
-            if (title == "" || index($0, title)) {
-                match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)
-                print toupper(substr($0, RSTART + 4, 4))
-            }
+# Read actual EFI variable names, including boot entries not in BootOrder.
+# efibootmgr -v is for diagnostics; it may omit or fail to decode device paths.
+efi_boot_variable_numbers() {
+    local vars
+    vars=$(efivar -l) || return 1
+    printf '%s\n' "$vars" | awk '
+        tolower($0) ~ /^8be4df61-93ca-11d2-aa0d-00e098032b8c-boot[0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ {
+            print toupper(substr($0,length($0)-3))
         }
     ' | sort -u
 }
 
-efi_bootnext_number() {
-    efibootmgr 2>/dev/null | awk -F: '/^BootNext[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
+efi_bootorder() {
+    local listing
+    listing=$(efibootmgr) || return 1
+    printf '%s\n' "$listing" | awk -F: '/^BootOrder[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
 }
 
-efi_bootorder() {
-    efibootmgr 2>/dev/null | awk -F: '/^BootOrder[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
+efi_bootnext_number() {
+    local listing
+    listing=$(efibootmgr) || return 1
+    printf '%s\n' "$listing" | awk -F: '/^BootNext[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
+}
+
+# Reserve a deterministic unused boot number, including missing BootOrder
+# entries. FreeBSD efibootmgr -c -b HEX also refuses an existing variable.
+efi_choose_boot_number() {
+    printf '%s\n' "$1" | awk -v order="$2" '
+        { if(NF) used[toupper($0)]=1 }
+        END {
+            n=split(order,a,",")
+            for(i=1;i<=n;i++) used[toupper(a[i])]=1
+            for(i=0;i<=65535;i++) {
+                slot=sprintf("%04X",i)
+                if(!(slot in used)) { print slot; exit }
+            }
+            exit 1
+        }
+    '
+}
+
+efi_verify_created_entry() {
+    local listing="$1" number="$2" title="$3"
+    printf '%s\n' "$listing" | awk -v number="$number" -v title="$title" '
+        {
+            line=$0
+            sub(/^[[:space:]]*[+*]?Boot/,"",line)
+            if(toupper(substr(line,1,4)) != number) next
+            line=substr(line,5)
+            if(substr(line,1,1)!="*") next
+            sub(/^\*[[:space:]]+/,"",line)
+            if(line==title) count++
+        }
+        END {exit count!=1}
+    '
 }
 
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
-    local before num order bootnext current
+    command -v efivar >/dev/null 2>&1 || error "efivar is required on FreeBSD"
+    local before num order bootnext current listing after created
 
-    # Do not delete old entries by label: they might be user-managed entries.
-    [ -z "$(efi_entry_numbers "$ALPINE_ENTRY_TITLE")" ] || \
+    listing=$(efibootmgr -v) || error "Cannot inspect current UEFI entries"
+    info "UEFI entries before bootstrap:"
+    printf '%s\n' "$listing"
+    if printf '%s\n' "$listing" | grep -Fq "$ALPINE_ENTRY_TITLE"; then
         error "An existing Alpine reinstall EFI entry needs manual removal"
-    order=$(efi_bootorder)
-    match_ere "$order" '^[0-9A-F]{4}(,[0-9A-F]{4})*$' || \
+    fi
+    order=$(efi_bootorder) || error "Cannot read original UEFI BootOrder"
+    match_ere "$order" '^[0-9A-F]{4}(,[0-9A-F]{4})*$' ||
         error "Could not safely capture the original UEFI BootOrder"
 
-    before=$(efi_entry_numbers)
-    efibootmgr -a -c -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
+    before=$(efi_boot_variable_numbers) || error "Cannot enumerate EFI boot variables"
+    [ -n "$before" ] || error "EFI boot variable inventory is empty"
+    num=$(efi_choose_boot_number "$before" "$order") || error "No unused EFI boot number"
+    match_ere "$num" '^[0-9A-F]{4}$' || error "Invalid EFI boot number"
+    info "Creating one-time Alpine boot entry Boot$num"
+    if ! created=$(efibootmgr -a -c -b "$num" -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" -L "$ALPINE_ENTRY_TITLE" 2>&1); then
+        printf '%s\n' "$created" >&2
         error "Failed to create UEFI boot entry"
-    # Compare boot entry numbers without process substitution.
-    num=$(printf '%s\n' "$(efi_entry_numbers)" | awk -v before="$before" '
-        BEGIN { n=split(before,a,"\n"); for(i=1;i<=n;i++) seen[a[i]]=1 }
-        NF && !($0 in seen) { result=$0; count++ }
-        END { if(count==1) print result; else exit 1 }
-    ') || error "Expected exactly one new UEFI boot entry"
-    match_ere "$num" '^[0-9A-F]{4}$' || error "Could not uniquely determine new UEFI boot entry"
+    fi
+    printf '%s\n' "$created"
 
-    # -c prepends the new entry to BootOrder; preserve the user's original order.
+    # Restore the original order immediately, before any further validation.
+    # Only this explicitly reserved and successfully created entry may be
+    # removed on rollback. Never delete an existing entry by its label.
     if ! efibootmgr -o "$order" >/dev/null; then
         efibootmgr -B -b "$num" >/dev/null 2>&1 || true
         error "Failed to restore original UEFI BootOrder"
     fi
-    current=$(efi_bootorder)
+    current=$(efi_bootorder) || error "Cannot verify restored UEFI BootOrder"
     [ "$current" = "$order" ] || error "UEFI BootOrder changed unexpectedly: $current"
-    efibootmgr -n -b "$num" >/dev/null || error "Failed to set BootNext=$num"
-    bootnext=$(efi_bootnext_number)
+    after=$(efi_boot_variable_numbers) || error "Cannot verify new EFI variable"
+    if ! printf '%s\n' "$after" | grep -Fxq "$num" ||
+       ! efi_verify_created_entry "$created" "$num" "$ALPINE_ENTRY_TITLE"; then
+        efibootmgr -B -b "$num" >/dev/null 2>&1 || true
+        error "New UEFI boot variable or active entry label could not be verified"
+    fi
+    if ! efibootmgr -n -b "$num" >/dev/null; then
+        efibootmgr -B -b "$num" >/dev/null 2>&1 || true
+        error "Failed to set BootNext=$num"
+    fi
+    bootnext=$(efi_bootnext_number) || error "Cannot verify BootNext"
     [ "$bootnext" = "$num" ] || error "BootNext verification failed: $bootnext != $num"
     info "BootNext=$num ($ALPINE_ENTRY_TITLE); original BootOrder preserved"
 }
