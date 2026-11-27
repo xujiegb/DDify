@@ -17,7 +17,7 @@ permissions:
 jobs:
   matrix:
     name: Select source and target systems
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       cases: ${{ steps.cases.outputs.cases }}
     steps:
@@ -53,7 +53,7 @@ jobs:
   reinstall:
     name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (1 GiB RAM, ${{ matrix.disk_label }})
     needs: matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
