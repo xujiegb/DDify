@@ -100,6 +100,41 @@ jobs:
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
+      - name: Prepare reboot-safe OVMF firmware
+        shell: sh
+        run: |
+          set -eu
+          # LP #2175541: resolute's edk2 2025.11 can leave the IGVM parameter
+          # page available to the guest, then hang during a warm reboot.
+          # Upstream e4f99a85545f reserves the page. The 26.10 package
+          # includes the newer edk2 2026.05. Extract only its firmware data;
+          # keep the 26.04 runner and amd64v3 QEMU packages untouched.
+          fw="$RUNNER_TEMP/ddify-ovmf"
+          mkdir -p "$fw/lists/partial" "$fw/root"
+          cd "$fw"
+          printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu stonking main' > sources.list
+          printf '%s\n' '#clear APT::Architecture-Variants;' > apt.conf
+          firmware_apt() {
+              apt-get -c "$fw/apt.conf" \
+                  -o "Dir::Etc::sourcelist=$fw/sources.list" \
+                  -o 'Dir::Etc::sourceparts=-' \
+                  -o "Dir::State::lists=$fw/lists" \
+                  -o 'Dir::Cache::pkgcache=' -o 'Dir::Cache::srcpkgcache=' \
+                  -o 'Acquire::Languages=none' "$@"
+          }
+          firmware_apt update
+          firmware_apt download ovmf-generic=2026.05-2ubuntu3
+          deb="$fw/ovmf-generic_2026.05-2ubuntu3_all.deb"
+          test "$(dpkg-deb -f "$deb" Package)" = ovmf-generic
+          test "$(dpkg-deb -f "$deb" Version)" = 2026.05-2ubuntu3
+          test "$(dpkg-deb -f "$deb" Architecture)" = all
+          dpkg-deb -x "$deb" "$fw/root"
+          code="$fw/root/usr/share/OVMF/OVMF_CODE_4M.fd"
+          vars="$fw/root/usr/share/OVMF/OVMF_VARS_4M.fd"
+          test -s "$code" && test -s "$vars"
+          test "$(($(stat -c %s "$code") + $(stat -c %s "$vars")))" -eq 4194304
+          sha256sum "$code" "$vars"
+          printf 'DDIFY_OVMF_CODE=%s\nDDIFY_OVMF_VARS=%s\n' "$code" "$vars" >> "$GITHUB_ENV"
       - name: Validate persistent Expect UART reader
         shell: sh
         run: |
@@ -463,8 +498,11 @@ jobs:
           cloud-localds seed.iso user-data meta-data
           rm -f user-data
           # Non-Secure-Boot UEFI, persistent NVRAM across reboots and QEMU restarts.
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
-          CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          : "${DDIFY_OVMF_CODE:?}" "${DDIFY_OVMF_VARS:?}"
+          cp "$DDIFY_OVMF_VARS" vars.fd
+          CODE="$DDIFY_OVMF_CODE"
+          echo 'Using isolated edk2 2026.05 firmware (Ubuntu stonking, non-Secure-Boot)'
+          sha256sum "$CODE" "$DDIFY_OVMF_VARS" > "$LOG/ovmf-firmware.txt"
           [ -r "$CODE" ] || fail 'OVMF firmware not found'
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
               accel=kvm; cpu=host
