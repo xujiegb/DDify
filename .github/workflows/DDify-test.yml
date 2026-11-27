@@ -164,15 +164,20 @@ jobs:
           write_nocloud_seed rocky "$work/linux-meta-data" "$work/linux-user-data" 11111111-2222-3333-4444-555555555555
           grep -Fxq '#cloud-config' "$work/linux-user-data"
           grep -Fxq 'hostname: ddify-rocky' "$work/linux-user-data"
-          grep -Fxq 'local-hostname: ddify-rocky' "$work/linux-meta-data"
+          if grep -q '^local-hostname:' "$work/linux-meta-data"; then exit 1; fi
           write_nocloud_seed fedora "$work/fedora-meta-data" "$work/fedora-user-data" 11111111-2222-3333-4444-555555555555
           grep -Fxq 'hostname: ddify-fedora' "$work/fedora-user-data"
           grep -Fxq 'preserve_hostname: true' "$work/fedora-user-data"
           grep -Fxq 'preserve_hostname: true' "$work/linux-user-data"
-          mkdir -p "$work/hostname-root/etc"
+          mkdir -p "$work/hostname-root/etc/cloud"
+          printf '%s\n' 'preserve_hostname: false' 'users: []' > "$work/hostname-root/etc/cloud/cloud.cfg"
           printf '%s\n' localhost > "$work/hostname-root/etc/hostname"
           linux_copy_set_hostname "$work/hostname-root" fedora
           [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-fedora ]
+          grep -Fxq 'preserve_hostname: true' "$work/hostname-root/etc/cloud/cloud.cfg"
+          grep -Fxq 'users: []' "$work/hostname-root/etc/cloud/cloud.cfg"
+          [ "$(grep -c '^preserve_hostname:' "$work/hostname-root/etc/cloud/cloud.cfg")" -eq 1 ]
+          grep -Fq 'restorecon -F /etc/hostname /etc/cloud/cloud.cfg' "$work/fedora-user-data"
           rm "$work/hostname-root/etc/hostname"
           linux_copy_set_hostname "$work/hostname-root" debian
           [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-debian ]
@@ -180,7 +185,7 @@ jobs:
           ln -s "$work/plan" "$work/hostname-root/etc/hostname"
           if (linux_copy_set_hostname "$work/hostname-root" fedora); then exit 1; fi
           [ -L "$work/hostname-root/etc/hostname" ]
-          grep -Fxq 'local-hostname: ddify-fedora' "$work/fedora-meta-data"
+          if grep -q '^local-hostname:' "$work/fedora-meta-data"; then exit 1; fi
           if grep -Eq '^(hostname|local-hostname): localhost$' "$work/fedora-user-data" "$work/fedora-meta-data"; then exit 1; fi
           grep -Fxq '  - name: root' "$work/linux-user-data"
           grep -Fq "$SSH_KEYS_ALL" "$work/linux-user-data"
@@ -504,7 +509,7 @@ jobs:
                   SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' > "$LOG/cloud-init-$tag.txt" || {
                       cat "$LOG/cloud-init-$tag.txt"
                       collect_guest "$key" "$tag-failed"
-                      ssh_guest "$key" 'hostname; cat /etc/hostname; hostnamectl status; journalctl -b -u systemd-hostnamed --no-pager' > "$LOG/$tag-hostname.txt" 2>&1 || true
+                      ssh_guest "$key" 'hostname; cat /etc/hostname; ls -lZ /etc/hostname /etc/cloud/cloud.cfg; grep -n preserve_hostname /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/*.cfg; hostnamectl status; journalctl -b -u systemd-hostnamed --no-pager' > "$LOG/$tag-hostname.txt" 2>&1 || true
                       fail 'Linux cloud-init failed'
                   }
                   cat "$LOG/cloud-init-$tag.txt"
