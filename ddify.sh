@@ -42,9 +42,9 @@ Options:
   --web-port PORT        Write /etc/reinstall-web-port through NoCloud
   --frpc-toml PATH|URL   Embed/download FRPC config
   --post-install-hook P  Run hook after image/NoCloud write
-  --hold 1               Validate only
+  --hold 1               Validate prerequisites only; do not erase or install
   --hold 2               Install but do not reboot
-  --allow-early-wipe     Low-memory disk staging; erase before full image verification (explicit opt-in)
+  --allow-early-wipe     Default disk staging; retained for command-line compatibility
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
@@ -1488,7 +1488,6 @@ GRUB_REBOOT_CMD=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 PASSWORD_TO_DISPLAY=""
-ALLOW_EARLY_WIPE=0
 STAGED_IMAGE=""
 LINUX_COPY_ROOT_USED=""
 
@@ -1681,7 +1680,6 @@ write_install_plan() {
         plan_assignment POST_INSTALL_HOOK "$POST_INSTALL_HOOK"
         plan_assignment AUTO_PASSWORD "$AUTO_PASSWORD"
         plan_assignment HOLD "$HOLD"
-        plan_assignment ALLOW_EARLY_WIPE "$ALLOW_EARLY_WIPE"
         plan_assignment PLAN_EFI_UUID "$PLAN_EFI_UUID"
     } >"$path"
     chmod 0600 "$path" 2>/dev/null || true
@@ -1694,8 +1692,6 @@ load_install_plan() {
     . "$plan"
     PASSWORD=""
     PASSWORD_HASH="${PASSWORD_HASH:-}"
-    ALLOW_EARLY_WIPE="${ALLOW_EARLY_WIPE:-0}"
-    { [ "$ALLOW_EARLY_WIPE" = 0 ] || [ "$ALLOW_EARLY_WIPE" = 1 ]; } || error "Invalid destructive-staging policy"
     ! [ -f /etc/reinstall/frpc.toml ] || FRPC_TOML="/etc/reinstall/frpc.toml"
     ! [ -f /etc/reinstall/post-install-hook.sh ] || POST_INSTALL_HOOK="/etc/reinstall/post-install-hook.sh"
     info "Loaded embedded install plan"
@@ -3113,12 +3109,9 @@ prepare_image_validation() {
         IMAGE_HASH_EXPECTED="" IMAGE_HASH_ALGO=""
         warn "Custom --img has no publisher-verified checksum; partition layout will still be validated"
     fi
-    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
-        # Only the low-memory path needs a remote size/header before commit.
-        calculate_disk_staging_budget
-        if ! image_is_freebsd_raw; then
-            probe_remote_qcow_virtual_size >/dev/null || error "Cannot read remote QCOW2 header before disk commit"
-        fi
+    calculate_disk_staging_budget
+    if ! image_is_freebsd_raw; then
+        probe_remote_qcow_virtual_size >/dev/null || error "Cannot read remote QCOW2 header before disk commit"
     fi
 }
 
@@ -3415,7 +3408,7 @@ confirm_destructive_write() {
     case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
 }
 
-# Use the same source validation for RAM and disk staging. Keep the read-only
+# Validate the disk-staged source. Keep the read-only
 # Linux source mounted for the copy instead of rescanning it after commit.
 validate_linux_source() {
     local efi_bytes boot_bytes=0 root_budget source_dir top fs cmd esp efi_candidate
@@ -3472,7 +3465,7 @@ image_is_freebsd_raw() {
     case "$IMG_URL" in *.raw.xz) return 0 ;; *) return 1 ;; esac
 }
 
-# Disk staging is deliberately destructive and remains explicit opt-in.
+# Disk staging is the sole installation path and is deliberately destructive.
 # RAW.xz stays compressed until the final disk write. Plain QCOW2 is
 # accessed in place via NBD. Compressed custom QCOW2 needs expansion space.
 calculate_disk_staging_budget() {
@@ -3614,27 +3607,6 @@ validate_staged_source() {
     fi
 }
 
-prepare_ram_source() {
-    local mem_bytes free_bytes limit
-    TEMP_STAGE_SIZE_MIB=128
-    TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1048576))
-    planned_stage_boundary
-    mem_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
-    free_bytes=$(df -B1 --output=avail /run/reinstall-work | awk 'NR == 2 {print $1}')
-    { match_ere "$mem_bytes" '^[0-9]+$' && match_ere "$free_bytes" '^[0-9]+$'; } || error "Cannot budget RAM staging"
-    limit=$((mem_bytes - 384 * 1048576))
-    [ "$limit" -le $((free_bytes - 256 * 1048576)) ] || limit=$((free_bytes - 256 * 1048576))
-    [ "$limit" -gt $((64 * 1048576)) ] ||
-        error "Insufficient safe RAM staging; use --allow-early-wipe only if data loss is acceptable"
-    IMAGE_DOWNLOAD_LIMIT_BYTES="$limit"
-    stage_source_image "$INSTALL_TMPDIR"
-    validate_staged_source
-    mem_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
-    match_ere "$mem_bytes" '^[0-9]+$' && [ "$mem_bytes" -ge $((256 * 1048576)) ] ||
-        error "Insufficient RAM after source validation; disk untouched"
-    info "Source verified before disk commit"
-}
-
 commit_disk_and_prepare_source() {
     local planned
     if [ "$TARGET_OS" != freebsd ]; then TEMP_STAGE_PART_NUM=128; fi
@@ -3648,11 +3620,9 @@ commit_disk_and_prepare_source() {
     assert_target_disk_idle "$DISK"
     prepare_fixed_temp_staging_partition
     [ "$TEMP_STAGE_START_BYTES" -ge "$planned" ] || error "Actual staging boundary is smaller than validated plan"
-    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
-        set_disk_download_limit
-        stage_source_image "$TEMP_STAGE_MNT"
-        validate_staged_source
-    fi
+    set_disk_download_limit
+    stage_source_image "$TEMP_STAGE_MNT"
+    validate_staged_source
 }
 
 installer_write_image() {
@@ -4389,27 +4359,19 @@ DDIFY_INPUT_22
 do_install() {
     info "Installing $TARGET_OS ${TARGET_VER:-} to $DISK"
     info "Image: $IMG_URL"
-    [ "$HOLD" != 1 ] || {
-        info "--hold 1: running full image/source checks without modifying the target"
-        ALLOW_EARLY_WIPE=0
-    }
-
     info "[1/5] Prepare rescue workspace and verify image metadata"
     installer_workspace
     installer_stage_optional_inputs
     prepare_image_validation
-    info "[2/5] Prepare bounded source and validate before disk commit"
-    if [ "$ALLOW_EARLY_WIPE" = 0 ]; then
-        prepare_ram_source
-    else
-        warn "Explicit early-wipe mode: a failed download or validation can leave the original system unrecoverable"
-    fi
+    info "[2/5] Check disk staging prerequisites"
     [ "$HOLD" != 1 ] || {
+        assert_target_disk_idle "$DISK"
         trap - EXIT
         cleanup_install_stage || error "Validation cleanup failed; disk was not changed"
-        info "Full rescue preflight passed; target disk was not changed (--hold 1)"
+        info "Rescue metadata and disk checks passed; no image downloaded and no disk modified (--hold 1)"
         return 0
     }
+    warn "Disk staging erases the original system before the full image is downloaded and verified"
     info "[3/5] Commit disk and install operating system"
     commit_disk_and_prepare_source
     if image_is_freebsd_raw; then
@@ -4475,7 +4437,7 @@ parse_host_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage ;;
-            --allow-early-wipe) ALLOW_EARLY_WIPE=1 ;;
+            --allow-early-wipe) : ;; # Compatibility flag; disk staging is always enabled.
             --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook|--hold)
                 local opt="$1"; shift
                 [ $# -gt 0 ] || error "Need value for $opt"
@@ -4552,7 +4514,7 @@ print_host_summary() {
     echo "Target:     $TARGET_OS ${TARGET_VER:-}"
     echo "Disk:       $DISK"
     echo "Image:      $IMG_URL"
-    echo "Staging:    $([ "$ALLOW_EARLY_WIPE" = 1 ] && echo 'early destructive (explicit opt-in)' || echo 'verified-before-wipe (RAM)')"
+    echo "Staging:    disk (erase before full image verification)"
     echo "Hostname:   $(seed_hostname "$TARGET_OS")"
     echo "SSH port:   ${SSH_PORT:-22}"
     [ "$DISK_AUTO_SELECTED" != 1 ] || echo "Disk reason: $AUTO_DETECT_REASON"
@@ -4681,14 +4643,14 @@ host_main() {
             done
             [ -n "$choice" ] || error "Selected disk is missing from candidate list"
         fi
-        printf 'WARNING: all data on %s will be destroyed.\n' "$DISK" >&2
+        printf 'WARNING: all data on %s will be destroyed before the full image is downloaded and verified.\n' "$DISK" >&2
         printf "Select [%s] to confirm, [0] to cancel: " "$choice" >&2
         IFS= read -r answer || error "Confirmation required"
         [ "$answer" = "$choice" ] || error "Destructive operation cancelled (use --disk to choose another device)"
     fi
 
     [ "$HOLD" != 1 ] || {
-        info "--hold 1 (host): image URL, disk capacity and host capability checked; full download/source verification requires Alpine rescue."
+        info "--hold 1 (host): image URL, disk capacity and host capability checked; no full image was downloaded or verified."
         return 0
     }
     PASSWORD_TO_DISPLAY=""
