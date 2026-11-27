@@ -52,6 +52,7 @@ ui_init() {
     ui_rule
     ui_heading "DDify | System reinstall"
     printf '  Prepare an Alpine rescue boot, then install the target OS.\n' >&2
+    printf '  CLI presets are displayed and do not require repeated input.\n' >&2
     ui_rule
 }
 
@@ -149,13 +150,17 @@ Usage:
 Options:
   --disk DEVICE          Target disk; auto-detected when omitted
   --img URL              Override qcow2/qcow2.xz or FreeBSD raw.xz image URL
-  --password PASSWORD    Root password
+  --password PASSWORD    Root password (alias: --passwd)
   --ssh-key KEY          Public key, file, URL, github:user or gitlab:user; repeatable
+                         Alias: --public-key
   --ssh-port PORT        SSH port (default 22)
   --web-port PORT        Write /etc/reinstall-web-port through NoCloud
   --frpc-toml PATH|URL   Embed/download FRPC config
   --post-install-hook P  Run hook after image/NoCloud write
 
+Run with no arguments to configure the installation interactively.
+Provided CLI values are displayed in the TUI and their prompts are skipped.
+Unspecified settings can be entered interactively; pipes use existing defaults.
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
     exit 0
@@ -4561,7 +4566,13 @@ ui_prompt() {
 }
 
 ui_setting() {
-    ui_field "$1" "$2 [$3]"
+    case "$3" in
+        CLI) ui_field "$1" "$2 [CLI - preset]" ;;
+        TUI) ui_field "$1" "$2 [TUI]" ;;
+        auto) ui_field "$1" "$2 [Auto-detected]" ;;
+        default) ui_field "$1" "$2 [Default]" ;;
+        *) error "Unknown setting origin: $3" ;;
+    esac
 }
 
 ui_display_url() {
@@ -4674,7 +4685,10 @@ ui_auth_settings() {
         # Either CLI authentication method is complete; never prompt for
         # an additional method or echo supplied secret/key material.
         [ -z "$PASSWORD" ] || ui_setting "Root password" "Configured (hidden)" CLI
-        [ -z "$SSH_KEY_ARGS" ] || ui_setting "SSH public keys" "Supplied; validating" CLI
+        if [ -n "$SSH_KEY_ARGS" ]; then
+            key=$(printf '%s\n' "$SSH_KEY_ARGS" | awk '{print NF}')
+            ui_setting "SSH public keys" "$key supplied; validating" CLI
+        fi
         for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
     elif [ "$UI_TTY" = 1 ]; then
         entered=$(ui_prompt "SSH public key, path or HTTPS URL (Enter = password)") || error "Authentication cancelled"
@@ -4757,6 +4771,7 @@ parse_host_options() {
             --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook)
                 local opt="$1"; shift
                 [ $# -gt 0 ] || error "Need value for $opt"
+                [ -n "$1" ] || error "Empty value: $opt"
                 case "$opt" in
                     --disk) DISK="$1" ;;
                     --img) IMG_URL="$1" ;;
@@ -4845,7 +4860,7 @@ print_host_summary() {
     ui_field "SSH port" "${SSH_PORT:-22}"
     ui_field "Authentication" "$auth"
     ui_field "SSH keys" "$keys"
-    [ -z "$WEB_PORT" ] || ui_field "Web port file" "$WEB_PORT"
+    ui_field "Web port file" "${WEB_PORT:-None}"
     ui_field "FRPC config" "$(ui_display_url "${FRPC_TOML:-None}")"
     ui_field "Post-install" "${POST_INSTALL_HOOK:-None}"
     ui_rule
