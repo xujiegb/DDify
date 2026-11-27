@@ -178,6 +178,9 @@ jobs:
           grep -Fxq 'users: []' "$work/hostname-root/etc/cloud/cloud.cfg"
           [ "$(grep -c '^preserve_hostname:' "$work/hostname-root/etc/cloud/cloud.cfg")" -eq 1 ]
           grep -Fq 'restorecon -F /etc/hostname /etc/cloud/cloud.cfg' "$work/fedora-user-data"
+          grep -Fq 'hostnamectl set-hostname "$ddify_hostname"' "$work/fedora-user-data"
+          grep -Fq "ddify_hostname='ddify-fedora'" "$work/fedora-user-data"
+          grep -Fq "ddify_hostname='ddify-rocky'" "$work/linux-user-data"
           rm "$work/hostname-root/etc/hostname"
           linux_copy_set_hostname "$work/hostname-root" debian
           [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-debian ]
@@ -665,8 +668,12 @@ jobs:
           done
           verify_target_hostname() {
               [ "$TARGET_OS" != freebsd ] || return 0
-              ssh_guest target "test \"\$(hostname)\" = 'ddify-$TARGET_OS' && test \"\$(cat /etc/hostname)\" = 'ddify-$TARGET_OS'" ||
-                  fail 'Target static hostname not persistent'
+              if ! ssh_guest target "test \"\$(hostname)\" = 'ddify-$TARGET_OS' && test \"\$(cat /etc/hostname)\" = 'ddify-$TARGET_OS'"; then
+                  collect_guest target hostname-failed
+                  ssh_guest target 'hostname; cat /etc/hostname; ls -lZ /etc/hostname /etc/cloud/cloud.cfg; hostnamectl status; journalctl -b -u systemd-hostnamed -u NetworkManager --no-pager' > "$LOG/hostname-failed-details.txt" 2>&1 || true
+                  cat "$LOG/hostname-failed-details.txt"
+                  fail 'Target static or running hostname differs from expected'
+              fi
           }
           cloud_wait target first-boot
           verify_target_hostname
