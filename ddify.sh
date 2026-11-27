@@ -42,7 +42,6 @@ Options:
   --web-port PORT        Write /etc/reinstall-web-port through NoCloud
   --frpc-toml PATH|URL   Embed/download FRPC config
   --post-install-hook P  Run hook after image/NoCloud write
-  --hold 1               Validate prerequisites only; do not erase or install
   --hold 2               Install but do not reboot
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
@@ -1689,6 +1688,7 @@ load_install_plan() {
     [ -f "$plan" ] || error "Embedded install plan not found: $plan"
     # shellcheck disable=SC1090
     . "$plan"
+    case "${HOLD:-0}" in 0|2) ;; *) error "Unsupported hold value in saved install plan; refusing disk changes" ;; esac
     PASSWORD=""
     PASSWORD_HASH="${PASSWORD_HASH:-}"
     ! [ -f /etc/reinstall/frpc.toml ] || FRPC_TOML="/etc/reinstall/frpc.toml"
@@ -2619,7 +2619,6 @@ check_secure_boot() {
         error "UEFI Secure Boot is enabled; unsigned Alpine bootstrap is unsupported"
     fi
     if ! command -v mokutil >/dev/null 2>&1; then
-        [ "${HOLD:-0}" != 1 ] || error "--hold 1 requires existing mokutil to validate Secure Boot without installing packages"
         detect_linux_family
         case "$LINUX_FAMILY" in
             redhat)
@@ -4363,13 +4362,6 @@ do_install() {
     installer_stage_optional_inputs
     prepare_image_validation
     info "[2/5] Check disk staging prerequisites"
-    [ "$HOLD" != 1 ] || {
-        assert_target_disk_idle "$DISK"
-        trap - EXIT
-        cleanup_install_stage || error "Validation cleanup failed; disk was not changed"
-        info "Rescue metadata and disk checks passed; no image downloaded and no disk modified (--hold 1)"
-        return 0
-    }
     warn "Disk staging erases the original system before the full image is downloaded and verified"
     info "[3/5] Commit disk and install operating system"
     commit_disk_and_prepare_source
@@ -4448,7 +4440,7 @@ parse_host_options() {
                     --web-port) is_port_valid "$1" || error "Invalid web port: $1"; WEB_PORT="$1" ;;
                     --frpc-toml) FRPC_TOML="$1" ;;
                     --post-install-hook) POST_INSTALL_HOOK="$1" ;;
-                    --hold) { [ "$1" = 1 ] || [ "$1" = 2 ]; } || error "--hold must be 1 or 2"; HOLD="$1" ;;
+                    --hold) [ "$1" = 2 ] || error "--hold only accepts 2 (install without reboot)"; HOLD=2 ;;
                 esac
                 ;;
             --*=*)
@@ -4607,11 +4599,7 @@ host_main() {
     { case "$IMG_URL" in http://*) false ;; *) true ;; esac; } || error "HTTP image URLs are not supported; use HTTPS"
     detect_os_arch
     validate_supported_install_mode
-    if [ "$HOLD" = 1 ]; then
-        have_any_downloader || error "--hold 1 needs curl or wget for image metadata validation"
-    else
-        ensure_dependencies
-    fi
+    ensure_dependencies
     local key
     for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
     prepare_target_disk
@@ -4630,27 +4618,21 @@ host_main() {
     warn "Rescue boot currently uses DHCPv4; static IP, VLAN and bonding are not migrated. Verify DHCP access before reboot."
     warn "The apkovl contains password hash/configuration on the boot filesystem; FAT filesystems cannot enforce 0600 access."
     [ "$DISK_AUTO_SELECTED" != 1 ] || print_disk_candidates
-    if [ "$HOLD" != 1 ]; then
-        local answer choice=1 i
-        if [ "$DISK_AUTO_SELECTED" = 1 ]; then
-            choice=""
-            i=0
-            for candidate in $DISK_CANDIDATE_PATHS; do
-                i=$((i + 1))
-                if [ "$candidate" = "$DISK" ]; then choice=$i; break; fi
-            done
-            [ -n "$choice" ] || error "Selected disk is missing from candidate list"
-        fi
-        printf 'WARNING: all data on %s will be destroyed before the full image is downloaded and verified.\n' "$DISK" >&2
-        printf "Select [%s] to confirm, [0] to cancel: " "$choice" >&2
-        IFS= read -r answer || error "Confirmation required"
-        [ "$answer" = "$choice" ] || error "Destructive operation cancelled (use --disk to choose another device)"
+    local answer choice=1 i
+    if [ "$DISK_AUTO_SELECTED" = 1 ]; then
+        choice=""
+        i=0
+        for candidate in $DISK_CANDIDATE_PATHS; do
+            i=$((i + 1))
+            if [ "$candidate" = "$DISK" ]; then choice=$i; break; fi
+        done
+        [ -n "$choice" ] || error "Selected disk is missing from candidate list"
     fi
+    printf 'WARNING: all data on %s will be destroyed before the full image is downloaded and verified.\n' "$DISK" >&2
+    printf "Select [%s] to confirm, [0] to cancel: " "$choice" >&2
+    IFS= read -r answer || error "Confirmation required"
+    [ "$answer" = "$choice" ] || error "Destructive operation cancelled (use --disk to choose another device)"
 
-    [ "$HOLD" != 1 ] || {
-        info "--hold 1 (host): image URL, disk capacity and host capability checked; no full image was downloaded or verified."
-        return 0
-    }
     PASSWORD_TO_DISPLAY=""
     prepare_and_boot_alpine_ram
 }
@@ -4659,7 +4641,7 @@ parse_installer_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|--force) AUTO_YES=1 ;;
-            --hold) shift; { [ "${1:-}" = 1 ] || [ "${1:-}" = 2 ]; } || error "Invalid --hold"; HOLD="$1" ;;
+            --hold) shift; [ "${1:-}" = 2 ] || error "--hold only accepts 2 (install without reboot)"; HOLD=2 ;;
             *) error "Unknown installer argument: $1" ;;
         esac
         shift
