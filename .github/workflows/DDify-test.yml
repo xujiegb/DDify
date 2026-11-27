@@ -53,11 +53,13 @@ jobs:
               {target:"fedora",version:"44"},{target:"freebsd",version:"14"},
               {target:"freebsd",version:"15"},{target:"debian",version:"13"}]
               + (if $rhel then [{target:"redhat",version:""}] else [] end)) as $targets |
-            {include:[$sources[] as $source | $targets[] as $target | $source + $target]}
+            {include:([$sources[] as $source | $targets[] as $target | $source + $target + {mode:"early"}] +
+              [{source:"freebsd",target:"debian",version:"13",disk_bytes:"9499999744",disk_label:"9.5 GB",mode:"safe",ram_mib:"4096"},
+               {source:"freebsd",target:"freebsd",version:"15",disk_bytes:"9499999744",disk_label:"9.5 GB",mode:"safe",ram_mib:"4096"}])}
           ')
           printf 'cases=%s\n' "$cases" >> "$GITHUB_OUTPUT"
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }})
+    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ matrix.ram_mib || inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }}, ${{ matrix.mode }})
     needs: matrix
     runs-on: ubuntu-26.04
     timeout-minutes: 120
@@ -69,7 +71,8 @@ jobs:
       TARGET_OS: ${{ matrix.target }}
       TARGET_VERSION: ${{ matrix.version }}
       RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
-      VM_RAM_MIB: ${{ inputs.ram_mib || '720' }}
+      VM_RAM_MIB: ${{ matrix.ram_mib || inputs.ram_mib || '720' }}
+      INSTALL_MODE: ${{ matrix.mode }}
       VM_DISK_BYTES: ${{ matrix.disk_bytes }}
       SCRIPT_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       SCRIPT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -201,6 +204,50 @@ jobs:
           [ "$DDIFY_TEST_VALUE" = "$value" ]
           printf '%s' abcde | bounded_image_copy 3 > "$work/bounded"
           [ "$(wc -c < "$work/bounded")" -eq 4 ]
+          # Fault injection: none of these helpers can access runner disks.
+          (
+              OS=Linux
+              lsblk() { return 2; }
+              if (assert_target_disk_idle /dev/nonexistent) >"$work/inventory-failed" 2>&1; then exit 1; fi
+              grep -Fq 'Cannot enumerate target disk devices' "$work/inventory-failed"
+              lsblk() { printf '8:0\n'; }
+              findmnt() { return 2; }
+              if (assert_target_disk_idle /dev/nonexistent) >"$work/mount-failed" 2>&1; then exit 1; fi
+              grep -Fq 'Cannot read kernel mount inventory' "$work/mount-failed"
+          )
+          (
+              DISK=/dev/nonexistent TARGET_OS=debian TEMP_STAGE_SIZE_BYTES=134217728
+              get_disk_size_bytes() { printf '9499999744\n'; }
+              resolve_target_disk_from_identity() { :; }
+              validate_target_disk() { :; }
+              ensure_supported_sector_size() { :; }
+              confirm_destructive_write() { :; }
+              assert_target_disk_idle() { error 'simulated busy disk'; }
+              prepare_fixed_temp_staging_partition() { touch "$work/unexpected-wipe"; }
+              if (commit_disk_and_prepare_source); then exit 1; fi
+              [ ! -e "$work/unexpected-wipe" ]
+              assert_target_disk_idle() { :; }
+              prepare_fixed_temp_staging_partition() { events="$events commit"; }
+              set_disk_download_limit() { :; }
+              stage_source_image() { events="$events download"; }
+              validate_staged_source() { events="$events validate"; }
+              events=''
+              ALLOW_EARLY_WIPE=0
+              commit_disk_and_prepare_source
+              [ "$events" = ' commit' ]
+              events=''
+              ALLOW_EARLY_WIPE=1
+              commit_disk_and_prepare_source
+              [ "$events" = ' commit download validate' ]
+          )
+          (
+              INSTALL_TMPDIR=/run/reinstall-work/install.test
+              is_mountpoint() { return 1; }
+              findmnt() { printf '%s/cidata\n' "$INSTALL_TMPDIR"; }
+              rm() { touch "$work/unexpected-cleanup"; return 1; }
+              if (cleanup_install_stage); then exit 1; fi
+              [ ! -e "$work/unexpected-cleanup" ]
+          )
           qemu-img create -q -f qcow2 "$work/base.qcow2" 16M
           validate_qcow_metadata "$work/base.qcow2"
           qemu-img create -q -f qcow2 -F qcow2 -b "$work/base.qcow2" "$work/backed.qcow2"
@@ -327,7 +374,7 @@ jobs:
           esac
           WORK=${WORK:-$(mktemp -d)}
           RAM=${VM_RAM_MIB:-720}
-          case "$RAM" in 720|768|1024) ;; *) echo 'Unsupported CI RAM profile' >&2; exit 2 ;; esac
+          case "$INSTALL_MODE:$RAM" in early:720|early:768|early:1024|safe:4096) ;; *) echo 'Unsupported CI RAM/mode profile' >&2; exit 2 ;; esac
           DISK_BYTES=${VM_DISK_BYTES:-9499999744}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
@@ -735,7 +782,9 @@ jobs:
           } else {
               set target [format {%s %s} $env(TARGET_OS) $env(DDIFY_VERSION)]
           }
-          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s --allow-early-wipe --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $env(DDIFY_DISK)]
+          set mode ""
+          if {$env(INSTALL_MODE) eq "early"} { set mode "--allow-early-wipe" }
+          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s %s --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $mode $env(DDIFY_DISK)]
           send -- "$command\r"
           set timeout 1800
           expect {
@@ -922,7 +971,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}
+          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}-${{ matrix.mode }}
           path: ${{ runner.temp }}/ddify-qemu/logs/
           if-no-files-found: warn
           retention-days: 7
