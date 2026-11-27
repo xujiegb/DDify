@@ -2,6 +2,12 @@ name: DDify Test
 on:
   workflow_dispatch:
     inputs:
+      ram_mib:
+        description: 'Guest RAM (MiB); default 720 for minimum-memory testing'
+        required: false
+        type: choice
+        default: '720'
+        options: ['720', '768', '1024']
       rhel_image_url:
         description: 'Optional public HTTPS RHEL QCOW2 URL (no credentials or query tokens)'
         required: false
@@ -51,7 +57,7 @@ jobs:
           ')
           printf 'cases=%s\n' "$cases" >> "$GITHUB_OUTPUT"
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (1 GiB RAM, ${{ matrix.disk_label }})
+    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }})
     needs: matrix
     runs-on: ubuntu-26.04
     timeout-minutes: 120
@@ -63,7 +69,7 @@ jobs:
       TARGET_OS: ${{ matrix.target }}
       TARGET_VERSION: ${{ matrix.version }}
       RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
-      VM_RAM_MIB: '1024'
+      VM_RAM_MIB: ${{ inputs.ram_mib || '720' }}
       VM_DISK_BYTES: ${{ matrix.disk_bytes }}
       SCRIPT_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       SCRIPT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -320,7 +326,8 @@ jobs:
               *) exit 2 ;;
           esac
           WORK=${WORK:-$(mktemp -d)}
-          RAM=${VM_RAM_MIB:-1024}
+          RAM=${VM_RAM_MIB:-720}
+          case "$RAM" in 720|768|1024) ;; *) echo 'Unsupported CI RAM profile' >&2; exit 2 ;; esac
           DISK_BYTES=${VM_DISK_BYTES:-10000000000}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
