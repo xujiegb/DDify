@@ -560,7 +560,7 @@ assert_target_disk_idle() {
         match_ere "$id" '^[0-9]+:[0-9]+$' || error "Invalid target device number"
         sys="/sys/dev/block/$id"
         [ -d "$sys/holders" ] || error "Missing target sysfs holder inventory: $id"
-        if printf '%s\n' "$mounts" | grep -Fxq "$id"; then
+        if printf '%s\n' "$mounts" | grep -Fx "$id" >/dev/null; then
             error "Target device $id is mounted; refusing disk commit"
         fi
         for holder in "$sys/holders/"*; do
@@ -576,12 +576,12 @@ assert_target_disk_idle() {
     for dev in $swaps; do
         if [ -b "$dev" ]; then
             id=$(lsblk -dnr -o MAJ:MIN "$dev") || error "Cannot identify active swap: $dev"
-            if printf '%s\n' "$nodes" | grep -Fxq "$id"; then
+            if printf '%s\n' "$nodes" | grep -Fx "$id" >/dev/null; then
                 error "Target disk has active swap: $dev"
             fi
         elif [ -f "$dev" ]; then
             id=$(findmnt -kn -o MAJ:MIN --target "$dev") || error "Cannot identify swap file filesystem"
-            if printf '%s\n' "$nodes" | grep -Fxq "$id"; then
+            if printf '%s\n' "$nodes" | grep -Fx "$id" >/dev/null; then
                 error "Target disk contains active swap file: $dev"
             fi
         else
@@ -2939,7 +2939,7 @@ prepare_fixed_temp_staging_partition() {
 
 cleanup_qcow_nbd() {
     if [ -n "${QCOW_NBD_DEV:-}" ]; then
-        qemu-nbd --disconnect "$QCOW_NBD_DEV" >/dev/null 2>&1 || true
+        qemu-nbd --disconnect "$QCOW_NBD_DEV" >/dev/null || return 1
         QCOW_NBD_DEV=""
     fi
 }
@@ -3019,7 +3019,7 @@ DDIFY_INPUT_20
             QCOW_MAX_PART_END_SECTOR="$max_end"
             QCOW_MAX_PART_END_BYTES=$(((max_end + 1) * sector_size))
             [ "$(( QCOW_MAX_PART_END_BYTES + 8 * 1024 * 1024 <= TEMP_STAGE_START_BYTES ))" -ne 0 ] ||                 error "MBR image partitions cross the staging area; MBR shrinking is unsupported"
-            cleanup_qcow_nbd
+            cleanup_qcow_nbd || error "Cannot disconnect validated source NBD"
             QCOW_PARTITION_CROSSES_STAGE=0
             info "MBR image partitions end at ${QCOW_MAX_PART_END_BYTES} bytes; staging starts at ${TEMP_STAGE_START_BYTES} bytes"
             return 0
@@ -3053,7 +3053,7 @@ DDIFY_INPUT_20
     QCOW_MAX_PART_END_SECTOR="$max_end"
     QCOW_MAX_PART_END_BYTES=$(((max_end + 1) * sector_size))
 
-    cleanup_qcow_nbd
+    cleanup_qcow_nbd || error "Cannot disconnect validated source NBD"
 
     info "qcow2 virtual size:          ${QCOW_VIRTUAL_SIZE} bytes"
     info "qcow2 last partition end:    ${QCOW_MAX_PART_END_BYTES} bytes"
@@ -3184,9 +3184,9 @@ download_target_image_in_alpine() {
     mv -f "$tmp" "$dst"
     sync
     allocated=$(du -B1 "$dst" 2>/dev/null | awk '{print $1; exit}' || true)
-    info "Target qcow2 is ready on staging partition: $dst"
+    info "Verified QCOW2 ready: $dst"
     [ -n "$allocated" ] && info "qcow2 allocated staging space: ${allocated} bytes"
-    df -h "$TEMP_STAGE_MNT" || true
+    df -h "$(dirname "$dst")" || true
 }
 
 validate_qcow_metadata() {
@@ -3360,20 +3360,35 @@ grow_last_partition_reserving_cidata() {
 }
 
 cleanup_install_stage() {
-    local path vg
-    # A failed file copy must release all mounts before disconnecting qemu-nbd.
+    local path vg mounts
+    [ -n "${INSTALL_TMPDIR:-}" ] || return 0
+    case "$INSTALL_TMPDIR" in /run/reinstall-work/install.*) ;; *) warn "Unexpected workspace; refusing recursive cleanup"; return 1 ;; esac
+    cd /
+    # Release all known child mounts, including a failed NoCloud seed write.
     for path in "${LINUX_COPY_ROOT_MNT:-}" "${LINUX_COPY_SRC_MNT:-}" \
-        "${INSTALL_TMPDIR:-}/linux-src-boot" "${INSTALL_TMPDIR:-}/linux-src-efi" \
-        "${INSTALL_TMPDIR:-}/linux-probe" "${INSTALL_TMPDIR:-}/precheck-efi" "${INSTALL_TMPDIR:-}/precheck-btrfs-top" "${INSTALL_TMPDIR:-}/linux-btrfs-source-top"         "${INSTALL_TMPDIR:-}/linux-btrfs-target-top"; do
-        { [ -n "$path" ] && { case "$path" in /linux-*) false ;; *) true ;; esac; }; } || continue
-        is_mountpoint "$path" && umount -R "$path" 2>/dev/null || true
+        "$INSTALL_TMPDIR/linux-src-boot" "$INSTALL_TMPDIR/linux-src-efi" \
+        "$INSTALL_TMPDIR/linux-probe" "$INSTALL_TMPDIR/precheck-efi" \
+        "$INSTALL_TMPDIR/precheck-btrfs-top" "$INSTALL_TMPDIR/linux-btrfs-source-top" \
+        "$INSTALL_TMPDIR/linux-btrfs-target-top" "$INSTALL_TMPDIR/cidata"; do
+        [ -n "$path" ] || continue
+        if is_mountpoint "$path"; then
+            umount -R "$path" || { warn "Cannot release $path; preserving workspace"; return 1; }
+        fi
     done
+    mounts=$(findmnt -krn -o TARGET) || { warn "Cannot verify mount inventory; preserving workspace"; return 1; }
+    if printf '%s\n' "$mounts" | awk -v p="$INSTALL_TMPDIR" '$0 == p || index($0,p "/") == 1 {found=1} END {exit !found}'; then
+        warn "Workspace still contains mounted filesystems; refusing recursive cleanup"
+        return 1
+    fi
     for vg in $LINUX_COPY_SOURCE_VGS; do
-        vgchange -an "$vg" >/dev/null 2>&1 || true
+        vgchange -an "$vg" >/dev/null || { warn "Cannot deactivate $vg; preserving workspace"; return 1; }
     done
-    cleanup_qcow_nbd
-    is_mountpoint "$TEMP_STAGE_MNT" && umount "$TEMP_STAGE_MNT" 2>/dev/null || true
-    [ -z "${INSTALL_TMPDIR:-}" ] || rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
+    LINUX_COPY_SOURCE_VGS=""
+    cleanup_qcow_nbd || { warn "Cannot disconnect source image; preserving workspace"; return 1; }
+    if is_mountpoint "$TEMP_STAGE_MNT"; then
+        umount "$TEMP_STAGE_MNT" || { warn "Cannot release staging filesystem"; return 1; }
+    fi
+    rm -rf "$INSTALL_TMPDIR" || return 1
 }
 
 installer_workspace() {
@@ -3623,11 +3638,12 @@ prepare_ram_source() {
 commit_disk_and_prepare_source() {
     local planned
     if [ "$TARGET_OS" != freebsd ]; then TEMP_STAGE_PART_NUM=128; fi
-    planned_stage_boundary
-    planned="$TEMP_STAGE_START_BYTES"
     resolve_target_disk_from_identity
     validate_target_disk "$DISK"
     ensure_supported_sector_size
+    validate_target_capacity
+    planned_stage_boundary
+    planned="$TEMP_STAGE_START_BYTES"
     confirm_destructive_write
     assert_target_disk_idle "$DISK"
     prepare_fixed_temp_staging_partition
@@ -4287,7 +4303,7 @@ linux_copy_release_staging_and_grow() {
     for vg in $LINUX_COPY_SOURCE_VGS; do
         vgchange -an "$vg" >/dev/null || error "Cannot deactivate source LVM group: $vg"
     done
-    cleanup_qcow_nbd
+    cleanup_qcow_nbd || error "Cannot disconnect validated source NBD"
     sync
     umount "$TEMP_STAGE_MNT" || error "Cannot unmount image staging partition"
     TEMP_STAGE_RELEASED=1
@@ -4388,6 +4404,8 @@ do_install() {
         warn "Explicit early-wipe mode: a failed download or validation can leave the original system unrecoverable"
     fi
     [ "$HOLD" != 1 ] || {
+        trap - EXIT
+        cleanup_install_stage || error "Validation cleanup failed; disk was not changed"
         info "Full rescue preflight passed; target disk was not changed (--hold 1)"
         return 0
     }
@@ -4408,7 +4426,7 @@ do_install() {
     print_install_summary
 
     trap - EXIT
-    cleanup_install_stage
+    cleanup_install_stage || error "Installation cleanup failed"
     [ "$HOLD" != 2 ] || { info "--hold 2: installation complete; not rebooting"; return; }
     info "Installation complete. Reboot when ready."
 }
