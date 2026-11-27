@@ -973,10 +973,21 @@ $SSH_KEYS_ALL
 DDIFY_INPUT_18
 }
 
+# Use a real hostname rather than the reserved fallback "localhost".
+# systemd-hostnamed on Fedora rejects setting localhost as a static hostname.
+seed_hostname() {
+    case "$1" in
+        rocky|almalinux|fedora|debian|redhat|freebsd) printf 'ddify-%s\n' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
 seed_account_linux() {
-    cat <<'EOF'
+    local hostname
+    hostname=$(seed_hostname "$1") || error "Invalid target OS for hostname"
+    cat <<EOF
 preserve_hostname: false
-hostname: localhost
+hostname: $hostname
 prefer_fqdn_over_hostname: false
 growpart:
   mode: auto
@@ -1417,12 +1428,13 @@ FREEBSD_BOOT
 }
 
 write_nocloud_seed() {
-    local os="$1" meta="$2" user="$3" cidata_partuuid="${4:-}" frpc_b64=""
+    local os="$1" meta="$2" user="$3" cidata_partuuid="${4:-}" frpc_b64="" hostname
+    hostname=$(seed_hostname "$os") || error "Invalid target OS for hostname"
 
     mkdir -p "$(dirname "$meta")"
     cat >"$meta" <<EOF
 instance-id: iid-$(date +%s)
-local-hostname: localhost
+local-hostname: $hostname
 EOF
 
     { [ -z "${FRPC_PRESENT:-}" ] || [ -z "${FRPC_TOML:-}" ] || ! [ -f "$FRPC_TOML" ]; } || \
@@ -1433,7 +1445,7 @@ EOF
     else
         {
             echo "#cloud-config"
-            seed_account_linux
+            seed_account_linux "$os"
             seed_write_files "$os" "$frpc_b64"
             seed_runcmd "$os" "$frpc_b64" "$cidata_partuuid"
         } >"$user"
@@ -4315,7 +4327,7 @@ print_install_summary() {
     echo "==================== Installation summary ===================="
     echo "Disk:       $DISK"
     echo "Target:     $TARGET_OS ${TARGET_VER:-}"
-    echo "Hostname:   localhost"
+    echo "Hostname:   $(seed_hostname "$TARGET_OS")"
     echo "User:       root"
     echo "SSH port:   ${SSH_PORT:-22}"
     echo "Password:   $([ -n "$PASSWORD_HASH" ] && echo configured || echo 'SSH-key only')"
@@ -4490,7 +4502,7 @@ print_host_summary() {
     echo "Disk:       $DISK"
     echo "Image:      $IMG_URL"
     echo "Staging:    $([ "$ALLOW_EARLY_WIPE" = 1 ] && echo 'early destructive (explicit opt-in)' || echo 'verified-before-wipe (RAM)')"
-    echo "Hostname:   localhost"
+    echo "Hostname:   $(seed_hostname "$TARGET_OS")"
     echo "SSH port:   ${SSH_PORT:-22}"
     [ "$DISK_AUTO_SELECTED" != 1 ] || echo "Disk reason: $AUTO_DETECT_REASON"
     if [ "$AUTO_PASSWORD" = 1 ]; then
