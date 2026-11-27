@@ -23,6 +23,114 @@ info() {
     echo "==> $*" >&2
 }
 
+# Host-only terminal presentation. No alternate screen, cursor hiding,
+# Bash, dialog, whiptail or extra package is required. Pipe/serial output
+# remains line-oriented and installer-phase output is unchanged.
+UI_TTY=0
+UI_COLOR=0
+UI_WIDTH=64
+UI_LOG_DIR=""
+UI_ACTIVE_LOG=""
+UI_STEP=0
+
+ui_init() {
+    local cols
+    if [ -t 0 ] && [ -t 2 ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ] &&
+        [ -z "${CI:-}" ]; then
+        UI_TTY=1
+        [ -n "${NO_COLOR:-}" ] || UI_COLOR=1
+        cols=$(stty size 2>/dev/null | awk '{print $2}') || cols=""
+        if match_ere "$cols" '^[0-9]{1,4}$' && [ "$cols" -ge 40 ]; then
+            UI_WIDTH="$cols"
+            [ "$UI_WIDTH" -le 76 ] || UI_WIDTH=76
+        fi
+        exec 3>&2
+        UI_LOG_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/ddify-ui.XXXXXX") ||
+            error "Cannot create private terminal log workspace"
+        trap 'ui_exit "$?"' 0
+    fi
+    ui_rule
+    ui_heading "DDify | System reinstall"
+    printf '  Prepare an Alpine rescue boot, then install the target OS.\n' >&2
+    ui_rule
+}
+
+ui_exit() {
+    local rc="$1"
+    trap - 0
+    if [ "$rc" -ne 0 ] && [ -n "$UI_ACTIVE_LOG" ] && [ -f "$UI_ACTIVE_LOG" ]; then
+        printf '\n  [FAILED] %s\n' "$UI_ACTIVE_LOG" >&3
+        tail -n 35 "$UI_ACTIVE_LOG" >&3 || :
+        printf '  Diagnostic logs: %s\n' "$UI_LOG_DIR" >&3
+    elif [ -n "$UI_LOG_DIR" ]; then
+        rm -rf "$UI_LOG_DIR" || :
+    fi
+    exit "$rc"
+}
+
+ui_rule() {
+    printf '%*s\n' "$UI_WIDTH" '' | tr ' ' '-' >&2
+}
+
+ui_heading() {
+    if [ "$UI_COLOR" = 1 ]; then
+        printf '\033[1;36m%s\033[0m\n' "$*" >&2
+    else
+        printf '%s\n' "$*" >&2
+    fi
+}
+
+ui_step() {
+    local filled rest
+    UI_STEP="$1"
+    shift
+    filled=$(printf '%*s' "$UI_STEP" '' | tr ' ' '#')
+    rest=$(printf '%*s' "$((5 - UI_STEP))" '' | tr ' ' '-')
+    printf '\n' >&2
+    ui_heading "[$filled$rest] $UI_STEP/5  $*"
+    ui_rule
+}
+
+ui_ok() {
+    if [ "$UI_COLOR" = 1 ]; then
+        printf '  \033[32m[OK]\033[0m %s\n' "$*" >&2
+    else
+        printf '  [OK] %s\n' "$*" >&2
+    fi
+}
+
+ui_field() {
+    # Prevent control characters in user-supplied URLs and device metadata
+    # from being interpreted as terminal escape sequences.
+    local value
+    value=$(printf '%s' "$2" | tr -d '\000-\037\177')
+    printf '  %-15s %s\n' "$1" "$value" >&2
+}
+
+ui_task() {
+    local title="$1" logname="$2"
+    shift 2
+    printf '  > %s\n' "$title" >&2
+    if [ "$UI_TTY" = 1 ]; then
+        UI_ACTIVE_LOG="$UI_LOG_DIR/$logname.log"
+        # Keep execution in the current shell so assignments survive.
+        # Do not call in an if/|| context: retain normal errexit behavior.
+        "$@" >"$UI_ACTIVE_LOG" 2>&1
+        UI_ACTIVE_LOG=""
+    else
+        "$@"
+    fi
+    ui_ok "$title"
+}
+
+ui_notice() {
+    if [ "$UI_COLOR" = 1 ]; then
+        printf '  \033[1;33m[!]\033[0m %s\n' "$*" >&2
+    else
+        printf '  [!] %s\n' "$*" >&2
+    fi
+}
+
 usage() {
     cat <<EOF
 Usage:
@@ -743,19 +851,16 @@ freebsd_provider_to_disk() {
 
 print_disk_candidates() {
     [ -n "$DISK_CANDIDATE_LINES" ] || return 0
-    echo
-    echo "Detected target disk candidates:"
-    printf '%s\n' "$DISK_CANDIDATE_LINES"
-    echo
-    echo "Recommended disk: $AUTO_DETECTED_DISK"
-    echo "Reason: $AUTO_DETECT_REASON"
-    echo
+    ui_heading "  Detected disks"
+    printf '%s\n' "$DISK_CANDIDATE_LINES" >&2
+    ui_field "Recommended" "$AUTO_DETECTED_DISK"
+    ui_field "Reason" "$AUTO_DETECT_REASON"
 }
 
 candidate_add() {
     local path="$1" size="$2" tags="${3:-}" note="${4:-}" line
     DISK_CANDIDATE_COUNT=$((DISK_CANDIDATE_COUNT + 1))
-    line=$(printf '  [%d] %-16s size=%s bytes' "$DISK_CANDIDATE_COUNT" "$path" "$size")
+    line=$(printf '  [%d] %-16s %s' "$DISK_CANDIDATE_COUNT" "$path" "$(awk -v n="$size" 'BEGIN {printf "%.2f GB", n / 1000000000}')")
     [ -z "$tags" ] || line="$line markers:$tags"
     [ -z "$note" ] || line="$line ($note)"
     DISK_CANDIDATE_LINES="${DISK_CANDIDATE_LINES:+$DISK_CANDIDATE_LINES$NL}$line"
@@ -2693,8 +2798,7 @@ check_secure_boot() {
 }
 
 prepare_and_boot_alpine_ram() {
-    check_secure_boot
-    prepare_alpine_paths
+    ui_task "Locate rescue boot partition" boot-paths prepare_alpine_paths
     local boot_disk
     if [ "$OS" = Linux ]; then
         boot_disk=$(linux_source_to_disk "$PLAN_EFI_PART" || true)
@@ -2703,20 +2807,24 @@ prepare_and_boot_alpine_ram() {
     fi
     { [ -n "$boot_disk" ] && [ "$boot_disk" = "$DISK" ]; } || \
         error "Bootstrap partition is not on target disk $DISK; refusing unsafe cross-disk install"
-    download_alpine_ram_files
-    build_alpine_apkovl
+    ui_task "Download Alpine kernel and initramfs" alpine-download download_alpine_ram_files
+    ui_task "Build rescue configuration" alpine-overlay build_alpine_apkovl
 
     case "$OS" in
         Linux)
-            install_grub_entry_for_alpine
+            ui_task "Configure one-time GRUB boot" grub-entry install_grub_entry_for_alpine
+            ui_rule
+            ui_ok "Rescue boot is ready"
             info "Rebooting into one-time GRUB entry: $ALPINE_ENTRY_TITLE"
             sync
             sleep 2
             reboot
             ;;
         FreeBSD)
-            build_freebsd_grub_efi
-            install_freebsd_bootnext_entry
+            ui_task "Build FreeBSD GRUB EFI loader" grub-efi build_freebsd_grub_efi
+            ui_task "Configure one-time UEFI boot" bootnext install_freebsd_bootnext_entry
+            ui_rule
+            ui_ok "Rescue boot is ready"
             info "Rebooting into one-time UEFI entry: $ALPINE_ENTRY_TITLE"
             sync
             sleep 2
@@ -4511,7 +4619,7 @@ prepare_target_disk() {
 prepare_credentials() {
     local a b
     { [ -n "$PASSWORD" ] || [ -n "$SSH_KEYS_ALL" ]; } || {
-        echo "No --password or --ssh-key specified."
+        ui_notice "No authentication option supplied. Enter a root password or press Enter for a random one."
         a=$(prompt_secret "Root password (empty = random): ") || error "Cannot read root password"
         if [ -z "$a" ]; then
             PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20 || true)
@@ -4530,22 +4638,39 @@ prepare_credentials() {
 }
 
 print_host_summary() {
-    echo
-    echo "====================== Reinstall plan ======================"
-    echo "Host:       $OS $ARCH"
-    echo "Target:     $TARGET_OS ${TARGET_VER:-}"
-    echo "Disk:       $DISK"
-    echo "Image:      $IMG_URL"
-    echo "Staging:    disk (erase before full image verification)"
-    echo "Hostname:   $(seed_hostname "$TARGET_OS")"
-    echo "SSH port:   ${SSH_PORT:-22}"
-    [ "$DISK_AUTO_SELECTED" != 1 ] || echo "Disk reason: $AUTO_DETECT_REASON"
-    if [ "$AUTO_PASSWORD" = 1 ]; then
-        echo "Generated root password: $PASSWORD_TO_DISPLAY"
-    else
-        echo "Password:   $([ -n "$PASSWORD_HASH" ] && echo configured || echo 'SSH-key only')"
+    local auth keys=0 disk_bytes
+    disk_bytes=$(get_disk_size_bytes "$DISK") || error "Cannot read target disk capacity"
+    if [ -n "$SSH_KEYS_ALL" ]; then
+        keys=$(printf '%s\n' "$SSH_KEYS_ALL" | awk 'NF {n++} END {print n+0}')
     fi
-    echo "============================================================"
+    if [ -n "$PASSWORD_HASH" ]; then
+        auth="Password"
+        [ "$keys" -eq 0 ] || auth="Password + SSH key"
+    else
+        auth="SSH key only"
+    fi
+    ui_heading "  REINSTALL PLAN"
+    ui_rule
+    ui_field "Current system" "$OS $ARCH"
+    ui_field "Target system" "$TARGET_OS ${TARGET_VER:-}"
+    ui_field "Target disk" "$DISK"
+    ui_field "Capacity" "$(awk -v n="$disk_bytes" 'BEGIN {printf "%.2f GB (%.2f GiB)",n/1000000000,n/1073741824}')"
+    ui_field "Firmware" "UEFI / one-time rescue boot"
+    ui_field "Staging" "Disk staging (destructive)"
+    ui_field "Image URL" "$IMG_URL"
+    ui_field "Hostname" "$(seed_hostname "$TARGET_OS")"
+    ui_field "SSH account" "root"
+    ui_field "SSH port" "${SSH_PORT:-22}"
+    ui_field "Authentication" "$auth"
+    ui_field "SSH keys" "$keys"
+    [ -z "$WEB_PORT" ] || ui_field "Web port file" "$WEB_PORT"
+    [ -z "$FRPC_TOML" ] || ui_field "FRPC config" "Configured"
+    [ -z "$POST_INSTALL_HOOK" ] || ui_field "Post-install" "Configured"
+    ui_rule
+    if [ "$AUTO_PASSWORD" = 1 ]; then
+        ui_notice "Save this generated root password now:"
+        ui_field "Root password" "$PASSWORD_TO_DISPLAY"
+    fi
 }
 
 probe_remote_qcow_virtual_size() {
@@ -4629,14 +4754,18 @@ host_main() {
 
     { [ "$TARGET_OS" != redhat ] || [ -n "$IMG_URL" ]; } || error "redhat requires --img URL"
     { case "$IMG_URL" in http://*) false ;; *) true ;; esac; } || error "HTTP image URLs are not supported; use HTTPS"
+    ui_init
+    ui_step 1 "Environment"
     detect_os_arch
     validate_supported_install_mode
-    ensure_dependencies
+    ui_field "Host" "$OS $ARCH"
+    ui_task "Check host dependencies" dependencies ensure_dependencies
+    ui_task "Check Secure Boot" secure-boot check_secure_boot
+    ui_step 2 "Target disk and image"
     local key
-    for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
-    prepare_target_disk
-    check_secure_boot
-    prepare_credentials
+    ui_task "Identify and validate target disk" disk prepare_target_disk
+    ui_field "Selected disk" "$DISK"
+    ui_task "Check disk capacity" capacity validate_target_capacity
     if [ -z "$IMG_URL" ]; then
         IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
         IMAGE_BUILTIN=1
@@ -4644,11 +4773,15 @@ host_main() {
     if image_is_freebsd_raw && [ "$IMAGE_BUILTIN" != 1 ]; then
         error "Custom RAW images require a trusted checksum; use the built-in FreeBSD RAW URL or a QCOW2 override"
     fi
-    preflight_target_image_on_host
-    validate_target_capacity
+    ui_task "Check target image URL" image-url preflight_target_image_on_host
+    ui_step 3 "Authentication"
+    for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
+    prepare_credentials
+    ui_ok "Root authentication configured"
+    ui_step 4 "Review and confirm"
     print_host_summary
-    warn "Rescue boot currently uses DHCPv4; static IP, VLAN and bonding are not migrated. Verify DHCP access before reboot."
-    warn "The apkovl contains password hash/configuration on the boot filesystem; FAT filesystems cannot enforce 0600 access."
+    ui_notice "DHCPv4 is required; static IP, VLAN and bonding are not migrated."
+    ui_notice "Local readers may access the apkovl on FAT boot filesystems."
     [ "$DISK_AUTO_SELECTED" != 1 ] || print_disk_candidates
     local answer choice=1 i
     if [ "$DISK_AUTO_SELECTED" = 1 ]; then
@@ -4660,12 +4793,15 @@ host_main() {
         done
         [ -n "$choice" ] || error "Selected disk is missing from candidate list"
     fi
+    ui_heading "  DESTRUCTIVE ACTION"
     printf 'WARNING: all data on %s will be destroyed before the full image is downloaded and verified.\n' "$DISK" >&2
     printf "Select [%s] to confirm, [0] to cancel: " "$choice" >&2
     IFS= read -r answer || error "Confirmation required"
     [ "$answer" = "$choice" ] || error "Destructive operation cancelled (use --disk to choose another device)"
 
     PASSWORD_TO_DISPLAY=""
+    ui_ok "Target disk confirmed: $DISK"
+    ui_step 5 "Prepare and reboot"
     prepare_and_boot_alpine_ram
 }
 
