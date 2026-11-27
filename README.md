@@ -61,6 +61,10 @@ curl -O https://raw.githubusercontent.com/xujiegb/DDify/main/ddify.sh || wget -O
 
 ### Step 3 · Start Reinstall / 开始重装
 
+**Warning / 警告:** DDify always uses disk staging. After you confirm the target disk, it erases the old system before the entire image is downloaded and verified. Back up your data first. `--allow-early-wipe` is accepted but optional; there is no RAM image-staging mode. `--hold 1` checks prerequisites without reinstalling.
+
+DDify 默认且仅使用磁盘暂存。确认目标磁盘后，脚本会在完整镜像下载和校验前擦除原系统，请先备份数据。`--allow-early-wipe` 可省略，不再提供 RAM 镜像暂存模式。`--hold 1` 仅检查前置条件，不执行重装。
+
 ```bash
 bash ddify.sh rocky     10
               almalinux 10
