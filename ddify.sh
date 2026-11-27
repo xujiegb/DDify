@@ -4646,8 +4646,8 @@ probe_remote_qcow_virtual_size() {
 preflight_image_geometry() {
     local disk_bytes image_bytes stage_safe
     disk_bytes=$(get_disk_size_bytes "$DISK")
-    { match_ere "$disk_bytes" '^[0-9]+$' && [ "$disk_bytes" -ge 10000000000 ]; } || \
-        error "Minimum supported target disk size is 10 GB (decimal)"
+    { match_ere "$disk_bytes" '^[0-9]+$' && [ "$disk_bytes" -ge 9499999744 ]; } || \
+        error "Minimum supported target disk size is 9.5 GB (rounded down to a 512-byte sector)"
     if image_is_freebsd_raw; then
         # XZ virtual length and both GPT copies are checked on the verified file.
         if [ "$ALLOW_EARLY_WIPE" = 1 ]; then calculate_disk_staging_budget; fi
