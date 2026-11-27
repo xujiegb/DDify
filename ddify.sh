@@ -544,8 +544,43 @@ get_disk_size_bytes() {
     diskinfo "$disk" 2>/dev/null | awk 'NR==1 {print $3; exit}'
 }
 
-# Rescue runs from RAM. A busy target is unexpected: never unmount or
-# deactivate unknown storage automatically, and never treat a failed query as empty.
+# Alpine's diskless initramfs leaves the apkovl boot medium mounted at
+# /media/<kernel device>. The overlay has already been extracted into RAM,
+# and the rescue runner has already relocated the modloop away from disk.
+# Release only this identified medium; unrelated mounts remain a hard error.
+rescue_boot_overlay_present() {
+    [ -f "$1/reinstall.apkovl.tar.gz" ] && [ ! -L "$1/reinstall.apkovl.tar.gz" ]
+}
+
+release_rescue_boot_media() {
+    local disk="$1" nodes mounts id name type target actual rootfs
+    nodes=$(lsblk -nr -o MAJ:MIN,KNAME,TYPE "$disk") || error "Cannot enumerate rescue boot devices"
+    [ -n "$nodes" ] || error "Empty rescue boot device inventory"
+    mounts=$(findmnt -krn -o MAJ:MIN,TARGET) || error "Cannot read rescue mount inventory"
+    cd /
+    while read -r id name type; do
+        [ "$type" = part ] || continue
+        match_ere "$id" '^[0-9]+:[0-9]+$' || error "Invalid rescue boot device number"
+        match_ere "$name" '^[A-Za-z0-9_.-]+$' || error "Invalid rescue boot device name"
+        target="/media/$name"
+        printf '%s\n' "$mounts" | awk -v id="$id" -v target="$target" '
+            $1 == id && $2 == target { found=1 } END { exit !found }
+        ' || continue
+        rescue_boot_overlay_present "$target" || continue
+        rootfs=$(findmnt -kn -o FSTYPE --mountpoint /) || error "Cannot identify rescue root filesystem"
+        case "$rootfs" in rootfs|ramfs|tmpfs) ;; *) error "Rescue root is not RAM-backed; refusing boot medium release" ;; esac
+        actual=$(findmnt -kn -o MAJ:MIN --mountpoint "$target") ||
+            error "Cannot verify rescue boot mount: $target"
+        [ "$actual" = "$id" ] || error "Rescue boot mount identity changed: $target"
+        info "Releasing Alpine boot medium: $target ($id)"
+        umount "$target" || error "Cannot release Alpine boot medium: $target"
+    done <<DDIFY_BOOT_DEVICES
+$nodes
+DDIFY_BOOT_DEVICES
+}
+
+# After releasing the known rescue boot medium, never deactivate unknown
+# storage automatically, and never treat a failed query as empty.
 assert_target_disk_idle() {
     local disk="$1" nodes mounts swaps id dev sys holder member member_id
     [ "$OS" = Linux ] || error "Disk commit must run in Linux rescue"
@@ -3608,6 +3643,7 @@ commit_disk_and_prepare_source() {
     planned_stage_boundary
     planned="$TEMP_STAGE_START_BYTES"
     confirm_destructive_write
+    release_rescue_boot_media "$DISK"
     assert_target_disk_idle "$DISK"
     prepare_fixed_temp_staging_partition
     [ "$TEMP_STAGE_START_BYTES" -ge "$planned" ] || error "Actual staging boundary is smaller than validated plan"
