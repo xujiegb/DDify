@@ -813,7 +813,72 @@ jobs:
               rocky|almalinux|fedora|debian|redhat) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
               freebsd) ssh_guest target 'test -c /dev/efi && layout=$(gpart show -l) && ! printf "%s\n" "$layout" | grep -w CIDATA' ;;
           esac
-          echo "PASS: $SOURCE_OS -> $TARGET_OS ${TARGET_VERSION:-custom} (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
+          # Independent final acceptance from the runner, through QEMU's TCP
+          # forwarding, after DDify and both guest boots have completed.
+          echo '[SSH] Verify installed guest from runner at 127.0.0.1:2222 -> guest port 22'
+          ssh_nonce=$(openssl rand -hex 16)
+          # A fresh TCP connection must authenticate with the NEW key only,
+          # run a privileged remote command, and round-trip an unpredictable
+          # value through the guest filesystem. Disable connection sharing.
+          if ! timeout 60s ssh -v -T -p 2222 -i "$WORK/target-key" \
+              -o IdentitiesOnly=yes -o BatchMode=yes -o PreferredAuthentications=publickey \
+              -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+              -o ControlMaster=no -o ControlPath=none \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+              root@127.0.0.1 sh -s -- "$ssh_nonce" \
+              > "$LOG/final-ssh.txt" 2> "$LOG/final-ssh-client.log" <<'SSH_ACCEPTANCE'
+          set -eu
+          PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH
+          export PATH
+          test "$(id -u)" = 0
+          test -n "$SSH_CONNECTION"
+          printf 'Remote OS: '; uname -s
+          printf 'Remote hostname: '; hostname
+          printf 'SSH connection: %s\n' "$SSH_CONNECTION"
+          case "$(uname -s)" in
+              FreeBSD)
+                  service sshd onestatus
+                  sockstat -46l
+                  ;;
+              Linux)
+                  if systemctl is-active --quiet sshd.service; then
+                      systemctl is-active sshd.service
+                  elif systemctl is-active --quiet ssh.service; then
+                      systemctl is-active ssh.service
+                  elif systemctl is-active --quiet ssh.socket; then
+                      systemctl is-active ssh.socket
+                  elif systemctl is-active --quiet sshd.socket; then
+                      systemctl is-active sshd.socket
+                  else
+                      echo 'No active OpenSSH service or socket' >&2
+                      exit 1
+                  fi
+                  ss -ltn
+                  ;;
+              *) exit 1 ;;
+          esac
+          test -f /etc/reinstall-web-port
+          test "$(cat /etc/reinstall-web-port)" = 18080
+          test ! -e /var/tmp/ddify-old-system-marker
+          probe=$(mktemp /var/tmp/ddify-ssh-probe.XXXXXX)
+          trap 'rm -f "$probe"' 0
+          printf '%s\n' "$1" > "$probe"
+          test "$(cat "$probe")" = "$1"
+          printf 'DDIFY_SSH_OK:%s\n' "$(cat "$probe")"
+          SSH_ACCEPTANCE
+          then
+              cat "$LOG/final-ssh.txt" "$LOG/final-ssh-client.log" || true
+              fail 'Final runner-to-guest SSH acceptance failed'
+          fi
+          cat "$LOG/final-ssh.txt"
+          grep -Fxq "DDIFY_SSH_OK:$ssh_nonce" "$LOG/final-ssh.txt" ||
+              fail 'Final SSH challenge response missing'
+          echo '[SSH] PASS: new key, root login, SSH service and remote read/write verified'
+          echo '[QEMU] Requesting normal target shutdown over SSH'
+          shutdown_vm target
+          echo '[QEMU] PASS: guest powered off and QEMU exited normally'
+          echo "PASS: $SOURCE_OS -> $TARGET_OS ${TARGET_VERSION:-custom} (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed, final SSH acceptance, clean shutdown)"
       - name: Upload logs even when installation fails
         if: always()
         uses: actions/upload-artifact@v4
