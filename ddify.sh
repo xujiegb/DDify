@@ -1338,13 +1338,25 @@ seed_runcmd() {
 
     echo
     echo "runcmd:"
+    # Alpine may create /etc/hostname without the target's SELinux context.
+    # Reapply the target policy after it is loaded, not the rescue policy.
+    cat <<'EOF'
+  - |
+      ddify_hostname_failed=0
+      if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != Disabled ]; then
+          if ! command -v restorecon >/dev/null 2>&1 ||
+             ! restorecon -F /etc/hostname /etc/cloud/cloud.cfg; then
+              ddify_hostname_failed=1
+          fi
+      fi
+EOF
     seed_runcmd_ssh_port "$os"
     seed_runcmd_expand_root "$os"
     seed_runcmd_frpc "$os" "$frpc_b64"
     cat <<'EOF'
   - |
-      [ "${ddify_ssh_failed:-0}" = 0 ] || {
-          echo "DDify: SSH setup failed; CIDATA retained for recovery" >&2
+      [ "${ddify_ssh_failed:-0}" = 0 ] && [ "${ddify_hostname_failed:-0}" = 0 ] || {
+          echo "DDify: SSH or hostname setup failed; CIDATA retained for recovery" >&2
           exit 1
       }
 EOF
@@ -1432,10 +1444,12 @@ write_nocloud_seed() {
     hostname=$(seed_hostname "$os") || error "Invalid target OS for hostname"
 
     mkdir -p "$(dirname "$meta")"
-    cat >"$meta" <<EOF
-instance-id: iid-$(date +%s)
-local-hostname: $hostname
-EOF
+    printf 'instance-id: iid-%s\n' "$(date +%s)" >"$meta"
+    # FreeBSD nuageinit consumes the metadata hostname itself. Linux already
+    # has a static /etc/hostname and does not need a competing early request.
+    if [ "$os" = freebsd ]; then
+        printf 'local-hostname: %s\n' "$hostname" >>"$meta"
+    fi
 
     { [ -z "${FRPC_PRESENT:-}" ] || [ -z "${FRPC_TOML:-}" ] || ! [ -f "$FRPC_TOML" ]; } || \
         frpc_b64=$(base64 <"$FRPC_TOML" | tr -d '\n')
@@ -4156,8 +4170,33 @@ linux_copy_set_hostname() {
         [ -f "$file" ] || error "Target hostname is not a regular file"
     fi
     (umask 022; printf '%s\n' "$name" >"$file") || error "Cannot write target hostname"
+    chmod 0644 "$file" || error "Cannot set target hostname permissions"
     [ "$(cat "$file")" = "$name" ] || error "Target hostname verification failed"
-    info "Prepared static hostname: $name"
+
+    # cloud-init 25.3 calls _maybe_set_hostname in init-local and init-net
+    # BEFORE consuming user-data. Set the option in the image's base config,
+    # retaining its inode and SELinux attributes; user-data alone is too late.
+    local cfg="$root/etc/cloud/cloud.cfg" tmp
+    [ -f "$cfg" ] && [ ! -L "$cfg" ] || error "Missing or symlinked target cloud.cfg"
+    tmp=$(mktemp "$INSTALL_TMPDIR/hostname-config.XXXXXX") || error "Cannot allocate cloud.cfg buffer"
+    if ! awk '
+        /^preserve_hostname[[:space:]]*:/ {
+            if (!seen++) print "preserve_hostname: true"
+            next
+        }
+        /^[.][.][.][[:space:]]*$/ {
+            if (!seen++) print "preserve_hostname: true"
+        }
+        {print}
+        END {if (!seen) print "preserve_hostname: true"}
+    ' "$cfg" >"$tmp"; then
+        rm -f "$tmp"
+        error "Cannot prepare early cloud-init hostname configuration"
+    fi
+    cat "$tmp" >"$cfg" || error "Cannot write target cloud.cfg"
+    rm -f "$tmp"
+    grep -Fxq 'preserve_hostname: true' "$cfg" || error "Early cloud-init hostname configuration not written"
+    info "Prepared static hostname and early cloud-init configuration: $name"
 }
 
 linux_copy_recreate_and_copy() {
