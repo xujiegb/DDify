@@ -4207,6 +4207,29 @@ linux_copy_recreate_and_copy() {
     umount "$LINUX_COPY_SRC_MNT" || error "Failed to unmount source root"
 }
 
+# This runs only after all source and destination mounts have been released.
+# Explicitly authorize the already-approved UUID rewrite, with no terminal
+# input. Do not interrupt a metadata rewrite merely because it is quiet.
+restore_btrfs_uuid() {
+    local target="$1" wanted="$2" actual
+    match_ere "$wanted" '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$' ||
+        error "Invalid source Btrfs UUID"
+    [ -b "$target" ] || error "Invalid Btrfs target block device: $target"
+    if findmnt -rn -S "$target" >/dev/null 2>&1; then
+        error "Refusing UUID rewrite on mounted Btrfs target: $target"
+    fi
+    actual=$(blkid -p -s UUID -o value "$target") || error "Cannot read target Btrfs UUID"
+    if [ "$(to_lower "$actual")" != "$(to_lower "$wanted")" ]; then
+        info "Btrfs UUID: $actual -> $wanted (noninteractive metadata rewrite)"
+        btrfstune -f -U "$wanted" "$target" </dev/null ||
+            error "Cannot restore source Btrfs UUID; inspect the offline filesystem before attempting recovery"
+    fi
+    actual=$(blkid -p -s UUID -o value "$target") || error "Cannot verify restored Btrfs UUID"
+    [ "$(to_lower "$actual")" = "$(to_lower "$wanted")" ] ||
+        error "Btrfs UUID verification failed: expected $wanted, got $actual"
+    info "Verified Btrfs UUID: $actual"
+}
+
 linux_copy_release_staging_and_grow() {
     local root="$LINUX_COPY_ROOT_MNT" target="$LINUX_COPY_ROOT_TARGET" vg
     # No mounted source devices may remain before NBD and staging are released.
@@ -4230,9 +4253,11 @@ linux_copy_release_staging_and_grow() {
             e2fsck -pf "$target" || { rc=$?; [ "$(( rc <= 1 ))" -ne 0 ] || error "Target ext4 fsck failed: $rc"; }
             resize2fs "$target" >/dev/null || error "Cannot expand copied Linux ext4 filesystem" ;;
         btrfs)
-            # Source NBD is now gone, so reusing its filesystem UUID is safe.
+            # Source NBD is gone and the destination is unmounted. Use the
+            # full UUID rewrite rather than introducing metadata_uuid, which
+            # could change the bootloader compatibility of the source image.
             info "Restoring source Btrfs UUID after disconnecting source image"
-            btrfstune -U "$LINUX_COPY_ROOT_UUID" "$target" || error "Cannot restore source Btrfs UUID"
+            restore_btrfs_uuid "$target" "$LINUX_COPY_ROOT_UUID"
             info "Expanding copied Btrfs filesystem"
             mount -t btrfs -o subvolid=5 "$target" "$root" || error "Cannot mount copied Btrfs for expansion"
             btrfs filesystem resize max "$root" >/dev/null || error "Cannot expand copied Btrfs"
