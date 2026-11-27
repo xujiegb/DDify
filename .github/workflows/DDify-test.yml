@@ -163,6 +163,12 @@ jobs:
           FRPC_TOML=""
           write_nocloud_seed rocky "$work/linux-meta-data" "$work/linux-user-data" 11111111-2222-3333-4444-555555555555
           grep -Fxq '#cloud-config' "$work/linux-user-data"
+          grep -Fxq 'hostname: ddify-rocky' "$work/linux-user-data"
+          grep -Fxq 'local-hostname: ddify-rocky' "$work/linux-meta-data"
+          write_nocloud_seed fedora "$work/fedora-meta-data" "$work/fedora-user-data" 11111111-2222-3333-4444-555555555555
+          grep -Fxq 'hostname: ddify-fedora' "$work/fedora-user-data"
+          grep -Fxq 'local-hostname: ddify-fedora' "$work/fedora-meta-data"
+          if grep -Eq '^(hostname|local-hostname): localhost$' "$work/fedora-user-data" "$work/fedora-meta-data"; then exit 1; fi
           grep -Fxq '  - name: root' "$work/linux-user-data"
           grep -Fq "$SSH_KEYS_ALL" "$work/linux-user-data"
           grep -Fxq '    lock_passwd: true' "$work/linux-user-data"
@@ -482,7 +488,12 @@ jobs:
                   ssh_guest "$key" 'cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt"
                   cat "$LOG/nuageinit-$tag.txt"
               else
-                  SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' > "$LOG/cloud-init-$tag.txt" || { cat "$LOG/cloud-init-$tag.txt"; fail 'Linux cloud-init failed'; }
+                  SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' > "$LOG/cloud-init-$tag.txt" || {
+                      cat "$LOG/cloud-init-$tag.txt"
+                      collect_guest "$key" "$tag-failed"
+                      ssh_guest "$key" 'hostname; cat /etc/hostname; hostnamectl status; journalctl -b -u systemd-hostnamed --no-pager' > "$LOG/$tag-hostname.txt" 2>&1 || true
+                      fail 'Linux cloud-init failed'
+                  }
                   cat "$LOG/cloud-init-$tag.txt"
               fi
           }
