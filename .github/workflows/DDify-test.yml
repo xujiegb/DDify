@@ -53,13 +53,11 @@ jobs:
               {target:"fedora",version:"44"},{target:"freebsd",version:"14"},
               {target:"freebsd",version:"15"},{target:"debian",version:"13"}]
               + (if $rhel then [{target:"redhat",version:""}] else [] end)) as $targets |
-            {include:([$sources[] as $source | $targets[] as $target | $source + $target + {mode:"early"}] +
-              [{source:"freebsd",target:"debian",version:"13",disk_bytes:"9499999744",disk_label:"9.5 GB",mode:"safe",ram_mib:"4096"},
-               {source:"freebsd",target:"freebsd",version:"15",disk_bytes:"9499999744",disk_label:"9.5 GB",mode:"safe",ram_mib:"4096"}])}
+            {include:[$sources[] as $source | $targets[] as $target | $source + $target]}
           ')
           printf 'cases=%s\n' "$cases" >> "$GITHUB_OUTPUT"
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ matrix.ram_mib || inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }}, ${{ matrix.mode }})
+    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }})
     needs: matrix
     runs-on: ubuntu-26.04
     timeout-minutes: 120
@@ -71,8 +69,7 @@ jobs:
       TARGET_OS: ${{ matrix.target }}
       TARGET_VERSION: ${{ matrix.version }}
       RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
-      VM_RAM_MIB: ${{ matrix.ram_mib || inputs.ram_mib || '720' }}
-      INSTALL_MODE: ${{ matrix.mode }}
+      VM_RAM_MIB: ${{ inputs.ram_mib || '720' }}
       VM_DISK_BYTES: ${{ matrix.disk_bytes }}
       SCRIPT_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       SCRIPT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -185,6 +182,8 @@ jobs:
           busybox ash -n ddify.sh
           sh ddify.sh --help
           busybox ash ddify.sh --help
+          # The legacy flag must still parse; the actual E2E commands omit it.
+          if grep -Eq 'ALLOW_EARLY_WIPE|prepare_ram_source' ddify.sh; then exit 1; fi
       - name: Exercise non-destructive shell helpers
         shell: sh
         run: |
@@ -232,11 +231,6 @@ jobs:
               stage_source_image() { events="$events download"; }
               validate_staged_source() { events="$events validate"; }
               events=''
-              ALLOW_EARLY_WIPE=0
-              commit_disk_and_prepare_source
-              [ "$events" = ' commit' ]
-              events=''
-              ALLOW_EARLY_WIPE=1
               commit_disk_and_prepare_source
               [ "$events" = ' commit download validate' ]
           )
@@ -374,7 +368,7 @@ jobs:
           esac
           WORK=${WORK:-$(mktemp -d)}
           RAM=${VM_RAM_MIB:-720}
-          case "$INSTALL_MODE:$RAM" in early:720|early:768|early:1024|safe:4096) ;; *) echo 'Unsupported CI RAM/mode profile' >&2; exit 2 ;; esac
+          case "$RAM" in 720|768|1024) ;; *) echo 'Unsupported CI RAM profile' >&2; exit 2 ;; esac
           DISK_BYTES=${VM_DISK_BYTES:-9499999744}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
@@ -775,6 +769,7 @@ jobs:
           set verify [format {if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum /root/ddify.sh | cut -d ' ' -f1); else actual=$(sha256 -q /root/ddify.sh); fi; test "$actual" = '%s' && sh -n /root/ddify.sh} $env(SCRIPT_SHA256)]
           checked $verify CHECKSUM 60
           checked [format {umask 077; printf '%%s\n' '%s' > /root/ddify-target.pub} $env(DDIFY_TARGET_KEY)] TARGET_KEY 60
+          # No staging flag: exercise the sole default disk-staging path.
           # The installer itself handles dependency setup and disk confirmation.
           # The OVMF firmware here is explicitly non-Secure-Boot.
           if {$env(TARGET_OS) eq "redhat"} {
@@ -782,9 +777,7 @@ jobs:
           } else {
               set target [format {%s %s} $env(TARGET_OS) $env(DDIFY_VERSION)]
           }
-          set mode ""
-          if {$env(INSTALL_MODE) eq "early"} { set mode "--allow-early-wipe" }
-          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s %s --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $mode $env(DDIFY_DISK)]
+          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $env(DDIFY_DISK)]
           send -- "$command\r"
           set timeout 1800
           expect {
@@ -971,7 +964,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}-${{ matrix.mode }}
+          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}
           path: ${{ runner.temp }}/ddify-qemu/logs/
           if-no-files-found: warn
           retention-days: 7
