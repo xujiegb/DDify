@@ -182,7 +182,7 @@ jobs:
           busybox ash -n ddify.sh
           sh ddify.sh --help
           busybox ash ddify.sh --help
-          # The legacy flag must still parse; the actual E2E commands omit it.
+          # Guard against reintroducing the removed staging modes.
           if grep -Eq 'ALLOW_EARLY_WIPE|prepare_ram_source' ddify.sh; then exit 1; fi
       - name: Exercise non-destructive shell helpers
         shell: sh
@@ -677,7 +677,7 @@ jobs:
               # login, pinned download, independent target SSH key and reboot.
               ssh_guest source 'if ! command -v curl >/dev/null 2>&1; then env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl; fi'
               ssh_guest source "curl -fL --retry 3 --proto '=https' --proto-redir '=https' -o /root/ddify-prep.sh '$SCRIPT_URL' && test \"\$(sha256 -q /root/ddify-prep.sh)\" = '$SCRIPT_SHA256' && sh -n /root/ddify-prep.sh"
-              ssh_guest source "umask 077; printf '%s\n' '$source_key' > /root/ddify-prep.pub; nohup sh -c 'printf \"1\\n\" | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify-prep.sh rocky 10 --allow-early-wipe --disk /dev/vtbd0 --ssh-key /root/ddify-prep.pub --web-port 18080' </dev/null >/root/ddify-prep.log 2>&1 &"
+              ssh_guest source "umask 077; printf '%s\n' '$source_key' > /root/ddify-prep.pub; nohup sh -c 'printf \"1\\n\" | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify-prep.sh rocky 10 --disk /dev/vtbd0 --ssh-key /root/ddify-prep.pub --web-port 18080' </dev/null >/root/ddify-prep.log 2>&1 &"
               SOURCE_OS=rocky
               prep_end=$(($(date +%s)+1800))
               until assert_os source rocky >/dev/null 2>&1; do
