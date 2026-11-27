@@ -163,6 +163,30 @@ jobs:
           grep -aFq 'search --no-floppy --fs-uuid --set=root AAAA-BBBB' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
           grep -aFq 'set prefix=($root)/REINSTALL/alpine/grub' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
           [ "$(tail -c 4 "$ALPINE_FREEBSD_GRUB_EFI_ABS" | od -An -tx1 | tr -d ' \n')" = 454e4400 ]
+          # Test native EFI parsing with the FreeBSD 15.1 inventory format.
+          # Stub the readers only; never access runner NVRAM.
+          efivar() {
+              printf '%s\n' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0000' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0001' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0002' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot000A' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-BootOrder' \
+                  '00000000-0000-0000-0000-000000000000-Boot0003'
+          }
+          efibootmgr() {
+              printf '%s\n' 'BootNext : 0004' 'BootCurrent: 0001' 'BootOrder  : 0001, 0000, 0002, 0003'
+          }
+          numbers=$(efi_boot_variable_numbers)
+          [ "$numbers" = "$(printf '0000\n0001\n0002\n000A')" ]
+          order=$(efi_bootorder)
+          [ "$order" = 0001,0000,0002,0003 ]
+          [ "$(efi_choose_boot_number "$numbers" "$order")" = 0004 ]
+          [ "$(efi_bootnext_number)" = 0004 ]
+          listing=$(printf '%s\n' ' Boot0004* Reinstall Alpine RAM' '+Boot0001* UEFI Misc Device')
+          efi_verify_created_entry "$listing" 0004 'Reinstall Alpine RAM'
+          if efi_verify_created_entry ' Boot0004  Reinstall Alpine RAM' 0004 'Reinstall Alpine RAM'; then exit 1; fi
+          if efi_verify_created_entry ' Boot0005* Reinstall Alpine RAM' 0004 'Reinstall Alpine RAM'; then exit 1; fi
           EOF
           sh "$helper_dir/test.sh"
           busybox ash "$helper_dir/test.sh"
