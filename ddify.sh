@@ -42,7 +42,6 @@ Options:
   --web-port PORT        Write /etc/reinstall-web-port through NoCloud
   --frpc-toml PATH|URL   Embed/download FRPC config
   --post-install-hook P  Run hook after image/NoCloud write
-  --hold 2               Install but do not reboot
 
 If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
@@ -1677,7 +1676,6 @@ write_install_plan() {
         plan_assignment FRPC_TOML "$FRPC_TOML"
         plan_assignment POST_INSTALL_HOOK "$POST_INSTALL_HOOK"
         plan_assignment AUTO_PASSWORD "$AUTO_PASSWORD"
-        plan_assignment HOLD "$HOLD"
         plan_assignment PLAN_EFI_UUID "$PLAN_EFI_UUID"
     } >"$path"
     chmod 0600 "$path" 2>/dev/null || true
@@ -1688,7 +1686,6 @@ load_install_plan() {
     [ -f "$plan" ] || error "Embedded install plan not found: $plan"
     # shellcheck disable=SC1090
     . "$plan"
-    case "${HOLD:-0}" in 0|2) ;; *) error "Unsupported hold value in saved install plan; refusing disk changes" ;; esac
     PASSWORD=""
     PASSWORD_HASH="${PASSWORD_HASH:-}"
     ! [ -f /etc/reinstall/frpc.toml ] || FRPC_TOML="/etc/reinstall/frpc.toml"
@@ -2283,10 +2280,6 @@ main() {
     echo "Installer phase finished with rc=$rc"
 
     if [ "$rc" -eq 0 ]; then
-        if grep -q '^HOLD=2$' "$PLAN_FILE" 2>/dev/null || grep -q "^HOLD='2'$" "$PLAN_FILE" 2>/dev/null; then
-            echo "HOLD=2 detected, not rebooting."
-            exit 0
-        fi
         sync
         sleep 2
         reboot -f || poweroff -f || true
@@ -2326,7 +2319,7 @@ else
 fi
 
 echo "[init] reinstall runner returned rc=$rc"
-echo "[init] entering normal Alpine init for troubleshooting/HOLD mode."
+echo "[init] entering normal Alpine init for troubleshooting."
 exec /sbin/init
 EOF
     chmod 0755 "$initfile"
@@ -4381,8 +4374,7 @@ do_install() {
 
     trap - EXIT
     cleanup_install_stage || error "Installation cleanup failed"
-    [ "$HOLD" != 2 ] || { info "--hold 2: installation complete; not rebooting"; return; }
-    info "Installation complete. Reboot when ready."
+    info "Installation complete. Rescue runner will reboot automatically."
 }
 
 # ----------------- main -----------------
@@ -4391,7 +4383,7 @@ reset_config() {
     TARGET_OS="" TARGET_VER="" IMG_URL="" DISK=""
     PASSWORD="" PASSWORD_HASH="" PASSWORD_TO_DISPLAY="" AUTO_PASSWORD=0
     SSH_KEYS_ALL="" SSH_KEY_ARGS="" SSH_PORT="" WEB_PORT="" FRPC_TOML="" POST_INSTALL_HOOK="" FRPC_PRESENT=""
-    HOLD=0 AUTO_YES=0 IMAGE_BUILTIN=0
+    AUTO_YES=0 IMAGE_BUILTIN=0
 }
 
 target_versions() {
@@ -4428,7 +4420,7 @@ parse_host_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage ;;
-            --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook|--hold)
+            --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook)
                 local opt="$1"; shift
                 [ $# -gt 0 ] || error "Need value for $opt"
                 case "$opt" in
@@ -4440,7 +4432,6 @@ parse_host_options() {
                     --web-port) is_port_valid "$1" || error "Invalid web port: $1"; WEB_PORT="$1" ;;
                     --frpc-toml) FRPC_TOML="$1" ;;
                     --post-install-hook) POST_INSTALL_HOOK="$1" ;;
-                    --hold) [ "$1" = 2 ] || error "--hold only accepts 2 (install without reboot)"; HOLD=2 ;;
                 esac
                 ;;
             --*=*)
@@ -4641,7 +4632,6 @@ parse_installer_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|--force) AUTO_YES=1 ;;
-            --hold) shift; [ "${1:-}" = 2 ] || error "--hold only accepts 2 (install without reboot)"; HOLD=2 ;;
             *) error "Unknown installer argument: $1" ;;
         esac
         shift
@@ -4653,12 +4643,10 @@ installer_main() {
     set -o pipefail
     reset_config
     parse_installer_options "$@"
-    local hold_override="$HOLD"
 
     [ "$(id -u)" -eq 0 ] || error "Must run as root"
     detect_os_arch
     load_install_plan
-    [ "$hold_override" = 0 ] || HOLD="$hold_override"
     ensure_dependencies
     validate_supported_install_mode
 
