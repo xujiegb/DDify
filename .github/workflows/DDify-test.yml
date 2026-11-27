@@ -47,8 +47,8 @@ jobs:
               echo 'RHEL custom-image cases not scheduled: no RHEL image URL supplied.'
           fi
           cases=$(jq -cn --argjson rhel "$rhel" '
-            [{source:"rocky",disk_bytes:"10737418240",disk_label:"10 GiB"},
-             {source:"freebsd",disk_bytes:"10000000000",disk_label:"10 GB"}] as $sources |
+            [{source:"rocky",disk_bytes:"9499999744",disk_label:"9.5 GB"},
+             {source:"freebsd",disk_bytes:"9499999744",disk_label:"9.5 GB"}] as $sources |
             ([{target:"rocky",version:"10"},{target:"almalinux",version:"10"},
               {target:"fedora",version:"44"},{target:"freebsd",version:"14"},
               {target:"freebsd",version:"15"},{target:"debian",version:"13"}]
@@ -328,7 +328,7 @@ jobs:
           WORK=${WORK:-$(mktemp -d)}
           RAM=${VM_RAM_MIB:-720}
           case "$RAM" in 720|768|1024) ;; *) echo 'Unsupported CI RAM profile' >&2; exit 2 ;; esac
-          DISK_BYTES=${VM_DISK_BYTES:-10000000000}
+          DISK_BYTES=${VM_DISK_BYTES:-9499999744}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
           mkdir -p "$WORK/logs"
@@ -394,10 +394,12 @@ jobs:
           trap 'exit 143' TERM
           fail() { echo "ERROR: $*" >&2; exit 1; }
           fetch() { curl --fail --location --retry 4 --retry-delay 3 --connect-timeout 30 --max-time 1800 --proto '=https' --proto-redir '=https' -o "$2.part" "$1" && mv "$2.part" "$2"; }
-          case "$SOURCE_OS" in
-              rocky) url=https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2 ;;
-              freebsd) url=https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz ;;
-          esac
+          # The official Rocky cloud disk is 10 GiB and uses XFS. Do not
+          # truncate it. Provision a Rocky source on the same real 9.5 GB
+          # disk from the official FreeBSD image before the measured test.
+          REQUESTED_SOURCE_OS=$SOURCE_OS
+          SOURCE_OS=freebsd
+          url=https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz
           name=${url##*/}
           fetch "$url" "$name"
           if [ "$SOURCE_OS" = rocky ]; then
@@ -412,9 +414,8 @@ jobs:
           qemu-img check "$name"
           mv "$name" disk.qcow2
           # The source is the same disk later reinstalled by DDify.
-          # Rocky GenericCloud has a 10 GiB virtual disk; retain it intact.
-          # FreeBSD cases still test the smaller decimal 10 GB capacity.
           # Never shrink an official source filesystem blindly to fit the VPS.
+          # 9,499,999,744 bytes is the largest 512-byte multiple <= 9.5 GB.
           source_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
           [ "$source_bytes" -le "$DISK_BYTES" ] || fail "Source virtual disk exceeds requested $DISK_BYTES bytes: $source_bytes"
           if [ "$source_bytes" -lt "$DISK_BYTES" ]; then qemu-img resize disk.qcow2 "$DISK_BYTES"; fi
@@ -623,13 +624,44 @@ jobs:
           start_vm seed
           wait_os source "$SOURCE_OS" 900
           cloud_wait source
-          ssh_guest source 'touch /var/tmp/ddify-old-system-marker'
-          collect_guest source source
           shutdown_vm source
           # No external CIDATA medium may survive into rescue/target boot.
           rm -f seed.iso
           start_vm
           wait_os source "$SOURCE_OS" 900
+          if [ "$REQUESTED_SOURCE_OS" = rocky ]; then
+              echo '[source provisioning] Install official Rocky 10 on the exact 9.5 GB disk'
+              # Separate provisioning step, not counted as the measured test.
+              # The actual Rocky -> target test below still uses serial root
+              # login, pinned download, independent target SSH key and reboot.
+              ssh_guest source 'if ! command -v curl >/dev/null 2>&1; then env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl; fi'
+              ssh_guest source "curl -fL --retry 3 --proto '=https' --proto-redir '=https' -o /root/ddify-prep.sh '$SCRIPT_URL' && test \"\$(sha256 -q /root/ddify-prep.sh)\" = '$SCRIPT_SHA256' && sh -n /root/ddify-prep.sh"
+              ssh_guest source "umask 077; printf '%s\n' '$source_key' > /root/ddify-prep.pub; nohup sh -c 'printf \"1\\n\" | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify-prep.sh rocky 10 --allow-early-wipe --disk /dev/vtbd0 --ssh-key /root/ddify-prep.pub --web-port 18080' </dev/null >/root/ddify-prep.log 2>&1 &"
+              SOURCE_OS=rocky
+              prep_end=$(($(date +%s)+1800))
+              until assert_os source rocky >/dev/null 2>&1; do
+                  kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped while provisioning Rocky source'
+                  if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$RAW_SERIAL"; then
+                      fail 'Rocky source provisioning installer failed'
+                  fi
+                  [ "$(date +%s)" -lt "$prep_end" ] || fail 'Rocky source provisioning timed out'
+                  sleep 10
+              done
+              cloud_wait source provisioned-rocky
+              # Use the existing ephemeral console password only for the
+              # source root login. Leave SSH password authentication disabled.
+              ssh_guest source "printf '%s\n' 'root:$root_hash' | chpasswd -e && systemctl enable --now serial-getty@ttyS0.service && rm -f /etc/reinstall-web-port"
+              ssh_guest source "test \"\$(blockdev --getsize64 /dev/vda)\" = '$DISK_BYTES'"
+              collect_guest source provisioned-rocky
+              shutdown_vm source
+              start_vm
+              wait_os source rocky 900
+              echo '[source provisioning] PASS: Rocky boots on exact 9.5 GB disk'
+          fi
+          SOURCE_OS=$REQUESTED_SOURCE_OS
+          export SOURCE_OS
+          ssh_guest source 'touch /var/tmp/ddify-old-system-marker'
+          collect_guest source source
           case "$SOURCE_OS" in rocky) DDIFY_DISK=/dev/vda;; freebsd) DDIFY_DISK=/dev/vtbd0;; esac
           DDIFY_VERSION=${TARGET_VERSION:-}
           DDIFY_TARGET_KEY=$(awk '{print $1" "$2}' target-key.pub)
