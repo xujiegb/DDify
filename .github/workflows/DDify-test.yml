@@ -167,6 +167,19 @@ jobs:
           grep -Fxq 'local-hostname: ddify-rocky' "$work/linux-meta-data"
           write_nocloud_seed fedora "$work/fedora-meta-data" "$work/fedora-user-data" 11111111-2222-3333-4444-555555555555
           grep -Fxq 'hostname: ddify-fedora' "$work/fedora-user-data"
+          grep -Fxq 'preserve_hostname: true' "$work/fedora-user-data"
+          grep -Fxq 'preserve_hostname: true' "$work/linux-user-data"
+          mkdir -p "$work/hostname-root/etc"
+          printf '%s\n' localhost > "$work/hostname-root/etc/hostname"
+          linux_copy_set_hostname "$work/hostname-root" fedora
+          [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-fedora ]
+          rm "$work/hostname-root/etc/hostname"
+          linux_copy_set_hostname "$work/hostname-root" debian
+          [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-debian ]
+          rm "$work/hostname-root/etc/hostname"
+          ln -s "$work/plan" "$work/hostname-root/etc/hostname"
+          if (linux_copy_set_hostname "$work/hostname-root" fedora); then exit 1; fi
+          [ -L "$work/hostname-root/etc/hostname" ]
           grep -Fxq 'local-hostname: ddify-fedora' "$work/fedora-meta-data"
           if grep -Eq '^(hostname|local-hostname): localhost$' "$work/fedora-user-data" "$work/fedora-meta-data"; then exit 1; fi
           grep -Fxq '  - name: root' "$work/linux-user-data"
@@ -645,7 +658,13 @@ jobs:
               fi
               sleep 10
           done
+          verify_target_hostname() {
+              [ "$TARGET_OS" != freebsd ] || return 0
+              ssh_guest target "test \"\$(hostname)\" = 'ddify-$TARGET_OS' && test \"\$(cat /etc/hostname)\" = 'ddify-$TARGET_OS'" ||
+                  fail 'Target static hostname not persistent'
+          }
           cloud_wait target first-boot
+          verify_target_hostname
           if [ "$TARGET_OS" = freebsd ]; then ssh_guest target 'grep -Fq "DDify: FreeBSD firstboot completed" /var/log/ddify-firstboot.log'; fi
           collect_guest target first-boot
           first=$(boot_id target)
@@ -660,6 +679,7 @@ jobs:
           done
           assert_os target "$TARGET_OS"
           cloud_wait target second-boot
+          verify_target_hostname
           ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port)" = 18080 && test "$(id -u)" = 0'
           if ssh_guest source true >/dev/null 2>&1; then fail 'Old source SSH key still grants root access'; fi
           collect_guest target second-boot
