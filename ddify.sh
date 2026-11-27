@@ -4022,6 +4022,52 @@ linux_copy_ensure_efi_fallback() {
 }
 
 
+# rsync's progress2 emits a carriage-return update for nearly every small
+# file. On a serial console that floods both the UART and RAM-backed log.
+# Keep transfer options intact, report bounded periodic resource/IO samples,
+# and fail on prolonged rsync protocol inactivity instead of waiting forever.
+linux_copy_rsync() (
+    label="$1"
+    shift
+    rsync --timeout=300 --info=stats2 "$@" &
+    copy_pid=$!
+    reporter_pid=
+    cleanup_copy_reporter() {
+        if [ -n "$reporter_pid" ]; then
+            kill "$reporter_pid" 2>/dev/null || true
+            wait "$reporter_pid" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_copy_reporter 0
+    trap 'kill "$copy_pid" 2>/dev/null || true; exit 130' INT
+    trap 'kill "$copy_pid" 2>/dev/null || true; exit 143' TERM
+    (
+        while kill -0 "$copy_pid" 2>/dev/null; do
+            mem=$(awk '/^(MemAvailable|SwapFree|Dirty|Writeback):/ {printf "%s%sKiB ",$1,$2}' /proc/meminfo)
+            proc=$(awk '/^(State|VmRSS|VmSwap):/ {printf "%s%s ",$1,$2}' "/proc/$copy_pid/status" 2>/dev/null || true)
+            io=$(awk -v disk="${DISK##*/}" '
+                $3==disk {printf "disk_read_sectors=%s disk_written_sectors=%s pending_io=%s",$6,$10,$12}
+            ' /proc/diskstats)
+            printf '[copy] %s: %s%s%s\n' "$label" "$mem" "$proc" "$io"
+            sleep 15
+        done
+    ) &
+    reporter_pid=$!
+    if wait "$copy_pid"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    cleanup_copy_reporter
+    reporter_pid=
+    if [ "$rc" -ne 0 ]; then
+        warn "rsync failed for $label (rc=$rc); recent kernel messages follow"
+        dmesg | tail -n 40 >&2 || true
+        exit "$rc"
+    fi
+    info "Copy complete: $label"
+)
+
 linux_copy_btrfs_subvolumes() {
     local dest_root="$1" source_top="$INSTALL_TMPDIR/linux-btrfs-source-top" \
         dest_top="$INSTALL_TMPDIR/linux-btrfs-target-top" subvol path mp opts root_subvol="" line id default_subvol=""
@@ -4044,9 +4090,10 @@ DDIFY_SUBVOLS
     done
     for path in $subvols; do
         info "Copying Btrfs subvolume: $path"
-        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+        linux_copy_rsync "Btrfs $path" -aHAXS --numeric-ids --one-file-system \
             "$source_top/$path/" "$dest_top/$path/" || error "Could not copy Btrfs subvolume: $path"
     done
+    info "All Btrfs subvolumes copied; restoring default subvolume and mount layout"
     default_subvol=$(btrfs subvolume get-default "$source_top" | sed -n 's/^.* path //p' | head -n1)
     if { [ -n "$default_subvol" ] && [ "$default_subvol" != '<FS_TREE>' ]; }; then
         id=$(btrfs subvolume list "$dest_top" | awk -v name="$default_subvol" '$0 ~ " path " name "$" {print $2; exit}')
@@ -4123,21 +4170,21 @@ linux_copy_recreate_and_copy() {
     else
         linux_copy_mount_target "$LINUX_COPY_ROOT_TARGET" "$root" "$LINUX_COPY_ROOT_TYPE"
         info "Copying Linux root filesystem, including hidden files, xattrs and ACLs"
-        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+        linux_copy_rsync "Linux root" -aHAXS --numeric-ids --one-file-system \
             "$LINUX_COPY_SRC_MNT/" "$root/" || error "Failed to copy Linux root filesystem"
     fi
     if [ -n "$boot_dev" ]; then
         linux_copy_source_mount "$LINUX_COPY_SRC_BOOT" "$src_boot_mnt" "$src_boot_fs"
         linux_copy_mount_target "$boot_dev" "$root/boot" "$src_boot_fs"
         info "Copying Linux /boot"
-        rsync -aHAXS --numeric-ids --one-file-system --info=progress2 \
+        linux_copy_rsync "Linux /boot" -aHAXS --numeric-ids --one-file-system \
             "$src_boot_mnt/" "$root/boot/" || error "Failed to copy Linux /boot"
     fi
     linux_copy_source_mount "$LINUX_COPY_SRC_EFI" "$src_efi_mnt" vfat
     mkdir -p "$root/boot/efi"
     mount -t vfat "$efi_dev" "$root/boot/efi" || error "Failed to mount target EFI partition"
     info "Copying EFI bootloader and metadata"
-    rsync -rt --modify-window=2 --info=progress2 "$src_efi_mnt/" "$root/boot/efi/" || error "Failed to copy EFI files"
+    linux_copy_rsync "EFI" -rt --modify-window=2 "$src_efi_mnt/" "$root/boot/efi/" || error "Failed to copy EFI files"
     [ -f "$root/etc/os-release" ] || error "Copied Linux root is missing /etc/os-release"
     { [ -e "$root/bin/sh" ] || [ -e "$root/usr/bin/sh" ]; } || error "Copied Linux root has no shell"
     linux_copy_repair_boot_configs
@@ -4184,7 +4231,9 @@ linux_copy_release_staging_and_grow() {
             resize2fs "$target" >/dev/null || error "Cannot expand copied Linux ext4 filesystem" ;;
         btrfs)
             # Source NBD is now gone, so reusing its filesystem UUID is safe.
+            info "Restoring source Btrfs UUID after disconnecting source image"
             btrfstune -U "$LINUX_COPY_ROOT_UUID" "$target" || error "Cannot restore source Btrfs UUID"
+            info "Expanding copied Btrfs filesystem"
             mount -t btrfs -o subvolid=5 "$target" "$root" || error "Cannot mount copied Btrfs for expansion"
             btrfs filesystem resize max "$root" >/dev/null || error "Cannot expand copied Btrfs"
             umount "$root" || error "Cannot unmount copied Btrfs" ;;
