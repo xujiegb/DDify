@@ -40,7 +40,7 @@ ui_init() {
         UI_TTY=1
         [ -n "${NO_COLOR:-}" ] || UI_COLOR=1
         cols=$(stty size 2>/dev/null | awk '{print $2}') || cols=""
-        if match_ere "$cols" '^[0-9]{1,4}$' && [ "$cols" -ge 40 ]; then
+        if match_ere "$cols" '^[0-9]{1,4}$' && [ "$cols" -ge 24 ]; then
             UI_WIDTH="$cols"
             [ "$UI_WIDTH" -le 76 ] || UI_WIDTH=76
         fi
@@ -69,7 +69,9 @@ ui_exit() {
 }
 
 ui_rule() {
-    printf '%*s\n' "$UI_WIDTH" '' | tr ' ' '-' >&2
+    printf '+' >&2
+    printf '%*s' "$((UI_WIDTH - 2))" '' | tr ' ' '-' >&2
+    printf '+\n' >&2
 }
 
 ui_heading() {
@@ -116,6 +118,8 @@ ui_task() {
         # Keep execution in the current shell so assignments survive.
         # Do not call in an if/|| context: retain normal errexit behavior.
         "$@" >"$UI_ACTIVE_LOG" 2>&1
+        # Surface safety warnings even when verbose successful task output is hidden.
+        awk '/^WARN: / {print "  [!] " substr($0,7)}' "$UI_ACTIVE_LOG" >&2
         UI_ACTIVE_LOG=""
     else
         "$@"
@@ -2818,7 +2822,7 @@ prepare_and_boot_alpine_ram() {
             info "Rebooting into one-time GRUB entry: $ALPINE_ENTRY_TITLE"
             sync
             sleep 2
-            reboot
+            reboot || error "Could not reboot into Alpine rescue"
             ;;
         FreeBSD)
             ui_task "Build FreeBSD GRUB EFI loader" grub-efi build_freebsd_grub_efi
@@ -2828,7 +2832,7 @@ prepare_and_boot_alpine_ram() {
             info "Rebooting into one-time UEFI entry: $ALPINE_ENTRY_TITLE"
             sync
             sleep 2
-            shutdown -r now
+            shutdown -r now || error "Could not reboot into Alpine rescue"
             ;;
         *)
             error "Unsupported bootstrap host: $OS"
