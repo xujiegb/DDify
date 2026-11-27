@@ -199,6 +199,101 @@ jobs:
           work=$(mktemp -d "$DDIFY_HELPER_DIR/run.XXXXXX")
           # TUI helpers: plain output for automation; no real disk or reboot.
           (
+              # Every non-empty CLI preset must bypass its interactive prompt.
+              reset_config
+              UI_TTY=1 UI_COLOR=0
+              ui_task() { shift 2; "$@"; }
+              ui_prompt() { error "Unexpected prompt for preset: $1"; }
+              prompt_secret() { error "Unexpected password prompt"; }
+              prepare_target_disk() { :; }
+              validate_target_capacity() { :; }
+              auto_detect_disk() { error "Unexpected disk auto-detection"; }
+              get_default_image_url() { error "Unexpected default image selection"; }
+              parse_ssh_key() { printf '%s\n' "$1"; }
+              hash_password() { printf '%s\n' 'mock-hash'; }
+              : >"$work/frpc.toml"
+              : >"$work/hook.sh"
+              parse_host_request rocky 10 --disk=/dev/mock --img 'https://example.test/image.qcow2?secret=hidden' \
+                  --passwd 'test-secret-not-for-display' --public-key 'key-one' --ssh-key 'key-two' \
+                  --ssh-port=2222 --web-port 8080 --frpc-toml "$work/frpc.toml" --post-install-hook "$work/hook.sh"
+              {
+                  ui_target_settings
+                  ui_image_settings
+                  ui_disk_settings
+                  ui_auth_settings
+                  ui_optional_settings
+              } 2>"$work/ui-presets"
+              [ "$TARGET_OS:$TARGET_VER:$DISK:$SSH_PORT:$WEB_PORT" = rocky:10:/dev/mock:2222:8080 ]
+              [ "$PASSWORD_HASH" = mock-hash ]
+              [ -z "$PASSWORD" ]
+              [ "$(printf '%s\n' "$SSH_KEYS_ALL" | wc -l | tr -d ' ')" -eq 2 ]
+              grep -Fq 'rocky [CLI - preset]' "$work/ui-presets"
+              grep -Fq '/dev/mock [CLI - preset]' "$work/ui-presets"
+              grep -Fq '2222 [CLI - preset]' "$work/ui-presets"
+              grep -Fq '8080 [CLI - preset]' "$work/ui-presets"
+              grep -Fq '2 supplied; validating [CLI - preset]' "$work/ui-presets"
+              grep -Fq 'Configured (hidden) [CLI - preset]' "$work/ui-presets"
+              if grep -Eq 'test-secret-not-for-display|secret=hidden|key-one|key-two' "$work/ui-presets"; then exit 1; fi
+          )
+          (
+              # Partial parameters prompt only for absent fields.
+              reset_config
+              UI_TTY=1 UI_COLOR=0
+              ui_task() { shift 2; "$@"; }
+              prepare_target_disk() { :; }
+              validate_target_capacity() { :; }
+              auto_detect_disk() { error "Unexpected disk auto-detection"; }
+              parse_ssh_key() { printf '%s\n' "$1"; }
+              prompt_secret() { error "Unexpected password prompt with key preset"; }
+              ui_prompt() {
+                  case "$1" in
+                      'Version (14 15)') printf '15' ;;
+                      'Custom HTTPS image URL (Enter = official image)') printf 'https://example.test/custom.qcow2' ;;
+                      'SSH port (Enter = 22)') printf '2200' ;;
+                      'Web port file (Enter = none)'|'FRPC TOML path or HTTPS URL (Enter = none)'|'Post-install shell script path (Enter = none)') : ;;
+                      *) error "Unexpected prompt: $1" ;;
+                  esac
+              }
+              parse_host_request freebsd --disk /dev/mock --ssh-key 'mock-key'
+              {
+                  ui_target_settings
+                  ui_image_settings
+                  ui_disk_settings
+                  ui_auth_settings
+                  ui_optional_settings
+              } 2>"$work/ui-partial"
+              [ "$TARGET_VER:$DISK:$SSH_PORT" = 15:/dev/mock:2200 ]
+              [ "$IMG_URL" = https://example.test/custom.qcow2 ]
+              grep -Fq '15 [TUI]' "$work/ui-partial"
+              grep -Fq '2200 [TUI]' "$work/ui-partial"
+              grep -Fq '/dev/mock [CLI - preset]' "$work/ui-partial"
+              grep -Fq 'None [Default]' "$work/ui-partial"
+          )
+          (
+              # Automation must not consume the final confirmation as a settings answer.
+              reset_config
+              UI_TTY=0 UI_COLOR=0
+              ui_task() { shift 2; "$@"; }
+              ui_prompt() { error "Unexpected non-interactive prompt"; }
+              prompt_secret() { error "Unexpected password prompt"; }
+              prepare_target_disk() { :; }
+              validate_target_capacity() { :; }
+              parse_ssh_key() { printf '%s\n' "$1"; }
+              get_default_image_url() { printf 'https://example.test/official.qcow2'; }
+              parse_host_request debian 13 --disk /dev/mock --ssh-key 'mock-key'
+              ui_target_settings
+              ui_image_settings
+              ui_disk_settings
+              ui_auth_settings
+              ui_optional_settings
+              [ "$IMAGE_BUILTIN" = 1 ]
+              [ -z "$SSH_PORT$WEB_PORT$FRPC_TOML$POST_INSTALL_HOOK" ]
+              IFS= read -r confirmation
+              [ "$confirmation" = 1 ]
+          ) <<'DDIFY_CONFIRM'
+          1
+          DDIFY_CONFIRM
+          (
               UI_TTY=0 UI_COLOR=0 UI_WIDTH=40
               state=before
               task() { state=after; warn 'test warning'; }
