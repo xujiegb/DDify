@@ -567,11 +567,15 @@ release_rescue_boot_media() {
             $1 == id && $2 == target { found=1 } END { exit !found }
         ' || continue
         rescue_boot_overlay_present "$target" || continue
-        rootfs=$(findmnt -kn -o FSTYPE --mountpoint /) || error "Cannot identify rescue root filesystem"
+        rootfs=$(findmnt -krn -o FSTYPE --mountpoint /) || error "Cannot identify rescue root filesystem"
         case "$rootfs" in rootfs|ramfs|tmpfs) ;; *) error "Rescue root is not RAM-backed; refusing boot medium release" ;; esac
-        actual=$(findmnt -kn -o MAJ:MIN --mountpoint "$target") ||
+        actual=$(findmnt -krn -o MAJ:MIN --mountpoint "$target") ||
             error "Cannot verify rescue boot mount: $target"
-        [ "$actual" = "$id" ] || error "Rescue boot mount identity changed: $target"
+        # MAJ:MIN is a numeric column; normalize alignment whitespace but
+        # reject multiple records, malformed values and different devices.
+        actual=$(printf '%s\n' "$actual" | awk 'NF == 1 && $1 ~ /^[0-9]+:[0-9]+$/ {value=$1; n++} END {if (NR != 1 || n != 1) exit 1; print value}') ||
+            error "Invalid rescue boot mount device number: $target"
+        [ "$actual" = "$id" ] || error "Rescue boot mount identity changed: $target (expected $id, got $actual)"
         info "Releasing Alpine boot medium: $target ($id)"
         umount "$target" || error "Cannot release Alpine boot medium: $target"
     done <<DDIFY_BOOT_DEVICES
@@ -612,7 +616,8 @@ assert_target_disk_idle() {
                 error "Target disk has active swap: $dev"
             fi
         elif [ -f "$dev" ]; then
-            id=$(findmnt -kn -o MAJ:MIN --target "$dev") || error "Cannot identify swap file filesystem"
+            id=$(findmnt -krn -o MAJ:MIN --target "$dev") || error "Cannot identify swap file filesystem"
+            match_ere "$id" '^[0-9]+:[0-9]+$' || error "Invalid swap file filesystem device number: $dev"
             if printf '%s\n' "$nodes" | grep -Fx "$id" >/dev/null; then
                 error "Target disk contains active swap file: $dev"
             fi
