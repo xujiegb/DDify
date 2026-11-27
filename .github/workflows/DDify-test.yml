@@ -199,6 +199,25 @@ jobs:
           work=$(mktemp -d "$DDIFY_HELPER_DIR/run.XXXXXX")
           # TUI helpers: plain output for automation; no real disk or reboot.
           (
+              # Auto-select the system disk in an interactive terminal, without a disk prompt.
+              reset_config
+              UI_TTY=1 UI_COLOR=0
+              ui_task() { shift 2; "$@"; }
+              ui_prompt() { error "Unexpected disk prompt"; }
+              auto_detect_disk() {
+                  DISK=/dev/mock-system
+                  AUTO_DETECTED_DISK="$DISK"
+                  AUTO_DETECT_REASON='current / resolves to this disk'
+                  DISK_AUTO_SELECTED=1
+              }
+              prepare_target_disk() { [ "$DISK" = /dev/mock-system ]; }
+              validate_target_capacity() { [ "$DISK" = /dev/mock-system ]; }
+              ui_disk_settings 2>"$work/ui-auto-disk"
+              [ "$DISK_AUTO_SELECTED" = 1 ]
+              [ "$DISK" = /dev/mock-system ]
+              grep -Fq '/dev/mock-system [Auto-detected]' "$work/ui-auto-disk"
+          )
+          (
               # Every non-empty CLI preset must bypass its interactive prompt.
               reset_config
               UI_TTY=1 UI_COLOR=0
