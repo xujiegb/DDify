@@ -1,6 +1,18 @@
 name: DDify Test
 on:
   workflow_dispatch:
+    inputs:
+      ram_mib:
+        description: 'Guest RAM (MiB); default 720 for minimum-memory testing'
+        required: false
+        type: choice
+        default: '720'
+        options: ['720', '768', '1024']
+      rhel_image_url:
+        description: 'Optional public HTTPS RHEL QCOW2 URL (no credentials or query tokens)'
+        required: false
+        type: string
+        default: ''
   pull_request:
     paths: ['ddify.sh', '.github/workflows/DDify-test.yml']
   push:
@@ -9,92 +21,442 @@ on:
 permissions:
   contents: read
 jobs:
+  matrix:
+    name: Select source and target systems
+    runs-on: ubuntu-26.04
+    outputs:
+      cases: ${{ steps.cases.outputs.cases }}
+    steps:
+      - id: cases
+        shell: sh
+        env:
+          RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
+        run: |
+          set -eu
+          if [ -n "$RHEL_IMAGE_URL" ]; then
+              case "$RHEL_IMAGE_URL" in
+                  *[!A-Za-z0-9._~:/%+-]*) echo 'Invalid character in RHEL URL' >&2; exit 1 ;;
+              esac
+              # URLs are sent as literal arguments to the serial root shell.
+              # Never pass signed URLs, tokens, or embedded credentials into logs.
+              printf '%s\n' "$RHEL_IMAGE_URL" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/%+-]+\.qcow2$' ||
+                  { echo 'RHEL image must be a public HTTPS QCOW2 URL without query parameters' >&2; exit 1; }
+              rhel=true
+          else
+              rhel=false
+              echo 'RHEL custom-image cases not scheduled: no RHEL image URL supplied.'
+          fi
+          cases=$(jq -cn --argjson rhel "$rhel" '
+            [{source:"rocky",disk_bytes:"9499999744",disk_label:"9.5 GB"},
+             {source:"freebsd",disk_bytes:"9499999744",disk_label:"9.5 GB"}] as $sources |
+            ([{target:"rocky",version:"10"},{target:"almalinux",version:"10"},
+              {target:"fedora",version:"44"},{target:"freebsd",version:"14"},
+              {target:"freebsd",version:"15"},{target:"debian",version:"13"}]
+              + (if $rhel then [{target:"redhat",version:""}] else [] end)) as $targets |
+            {include:[$sources[] as $source | $targets[] as $target | $source + $target]}
+          ')
+          printf 'cases=%s\n' "$cases" >> "$GITHUB_OUTPUT"
   reinstall:
-    name: ${{ matrix.source }} -> ${{ matrix.target }} (UEFI amd64)
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.source }} -> ${{ matrix.target }} ${{ matrix.version }} (${{ inputs.ram_mib || '720' }} MiB RAM, ${{ matrix.disk_label }})
+    needs: matrix
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        source: [rocky, freebsd]
-        target: [rocky, freebsd]
+      matrix: ${{ fromJSON(needs.matrix.outputs.cases) }}
     env:
       SOURCE_OS: ${{ matrix.source }}
       TARGET_OS: ${{ matrix.target }}
-      VM_RAM_MIB: '5120'
+      TARGET_VERSION: ${{ matrix.version }}
+      RHEL_IMAGE_URL: ${{ inputs.rhel_image_url || '' }}
+      VM_RAM_MIB: ${{ inputs.ram_mib || '720' }}
+      VM_DISK_BYTES: ${{ matrix.disk_bytes }}
+      SCRIPT_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      SCRIPT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install QEMU and test tools
+          repository: ${{ env.SCRIPT_REPO }}
+          ref: ${{ env.SCRIPT_REF }}
+      - name: Install Ubuntu 26.04 amd64v3 QEMU and test tools
+        shell: sh
         run: |
+          set -eu
+          test "$(dpkg --print-architecture)" = amd64
+          /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported' ||
+              { echo 'Runner CPU does not support x86-64-v3' >&2; exit 1; }
+          printf '%s\n' 'APT::Architecture-Variants "amd64v3";' |
+              sudo tee /etc/apt/apt.conf.d/99enable-amd64v3
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
+          # Reinstall already-present tools as well, so preinstalled baseline
+          # packages do not silently bypass selection of optimized variants.
+          tools='qemu-system-x86 qemu-utils ovmf cloud-image-utils openssh-client openssl xz-utils curl jq busybox expect socat'
+          sudo apt-get install -y --reinstall --no-install-recommends $tools
+          apt-config dump | grep -F 'amd64v3'
+          echo 'Installed test-tool architecture variants:'
+          dpkg-query -W -f='${Package}\t${Architecture}\t${Architecture-Variant}\n' $tools
+          # QEMU is the main workload; require actual optimized executables,
+          # not merely an APT configuration or a v3-capable guest CPU.
+          for pkg in qemu-system-x86 qemu-utils; do
+              variant=$(dpkg-query -W -f='${Architecture-Variant}' "$pkg")
+              [ "$variant" = amd64v3 ] ||
+                  { echo "$pkg installed variant: ${variant:-baseline}; expected amd64v3" >&2; exit 1; }
+          done
+          if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           df -h "$RUNNER_TEMP"
           free -h
-      - name: Shell syntax
-        run: bash -n ddify.sh
-      - name: Reinstall and verify two boots
-        shell: bash
+      - name: Prepare reboot-safe OVMF firmware
+        shell: sh
+        run: |
+          set -eu
+          # LP #2175541: resolute's edk2 2025.11 can leave the IGVM parameter
+          # page available to the guest, then hang during a warm reboot.
+          # Upstream e4f99a85545f reserves the page. The 26.10 package
+          # includes the newer edk2 2026.05. Extract only its firmware data;
+          # keep the 26.04 runner and amd64v3 QEMU packages untouched.
+          fw="$RUNNER_TEMP/ddify-ovmf"
+          mkdir -p "$fw/lists/partial" "$fw/root"
+          cd "$fw"
+          printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu stonking main' > sources.list
+          printf '%s\n' '#clear APT::Architecture-Variants;' > apt.conf
+          firmware_apt() {
+              apt-get -c "$fw/apt.conf" \
+                  -o "Dir::Etc::sourcelist=$fw/sources.list" \
+                  -o 'Dir::Etc::sourceparts=-' \
+                  -o "Dir::State::lists=$fw/lists" \
+                  -o 'Dir::Cache::pkgcache=' -o 'Dir::Cache::srcpkgcache=' \
+                  -o 'Acquire::Languages=none' "$@"
+          }
+          firmware_apt update
+          firmware_apt download ovmf-generic=2026.05-2ubuntu3
+          deb="$fw/ovmf-generic_2026.05-2ubuntu3_all.deb"
+          test "$(dpkg-deb -f "$deb" Package)" = ovmf-generic
+          test "$(dpkg-deb -f "$deb" Version)" = 2026.05-2ubuntu3
+          test "$(dpkg-deb -f "$deb" Architecture)" = all
+          dpkg-deb -x "$deb" "$fw/root"
+          code="$fw/root/usr/share/OVMF/OVMF_CODE_4M.fd"
+          vars="$fw/root/usr/share/OVMF/OVMF_VARS_4M.fd"
+          test -s "$code" && test -s "$vars"
+          test "$(($(stat -c %s "$code") + $(stat -c %s "$vars")))" -eq 4194304
+          sha256sum "$code" "$vars"
+          printf 'DDIFY_OVMF_CODE=%s\nDDIFY_OVMF_VARS=%s\n' "$code" "$vars" >> "$GITHUB_ENV"
+      - name: Validate persistent Expect UART reader
+        shell: sh
+        run: |
+          set -eu
+          expect <<'EXPECT_SMOKE'
+          log_user 0
+          set timeout 10
+          spawn -noecho sh -c {printf 'first\r\n'; sleep 1; printf 'second\r\n'; sleep 1; printf 'third\r\n'}
+          set received ""
+          expect {
+              -re {.+} {
+                  append received $expect_out(0,string)
+                  exp_continue
+              }
+              full_buffer {
+                  append received $expect_out(buffer)
+                  exp_continue
+              }
+              eof {}
+              timeout { puts stderr "UART reader smoke test timed out"; exit 1 }
+          }
+          foreach marker {first second third} {
+              if {[string first $marker $received] < 0} {
+                  puts stderr "UART reader lost marker: $marker"
+                  exit 1
+              }
+          }
+          set result [wait]
+          if {[lindex $result 2] != 0 || [lindex $result 3] != 0} {
+              puts stderr "UART producer failed: $result"
+              exit 1
+          }
+          puts "Persistent Expect UART reader smoke test passed"
+          EXPECT_SMOKE
+      - name: Validate installer with sh and BusyBox ash
+        shell: sh
+        run: |
+          sh -n ddify.sh
+          busybox ash -n ddify.sh
+          sh ddify.sh --help
+          busybox ash ddify.sh --help
+      - name: Exercise non-destructive shell helpers
+        shell: sh
+        run: |
+          set -eu
+          helper_dir=$(mktemp -d)
+          trap 'rm -rf "$helper_dir"' 0
+          # Load the functions only; never execute host_main or touch a disk.
+          sed '/^main "\$@"$/d' ddify.sh > "$helper_dir/functions.sh"
+          export DDIFY_HELPER_DIR="$helper_dir"
+          cat > "$helper_dir/test.sh" <<'EOF'
+          set -eu
+          . "$DDIFY_HELPER_DIR/functions.sh"
+          work=$(mktemp -d "$DDIFY_HELPER_DIR/run.XXXXXX")
+          value="key 'quoted' \$value"
+          plan_assignment DDIFY_TEST_VALUE "$value" > "$work/plan"
+          . "$work/plan"
+          [ "$DDIFY_TEST_VALUE" = "$value" ]
+          printf '%s' abcde | bounded_image_copy 3 > "$work/bounded"
+          [ "$(wc -c < "$work/bounded")" -eq 4 ]
+          qemu-img create -q -f qcow2 "$work/base.qcow2" 16M
+          validate_qcow_metadata "$work/base.qcow2"
+          qemu-img create -q -f qcow2 -F qcow2 -b "$work/base.qcow2" "$work/backed.qcow2"
+          if (validate_qcow_metadata "$work/backed.qcow2"); then
+              echo 'Unexpected acceptance of an external backing file' >&2
+              exit 1
+          fi
+          INSTALL_TMPDIR="$work"
+          LINUX_COPY_ROOT_MNT="$work/root"
+          LINUX_COPY_SRC_ROOT=/dev/mapper/test-root
+          LINUX_COPY_ROOT_UUID=11111111-2222-3333-4444-555555555555
+          LINUX_COPY_BOOT_UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+          LINUX_COPY_EFI_UUID=AAAA-BBBB
+          mkdir -p "$LINUX_COPY_ROOT_MNT/etc/default" "$LINUX_COPY_ROOT_MNT/boot/grub2"
+          printf '/dev/mapper/test-root / xfs defaults 0 0\n/dev/mapper/test-swap none swap defaults 0 0\n' > "$LINUX_COPY_ROOT_MNT/etc/fstab"
+          printf '%s\n' 'GRUB_CMDLINE_LINUX="root=/dev/mapper/test-root rd.lvm.lv=test/root resume=/dev/mapper/test-swap quiet"' 'GRUB_VAR="root=$root"' > "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          envfile="$LINUX_COPY_ROOT_MNT/boot/grub2/grubenv"
+          printf '%s\n' '# GRUB Environment Block' 'kernelopts=root=/dev/mapper/test-root rd.lvm.lv=test/root quiet' > "$envfile"
+          head -c "$((1024 - $(wc -c < "$envfile")))" /dev/zero | tr '\000' '#' >> "$envfile"
+          linux_copy_repair_boot_configs
+          grep -Fq "UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/fstab"
+          grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          grep -Fq 'root=$root' "$LINUX_COPY_ROOT_MNT/etc/default/grub"
+          if grep -Fq 'rd.lvm.lv=' "$LINUX_COPY_ROOT_MNT/etc/default/grub"; then exit 1; fi
+          grep -Fq "root=UUID=$LINUX_COPY_ROOT_UUID" "$envfile"
+          [ "$(wc -c < "$envfile")" -eq 1024 ]
+          PASSWORD_HASH=""
+          SSH_KEYS_ALL="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey ci"
+          SSH_PORT=22
+          WEB_PORT=18080
+          write_freebsd_seed_script "$work/freebsd-user-data" 11111111-2222-3333-4444-555555555555 ""
+          sh -n "$work/freebsd-user-data"
+          grep -Fq 'DDify: FreeBSD firstboot completed' "$work/freebsd-user-data"
+          FRPC_PRESENT=""
+          FRPC_TOML=""
+          write_nocloud_seed rocky "$work/linux-meta-data" "$work/linux-user-data" 11111111-2222-3333-4444-555555555555
+          grep -Fxq '#cloud-config' "$work/linux-user-data"
+          grep -Fxq 'hostname: ddify-rocky' "$work/linux-user-data"
+          if grep -q '^local-hostname:' "$work/linux-meta-data"; then exit 1; fi
+          write_nocloud_seed fedora "$work/fedora-meta-data" "$work/fedora-user-data" 11111111-2222-3333-4444-555555555555
+          grep -Fxq 'hostname: ddify-fedora' "$work/fedora-user-data"
+          grep -Fxq 'preserve_hostname: true' "$work/fedora-user-data"
+          grep -Fxq 'preserve_hostname: true' "$work/linux-user-data"
+          mkdir -p "$work/hostname-root/etc/cloud"
+          printf '%s\n' 'preserve_hostname: false' 'users: []' > "$work/hostname-root/etc/cloud/cloud.cfg"
+          printf '%s\n' localhost > "$work/hostname-root/etc/hostname"
+          linux_copy_set_hostname "$work/hostname-root" fedora
+          [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-fedora ]
+          grep -Fxq 'preserve_hostname: true' "$work/hostname-root/etc/cloud/cloud.cfg"
+          grep -Fxq 'users: []' "$work/hostname-root/etc/cloud/cloud.cfg"
+          [ "$(grep -c '^preserve_hostname:' "$work/hostname-root/etc/cloud/cloud.cfg")" -eq 1 ]
+          grep -Fq 'restorecon -F /etc/hostname /etc/cloud/cloud.cfg' "$work/fedora-user-data"
+          grep -Fq 'hostnamectl set-hostname "$ddify_hostname"' "$work/fedora-user-data"
+          grep -Fq "ddify_hostname='ddify-fedora'" "$work/fedora-user-data"
+          grep -Fq "ddify_hostname='ddify-rocky'" "$work/linux-user-data"
+          rm "$work/hostname-root/etc/hostname"
+          linux_copy_set_hostname "$work/hostname-root" debian
+          [ "$(cat "$work/hostname-root/etc/hostname")" = ddify-debian ]
+          rm "$work/hostname-root/etc/hostname"
+          ln -s "$work/plan" "$work/hostname-root/etc/hostname"
+          if (linux_copy_set_hostname "$work/hostname-root" fedora); then exit 1; fi
+          [ -L "$work/hostname-root/etc/hostname" ]
+          if grep -q '^local-hostname:' "$work/fedora-meta-data"; then exit 1; fi
+          if grep -Eq '^(hostname|local-hostname): localhost$' "$work/fedora-user-data" "$work/fedora-meta-data"; then exit 1; fi
+          grep -Fxq '  - name: root' "$work/linux-user-data"
+          grep -Fq "$SSH_KEYS_ALL" "$work/linux-user-data"
+          grep -Fxq '    lock_passwd: true' "$work/linux-user-data"
+          grep -Fxq 'runcmd:' "$work/linux-user-data"
+          grep -Fq '/etc/reinstall-web-port' "$work/linux-user-data"
+          # Synthetic EFI binary: verify exact byte offsets, preserved LF,
+          # unchanged surrounding bytes and no change in the binary length.
+          ALPINE_NETBOOT_ARCH=x86_64
+          PLAN_EFI_UUID=AAAA-BBBB
+          ALPINE_BOOT_DIR_REL=/REINSTALL/alpine
+          ALPINE_FREEBSD_GRUB_EFI_ABS="$work/fixture.efi"
+          release=3.22.6
+          printf 'MZ\000fixture\nsearch --no-floppy --set=root --label "alpine-virt %s x86_64"\nset prefix=($root)/boot/grub\nEND\000' "$release" > "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          size=$(wc -c < "$ALPINE_FREEBSD_GRUB_EFI_ABS")
+          patch_alpine_grub_efi "$work" "$release"
+          [ "$(wc -c < "$ALPINE_FREEBSD_GRUB_EFI_ABS")" -eq "$size" ]
+          grep -aFq 'search --no-floppy --fs-uuid --set=root AAAA-BBBB' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          grep -aFq 'set prefix=($root)/REINSTALL/alpine/grub' "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+          [ "$(tail -c 4 "$ALPINE_FREEBSD_GRUB_EFI_ABS" | od -An -tx1 | tr -d ' \n')" = 454e4400 ]
+          # Test native EFI parsing with the FreeBSD 15.1 inventory format.
+          # Stub the readers only; never access runner NVRAM.
+          efivar() {
+              printf '%s\n' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0000' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0001' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot0002' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-Boot000A' \
+                  '8be4df61-93ca-11d2-aa0d-00e098032b8c-BootOrder' \
+                  '00000000-0000-0000-0000-000000000000-Boot0003'
+          }
+          efibootmgr() {
+              printf '%s\n' 'BootNext : 0004' 'BootCurrent: 0001' 'BootOrder  : 0001, 0000, 0002, 0003'
+          }
+          numbers=$(efi_boot_variable_numbers)
+          [ "$numbers" = "$(printf '0000\n0001\n0002\n000A')" ]
+          order=$(efi_bootorder)
+          [ "$order" = 0001,0000,0002,0003 ]
+          [ "$(efi_choose_boot_number "$numbers" "$order")" = 0004 ]
+          [ "$(efi_bootnext_number)" = 0004 ]
+          listing=$(printf '%s\n' ' Boot0004* Reinstall Alpine RAM' '+Boot0001* UEFI Misc Device')
+          efi_verify_created_entry "$listing" 0004 'Reinstall Alpine RAM'
+          if efi_verify_created_entry ' Boot0004  Reinstall Alpine RAM' 0004 'Reinstall Alpine RAM'; then exit 1; fi
+          if efi_verify_created_entry ' Boot0005* Reinstall Alpine RAM' 0004 'Reinstall Alpine RAM'; then exit 1; fi
+          EOF
+          sh "$helper_dir/test.sh"
+          busybox ash "$helper_dir/test.sh"
+      - name: Reinstall through QEMU serial root login and verify two boots
+        shell: sh
         env:
           WORK: ${{ runner.temp }}/ddify-qemu
         run: |
-          set -Eeuo pipefail
+          set -eu
           export LC_ALL=C
           : "${SOURCE_OS:?}" "${TARGET_OS:?}"
-          case "$SOURCE_OS:$TARGET_OS" in rocky:rocky|rocky:freebsd|freebsd:rocky|freebsd:freebsd) ;; *) exit 2;; esac
+          case "$SOURCE_OS" in rocky|freebsd) ;; *) exit 2 ;; esac
+          case "$TARGET_OS:${TARGET_VERSION:-}" in
+              rocky:10|almalinux:10|fedora:44|freebsd:14|freebsd:15|debian:13) ;;
+              redhat:) [ -n "$RHEL_IMAGE_URL" ] || exit 2 ;;
+              *) exit 2 ;;
+          esac
           WORK=${WORK:-$(mktemp -d)}
-          RAM=${VM_RAM_MIB:-5120}
+          RAM=${VM_RAM_MIB:-720}
+          case "$RAM" in 720|768|1024) ;; *) echo 'Unsupported CI RAM profile' >&2; exit 2 ;; esac
+          DISK_BYTES=${VM_DISK_BYTES:-9499999744}
           REPO="${GITHUB_WORKSPACE:?}"
           # All VM storage is disposable local files, never runner block devices.
           mkdir -p "$WORK/logs"
           WORK=$(cd "$WORK" && pwd)
+          export WORK
           cd "$WORK"
           LOG=$WORK/logs
-          exec > >(tee -a "$LOG/test.log") 2>&1
+          # POSIX FIFO logging keeps the original shell exit status.
+          mkfifo "$WORK/test-log.fifo"
+          exec 3>&1 4>&2
+          tee -a "$LOG/test.log" < "$WORK/test-log.fifo" >&3 &
+          logger_pid=$!
+          exec > "$WORK/test-log.fifo" 2>&1
           PID=''
+          serial_tail_pid=''
+          serial_filter_pid=''
+          serial_session_pid=''
+          # QEMU's unfiltered UART output stays outside the uploaded log folder.
+          RAW_SERIAL="$WORK/serial.raw"
+          export RAW_SERIAL
+          umask 077
+          : >"$RAW_SERIAL"
           cleanup() {
               local rc=$?
-              trap - EXIT
-              if [[ -n "$PID" ]]; then
+              trap - 0
+              if [ -n "$PID" ]; then
                   kill "$PID" 2>/dev/null || true
                   wait "$PID" 2>/dev/null || true
               fi
-              if ((rc != 0)); then tail -c 24000 "$LOG/serial.log" 2>/dev/null || true; fi
+              if [ -n "$serial_session_pid" ]; then
+                  kill "$serial_session_pid" 2>/dev/null || true
+                  wait "$serial_session_pid" 2>/dev/null || true
+              fi
+              if [ -n "$serial_tail_pid" ]; then
+                  # Let the follower drain the final UART bytes after QEMU exits.
+                  sleep 1
+                  kill "$serial_tail_pid" 2>/dev/null || true
+                  wait "$serial_tail_pid" 2>/dev/null || true
+              fi
+              if [ -n "$serial_filter_pid" ]; then wait "$serial_filter_pid" 2>/dev/null || true; fi
+              # Regenerate the complete artifact from the raw stream even if
+              # the live follower missed its final partial line. Never upload
+              # a plaintext console password, even if a guest echoed it.
+              LC_ALL=C awk '
+                  BEGIN { RS="\r\n|\r|\n"; secret=ENVIRON["SOURCE_CONSOLE_PASSWORD"] }
+                  { if(secret!="") gsub(secret,"[REDACTED]"); print }
+              ' "$RAW_SERIAL" >"$LOG/serial.log"
+              if [ "$rc" -ne 0 ]; then
+                  echo '[UART] Last 80 lines (failure context):'
+                  tail -n 80 "$LOG/serial.log" | sed 's/^/[UART] /' || true
+                  tail -c 4000 "$LOG/qemu.log" 2>/dev/null || true
+              fi
+              rm -f "$RAW_SERIAL" "$WORK/serial-live.fifo"
+              unset SOURCE_CONSOLE_PASSWORD
               rm -f "$WORK/source-key" "$WORK/target-key" "$WORK/user-data" "$WORK/seed.iso"
+              exec >&3 2>&4
+              wait "$logger_pid" || true
+              rm -f "$WORK/test-log.fifo"
               exit "$rc"
           }
-          trap cleanup EXIT
+          trap cleanup 0
           trap 'exit 130' INT
           trap 'exit 143' TERM
           fail() { echo "ERROR: $*" >&2; exit 1; }
           fetch() { curl --fail --location --retry 4 --retry-delay 3 --connect-timeout 30 --max-time 1800 --proto '=https' --proto-redir '=https' -o "$2.part" "$1" && mv "$2.part" "$2"; }
-          case "$SOURCE_OS" in
-              rocky) url=https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2 ;;
-              freebsd) url=https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz ;;
-          esac
+          # The official Rocky cloud disk is 10 GiB and uses XFS. Do not
+          # truncate it. Provision a Rocky source on the same real 9.5 GB
+          # disk from the official FreeBSD image before the measured test.
+          REQUESTED_SOURCE_OS=$SOURCE_OS
+          SOURCE_OS=freebsd
+          url=https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz
           name=${url##*/}
           fetch "$url" "$name"
-          if [[ "$SOURCE_OS" == rocky ]]; then
+          if [ "$SOURCE_OS" = rocky ]; then
               fetch "$url.CHECKSUM" checksum
           else
               fetch "${url%/*}/CHECKSUM.SHA256" checksum
           fi
           hash=$(awk -v f="$name" '$1=="SHA256" && $2=="("f")" && $3=="=" {print $4; exit} $2==f || $2=="*"f {print $1; exit}' checksum)
-          [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || fail "Source checksum missing: $name"
+          printf '%s\n' "$hash" | grep -Eq '^[[:xdigit:]]{64}$' || fail "Source checksum missing: $name"
           printf '%s  %s\n' "$hash" "$name" | sha256sum -c -
-          if [[ "$name" == *.xz ]]; then xz -d "$name"; name=${name%.xz}; fi
+          case "$name" in *.xz) xz -d "$name"; name=${name%.xz} ;; esac
           qemu-img check "$name"
           mv "$name" disk.qcow2
           # The source is the same disk later reinstalled by DDify.
-          qemu-img resize disk.qcow2 24G
+          # Never shrink an official source filesystem blindly to fit the VPS.
+          # 9,499,999,744 bytes is the largest 512-byte multiple <= 9.5 GB.
+          source_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
+          [ "$source_bytes" -le "$DISK_BYTES" ] || fail "Source virtual disk exceeds requested $DISK_BYTES bytes: $source_bytes"
+          if [ "$source_bytes" -lt "$DISK_BYTES" ]; then qemu-img resize disk.qcow2 "$DISK_BYTES"; fi
+          actual_bytes=$(qemu-img info --output=json disk.qcow2 | jq -er '."virtual-size"')
+          [ "$actual_bytes" -eq "$DISK_BYTES" ] || fail "Unexpected disk geometry: $actual_bytes"
+          printf 'Guest resources: %s MiB RAM, %s bytes disk\n' "$RAM" "$actual_bytes"
           qemu-img info disk.qcow2 | tee "$LOG/source-image.txt"
           ssh-keygen -q -t ed25519 -N '' -f source-key
           ssh-keygen -q -t ed25519 -N '' -f target-key
           source_key=$(cat source-key.pub)
           # Only bootstrap the SOURCE guest. Remove this ISO before running DDify.
-          root_hash=$(openssl rand -hex 32 | openssl passwd -6 -stdin)
+          # Ephemeral password is for the disposable SOURCE serial console only.
+          # Password authentication over SSH stays disabled.
+          SOURCE_CONSOLE_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$SOURCE_CONSOLE_PASSWORD" >&3
+          export SOURCE_CONSOLE_PASSWORD
+          # Follow UART output throughout every boot, including when Expect is
+          # disconnected. Prefix every line so guest output cannot become a
+          # GitHub Actions workflow command. Redact the ephemeral login secret.
+          mkfifo "$WORK/serial-live.fifo"
+          LC_ALL=C awk '
+              BEGIN { RS="\r\n|\r|\n"; secret=ENVIRON["SOURCE_CONSOLE_PASSWORD"] }
+              { if(secret!="") gsub(secret,"[REDACTED]"); print "[UART] " $0; fflush() }
+          ' <"$WORK/serial-live.fifo" >&3 &
+          serial_filter_pid=$!
+          tail -c +1 -f --sleep-interval=0.2 "$RAW_SERIAL" >"$WORK/serial-live.fifo" &
+          serial_tail_pid=$!
+          root_hash=$(printf '%s\n' "$SOURCE_CONSOLE_PASSWORD" | openssl passwd -6 -stdin)
+          printf '%s\n' "$SCRIPT_REF" | grep -Eq '^[0-9a-f]{40}$' || fail 'Invalid script commit SHA'
+          printf '%s\n' "$SCRIPT_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || fail 'Invalid script repository'
+          [ "$(git -C "$REPO" rev-parse HEAD)" = "$SCRIPT_REF" ] || fail 'Checkout does not match download commit'
+          # main tests the documented URL; PRs must test their own unmerged
+          # script, not the old main. The checksum rejects any moving-ref race.
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              SCRIPT_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/main/ddify.sh"
+          else
+              SCRIPT_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/$SCRIPT_REF/ddify.sh"
+          fi
+          SCRIPT_SHA256=$(sha256sum "$REPO/ddify.sh" | awk '{print $1}')
+          export SCRIPT_URL SCRIPT_SHA256
+          echo "Guest will download $SCRIPT_URL (SHA256 $SCRIPT_SHA256)"
           cat > user-data <<EOF
           #cloud-config
           ssh_pwauth: false
@@ -126,9 +488,16 @@ jobs:
                 rm -f "\$tmp"
                 sshd -t
                 if [ "\$(uname -s)" = FreeBSD ]; then
+                  printf '%s\\n' '$root_hash' | pw usermod root -H 0
+                  ttytmp=\$(mktemp)
+                  awk '\$1=="ttyu0" {\$0="ttyu0\\t\\"/usr/libexec/getty 3wire\\"\\tvt100\\ton secure"} {print}' /etc/ttys > "\$ttytmp"
+                  cat "\$ttytmp" > /etc/ttys
+                  rm -f "\$ttytmp"
+                  kill -HUP 1
                   sysrc sshd_enable=YES
                   service sshd restart || service sshd start
                 else
+                  systemctl enable --now serial-getty@ttyS0.service
                   systemctl enable --now sshd
                   systemctl restart sshd
                 fi
@@ -137,18 +506,25 @@ jobs:
           cloud-localds seed.iso user-data meta-data
           rm -f user-data
           # Non-Secure-Boot UEFI, persistent NVRAM across reboots and QEMU restarts.
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
-          CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-          [[ -r "$CODE" ]] || fail 'OVMF firmware not found'
-          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+          : "${DDIFY_OVMF_CODE:?}" "${DDIFY_OVMF_VARS:?}"
+          cp "$DDIFY_OVMF_VARS" vars.fd
+          CODE="$DDIFY_OVMF_CODE"
+          echo 'Using isolated edk2 2026.05 firmware (Ubuntu stonking, non-Secure-Boot)'
+          sha256sum "$CODE" "$DDIFY_OVMF_VARS" > "$LOG/ovmf-firmware.txt"
+          [ -r "$CODE" ] || fail 'OVMF firmware not found'
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
               accel=kvm; cpu=host
           else
               accel=tcg; cpu=max
           fi
           printf 'QEMU accelerator: %s\n' "$accel"
           start_vm() {
-              local extra=()
-              if [[ "${1:-}" == seed ]]; then extra=(-drive "file=$WORK/seed.iso,format=raw,media=cdrom,readonly=on"); fi
+              if [ "${1:-}" = seed ]; then
+                  set -- -drive "file=$WORK/seed.iso,format=raw,media=cdrom,readonly=on"
+              else
+                  set --
+              fi
+              rm -f "$WORK/serial.sock" "$WORK/qmp.sock"
               qemu-system-x86_64 -machine "q35,accel=$accel" -cpu "$cpu" -smp 2 -m "$RAM" \
                   -drive "if=pflash,format=raw,readonly=on,file=$CODE" \
                   -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -156,42 +532,85 @@ jobs:
                   -device virtio-blk-pci,drive=system,serial=DDIFYCI001,bootindex=1 \
                   -netdev user,id=net,hostfwd=tcp:127.0.0.1:2222-:22 \
                   -device virtio-net-pci,netdev=net \
-                  -display none -monitor none -serial stdio "${extra[@]}" >> "$LOG/serial.log" 2>&1 &
+                  -display none -monitor none -qmp "unix:$WORK/qmp.sock,server=on,wait=off" \
+                  -chardev "socket,id=console,path=$WORK/serial.sock,server=on,wait=off,logfile=$RAW_SERIAL,logappend=on" \
+                  -serial chardev:console "$@" >> "$LOG/qemu.log" 2>&1 &
               PID=$!
+              local end=$(($(date +%s)+30))
+              until [ -S "$WORK/serial.sock" ]; do
+                  kill -0 "$PID" 2>/dev/null || fail 'QEMU exited before serial socket was ready'
+                  [ "$(date +%s)" -lt "$end" ] || fail 'Serial socket not ready'
+                  sleep 1
+              done
           }
           ssh_guest() {
               local key=$1; shift
               timeout "${SSH_TIMEOUT:-45s}" ssh -T -p 2222 -i "$WORK/$key-key" -o IdentitiesOnly=yes -o BatchMode=yes \
                   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-                  -o LogLevel=ERROR root@127.0.0.1 "$@"
+                  -o LogLevel=ERROR root@127.0.0.1 'export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH;' "$@"
           }
           assert_os() {
-              local key=$1 os=$2
+              local key=$1 os=$2 version expected_id
+              if [ "$key" = source ]; then
+                  case "$os" in rocky) version=10 ;; freebsd) version=15 ;; *) return 1 ;; esac
+              else
+                  version=${TARGET_VERSION:-}
+              fi
               case "$os" in
-                  rocky) ssh_guest "$key" 'test "$(uname -s)" = Linux && . /etc/os-release && test "$ID" = rocky && case "$VERSION_ID" in 10|10.*) true;; *) false;; esac' ;;
-                  freebsd) ssh_guest "$key" 'test "$(uname -s)" = FreeBSD && case "$(freebsd-version -u)" in 15.*) true;; *) false;; esac' ;;
+                  freebsd)
+                      ssh_guest "$key" "test \"\$(uname -s)\" = FreeBSD && case \"\$(freebsd-version -u)\" in $version|$version.*) true;; *) false;; esac"
+                      ;;
+                  rocky|almalinux|fedora|debian|redhat)
+                      expected_id=$os
+                      [ "$os" != redhat ] || expected_id=rhel
+                      ssh_guest "$key" "test \"\$(uname -s)\" = Linux && . /etc/os-release && test \"\$ID\" = '$expected_id' && case \"\$VERSION_ID\" in ${version:-*}|${version:-*}.*) true;; *) false;; esac"
+                      ;;
+                  *) return 1 ;;
               esac
           }
           wait_os() {
-              local key=$1 os=$2 end=$((SECONDS+$3))
+              local key=$1 os=$2 end=$(($(date +%s)+$3))
               until assert_os "$key" "$os" >/dev/null 2>&1; do
                   kill -0 "$PID" 2>/dev/null || fail 'QEMU exited unexpectedly'
-                  ((SECONDS < end)) || fail "Timeout waiting for $os using $key key"
+                  [ "$(date +%s)" -lt "$end" ] || fail "Timeout waiting for $os using $key key"
                   sleep 10
               done
           }
           cloud_wait() {
-              local key=$1 tag=${2:-$1}
-              SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' | tee "$LOG/cloud-init-$tag.txt"
+              local key=$1 tag=${2:-$1} os end
+              if [ "$key" = source ]; then os=$SOURCE_OS; else os=$TARGET_OS; fi
+              if [ "$os" = freebsd ]; then
+                  # BASIC-CLOUDINIT uses base-system nuageinit, not Python cloud-init.
+                  # rc removes /firstboot only after its firstboot services run.
+                  end=$(($(date +%s)+900))
+                  until ssh_guest "$key" 'test -x /usr/libexec/nuageinit && test ! -e /firstboot && test ! -e /firstboot-reboot && test -s /var/log/nuageinit.log && grep -Eq "Executing (user_data script|'\''runcmd'\'')" /var/log/nuageinit.log' >/dev/null 2>&1; do
+                      kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during FreeBSD initialization'
+                      [ "$(date +%s)" -lt "$end" ] || {
+                          ssh_guest "$key" 'ls -l /firstboot* /var/log/nuageinit.log; cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt" 2>&1 || true
+                          fail 'FreeBSD firstboot/nuageinit did not complete'
+                      }
+                      sleep 10
+                  done
+                  ssh_guest "$key" 'cat /var/log/nuageinit.log' > "$LOG/nuageinit-$tag.txt"
+                  cat "$LOG/nuageinit-$tag.txt"
+              else
+                  SSH_TIMEOUT=600s ssh_guest "$key" 'cloud-init status --wait --long' > "$LOG/cloud-init-$tag.txt" || {
+                      cat "$LOG/cloud-init-$tag.txt"
+                      collect_guest "$key" "$tag-failed"
+                      ssh_guest "$key" 'hostname; cat /etc/hostname; ls -lZ /etc/hostname /etc/cloud/cloud.cfg; grep -n preserve_hostname /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/*.cfg; hostnamectl status; journalctl -b -u systemd-hostnamed --no-pager' > "$LOG/$tag-hostname.txt" 2>&1 || true
+                      fail 'Linux cloud-init failed'
+                  }
+                  cat "$LOG/cloud-init-$tag.txt"
+              fi
           }
           boot_id() {
               ssh_guest "$1" 'if [ "$(uname -s)" = FreeBSD ]; then sysctl -n kern.boottime; else cat /proc/sys/kernel/random/boot_id; fi'
           }
           shutdown_vm() {
               ssh_guest "$1" 'if [ "$(uname -s)" = FreeBSD ]; then shutdown -p now; else systemctl poweroff; fi' || true
-              local end=$((SECONDS+180))
+              local end=$(($(date +%s)+180))
               while kill -0 "$PID" 2>/dev/null; do
-                  ((SECONDS < end)) || fail 'Guest did not power off'
+                  [ "$(date +%s)" -lt "$end" ] || fail 'Guest did not power off'
                   sleep 3
               done
               wait "$PID" || fail 'QEMU exited abnormally'
@@ -200,74 +619,310 @@ jobs:
           collect_guest() {
               local key=$1 tag=$2
               ssh_guest "$key" 'uname -a; df -h; if [ "$(uname -s)" = FreeBSD ]; then freebsd-version -ku; gpart show -l; efibootmgr -v; else cat /etc/os-release; lsblk -f; findmnt /; efibootmgr -v; fi' > "$LOG/$tag-system.txt" 2>&1 || true
-              ssh_guest "$key" 'cat /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null' > "$LOG/$tag-cloud-init.log" 2>&1 || true
+              ssh_guest "$key" 'if [ "$(uname -s)" = FreeBSD ]; then cat /var/log/nuageinit.log /var/log/ddify-firstboot.log 2>/dev/null; else cat /var/log/cloud-init.log /var/log/cloud-init-output.log; fi' > "$LOG/$tag-cloud-init.log" 2>&1 || true
           }
           start_vm seed
           wait_os source "$SOURCE_OS" 900
           cloud_wait source
-          # Provision only tools required to INVOKE DDify; other dependencies are
-          # DDify's responsibility.
-          if [[ "$SOURCE_OS" == freebsd ]]; then
-              SSH_TIMEOUT=900s ssh_guest source 'env ASSUME_ALWAYS_YES=yes pkg bootstrap; env ASSUME_ALWAYS_YES=yes pkg install bash curl' | tee "$LOG/source-deps.log"
-          else
-              ssh_guest source 'command -v bash && command -v curl' || fail 'Rocky source lacks bash/curl'
-          fi
-          ssh_guest source 'touch /var/tmp/ddify-old-system-marker'
-          collect_guest source source
           shutdown_vm source
           # No external CIDATA medium may survive into rescue/target boot.
           rm -f seed.iso
           start_vm
           wait_os source "$SOURCE_OS" 900
-          ssh_guest source 'test -f /var/tmp/ddify-old-system-marker'
-          ssh_guest source 'cat > /root/ddify.sh' < "$REPO/ddify.sh"
-          ssh_guest source 'cat > /root/ddify-target.pub' < target-key.pub
-          case "$SOURCE_OS" in rocky) disk=/dev/vda;; freebsd) disk=/dev/vtbd0;; esac
-          case "$TARGET_OS" in rocky) version=10;; freebsd) version=15;; esac
-          # Explicit disk confirmation is 1. Exercise the default verified-before-wipe
-          # path and official image URL, not --allow-early-wipe or --img.
-          ssh_guest source "printf '%s\\n' 1 > /root/ddify-confirm; nohup bash /root/ddify.sh $TARGET_OS $version --disk $disk --ssh-key /root/ddify-target.pub --web-port 18080 < /root/ddify-confirm > /var/tmp/ddify-host.log 2>&1 &"
-          end=$((SECONDS+3600))
+          if [ "$REQUESTED_SOURCE_OS" = rocky ]; then
+              echo '[source provisioning] Install official Rocky 10 on the exact 9.5 GB disk'
+              # Separate provisioning step, not counted as the measured test.
+              # The actual Rocky -> target test below still uses serial root
+              # login, pinned download, independent target SSH key and reboot.
+              ssh_guest source 'if ! command -v curl >/dev/null 2>&1; then env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl; fi'
+              ssh_guest source "curl -fL --retry 3 --proto '=https' --proto-redir '=https' -o /root/ddify-prep.sh '$SCRIPT_URL' && test \"\$(sha256 -q /root/ddify-prep.sh)\" = '$SCRIPT_SHA256' && sh -n /root/ddify-prep.sh"
+              ssh_guest source "umask 077; printf '%s\n' '$source_key' > /root/ddify-prep.pub; nohup sh -c 'printf \"1\\n\" | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh /root/ddify-prep.sh rocky 10 --allow-early-wipe --disk /dev/vtbd0 --ssh-key /root/ddify-prep.pub --web-port 18080' </dev/null >/root/ddify-prep.log 2>&1 &"
+              SOURCE_OS=rocky
+              prep_end=$(($(date +%s)+1800))
+              until assert_os source rocky >/dev/null 2>&1; do
+                  kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped while provisioning Rocky source'
+                  if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$RAW_SERIAL"; then
+                      fail 'Rocky source provisioning installer failed'
+                  fi
+                  [ "$(date +%s)" -lt "$prep_end" ] || fail 'Rocky source provisioning timed out'
+                  sleep 10
+              done
+              cloud_wait source provisioned-rocky
+              # Use the existing ephemeral console password only for the
+              # source root login. Leave SSH password authentication disabled.
+              ssh_guest source "printf '%s\n' 'root:$root_hash' | chpasswd -e && systemctl enable --now serial-getty@ttyS0.service && rm -f /etc/reinstall-web-port"
+              ssh_guest source "test \"\$(blockdev --getsize64 /dev/vda)\" = '$DISK_BYTES'"
+              collect_guest source provisioned-rocky
+              shutdown_vm source
+              start_vm
+              wait_os source rocky 900
+              echo '[source provisioning] PASS: Rocky boots on exact 9.5 GB disk'
+          fi
+          SOURCE_OS=$REQUESTED_SOURCE_OS
+          export SOURCE_OS
+          ssh_guest source 'touch /var/tmp/ddify-old-system-marker'
+          collect_guest source source
+          case "$SOURCE_OS" in rocky) DDIFY_DISK=/dev/vda;; freebsd) DDIFY_DISK=/dev/vtbd0;; esac
+          DDIFY_VERSION=${TARGET_VERSION:-}
+          DDIFY_TARGET_KEY=$(awk '{print $1" "$2}' target-key.pub)
+          export DDIFY_DISK DDIFY_VERSION DDIFY_TARGET_KEY
+          # Drive the emulated UART, not SSH, QMP guest execution or file injection.
+          # All commands below execute in the real guest root login session.
+          echo '[serial] Login as root, download pinned DDify and reinstall'
+          rm -f "$WORK/serial-handoff.ok"
+          expect <<'EXPECT' &
+          # The live UART follower already prints the received stream.
+          # Use a binary, unbuffered pipe, not a second PTY/terminal driver.
+          log_user 0
+          set timeout 90
+          proc die {message} { puts stderr "SERIAL ERROR: $message"; exit 1 }
+          set channel [open [list | socat STDIO UNIX-CONNECT:$env(WORK)/serial.sock] r+]
+          fconfigure $channel -translation binary -encoding binary -buffering none
+          spawn -noecho -open $channel
+          match_max 65536
+          send -- "\r"
+          expect {
+              -nocase -exact "login:" {}
+              timeout { die "No serial login prompt" }
+              eof { die "Serial socket closed" }
+          }
+          send -- "root\r"
+          # Password prompts do not end in a newline. Match their literal
+          # text immediately even if spaces or terminal control bytes follow.
+          expect {
+              -nocase -exact "password:" {}
+              timeout { die "No root password prompt" }
+              eof { die "Serial socket closed during login" }
+          }
+          send -- "$env(SOURCE_CONSOLE_PASSWORD)\r"
+          expect {
+              -nocase -re {login incorrect|authentication failure|login:} { die "Root login rejected" }
+              -re {#[ \t]*} {}
+              timeout { die "No root shell prompt" }
+              eof { die "Serial socket closed during authentication" }
+          }
+          puts "SERIAL: root login prompt received; verifying uid"
+          # Markers are split in the command so terminal echo cannot fake success.
+          proc checked {command label seconds} {
+              global spawn_id
+              set timeout $seconds
+              set pattern [format {DDIFY_%s:([0-9]+)\r*\n} $label]
+              set line [format {%s; rc=$?; printf 'DDIFY_%%s:%%s\n' '%s' "$rc"} $command $label]
+              send -- "$line\r"
+              expect {
+                  -re $pattern {
+                      if {$expect_out(1,string) ne "0"} { die "$label failed with rc=$expect_out(1,string)" }
+                      puts "SERIAL: $label OK"
+                  }
+                  timeout { die "Timeout: $label" }
+                  eof { die "Serial closed: $label" }
+              }
+          }
+          checked {test "$(id -u)" = 0 && test -f /var/tmp/ddify-old-system-marker && uname -a} ROOT 60
+          # Run the public installation command inside the guest, not the runner.
+          # FreeBSD has neither curl nor wget in base; provision curl only if
+          # neither downloader exists, via this same serial root session.
+          checked {if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then if [ "$(uname -s)" = FreeBSD ]; then env ASSUME_ALWAYS_YES=yes pkg bootstrap && env ASSUME_ALWAYS_YES=yes pkg install curl; else false; fi; fi} DOWNLOADER 900
+          set download [format {cd /root && (curl -fL --retry 3 --proto '=https' --proto-redir '=https' -O '%s' || wget --https-only -O ddify.sh '%s')} $env(SCRIPT_URL) $env(SCRIPT_URL)]
+          checked $download DOWNLOAD 300
+          set verify [format {if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum /root/ddify.sh | cut -d ' ' -f1); else actual=$(sha256 -q /root/ddify.sh); fi; test "$actual" = '%s' && sh -n /root/ddify.sh} $env(SCRIPT_SHA256)]
+          checked $verify CHECKSUM 60
+          checked [format {umask 077; printf '%%s\n' '%s' > /root/ddify-target.pub} $env(DDIFY_TARGET_KEY)] TARGET_KEY 60
+          # The installer itself handles dependency setup and disk confirmation.
+          # The OVMF firmware here is explicitly non-Secure-Boot.
+          if {$env(TARGET_OS) eq "redhat"} {
+              set target [format {redhat --img='%s'} $env(RHEL_IMAGE_URL)]
+          } else {
+              set target [format {%s %s} $env(TARGET_OS) $env(DDIFY_VERSION)]
+          }
+          set command [format {printf '1\n' | env DDIFY_ASSUME_SECURE_BOOT_DISABLED=1 sh ddify.sh %s --allow-early-wipe --disk %s --ssh-key /root/ddify-target.pub --web-port 18080; rc=$?; printf 'DDIFY_%%s:%%s\n' HOST_RC "$rc"} $target $env(DDIFY_DISK)]
+          send -- "$command\r"
+          set timeout 1800
+          expect {
+              -re {DDIFY_HOST_RC:([0-9]+)\r*\n} {
+                  if {$expect_out(1,string) ne "0"} { die "Installer host rc=$expect_out(1,string)" }
+                  puts "SERIAL: installer host returned success"
+              }
+              -re {Rebooting into one-time (GRUB|UEFI) entry:} {
+                  puts "SERIAL: host reached one-time boot handoff"
+              }
+              timeout { die "Installer did not reach reboot handoff" }
+              eof { die "Serial connection lost before reboot handoff" }
+          }
+          # Keep the serial socket connected and continuously drained through
+          # rescue, reboot, first boot and final verification. A disconnected
+          # or abandoned console must not backpressure the emulated UART.
+          set handoff [open "$env(WORK)/serial-handoff.ok" w]
+          puts $handoff "ready"
+          close $handoff
+          set timeout -1
+          expect {
+              eof {}
+              -re {.+} { exp_continue }
+              full_buffer { exp_continue }
+          }
+          catch {close}
+          catch {wait}
+          EXPECT
+          serial_session_pid=$!
+          handoff_end=$(($(date +%s)+2400))
+          until [ -f "$WORK/serial-handoff.ok" ]; do
+              if ! kill -0 "$serial_session_pid" 2>/dev/null; then
+                  wait "$serial_session_pid" || fail 'Serial root session failed'
+                  fail 'Serial session exited before installer handoff'
+              fi
+              [ "$(date +%s)" -lt "$handoff_end" ] || fail 'Serial installer handoff timed out'
+              sleep 1
+          done
+          collect_qemu_state() {
+              {
+                  date -u
+                  ps -L -p "$PID" -o pid,tid,stat,pcpu,wchan:32,comm
+                  cat "/proc/$PID/status" "/proc/$PID/io" 2>/dev/null || true
+                  printf '%s\n' '{"execute":"qmp_capabilities"}' \
+                      '{"execute":"query-status"}' '{"execute":"query-block"}' \
+                      '{"execute":"query-blockstats"}' '{"execute":"query-cpus-fast"}' \
+                      '{"execute":"human-monitor-command","arguments":{"command-line":"info registers"}}' |
+                      timeout 15s socat -t 10 STDIO "UNIX-CONNECT:$WORK/qmp.sock" || true
+              } > "$LOG/qemu-stall-state.txt" 2>&1
+              cat "$LOG/qemu-stall-state.txt"
+          }
+          # Keep the ephemeral secret only until the UART artifact is redacted
+          # in cleanup; it is never passed to the target installation.
+          # SSH from this point is an independent check of the reinstalled OS.
+          # The copy backend emits a heartbeat every 15 seconds. If the
+          # installer stops emitting UART output, gather rescue diagnostics
+          # before failing rather than leaving an apparently frozen job.
+          end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
+              kill -0 "$serial_session_pid" 2>/dev/null || fail 'Persistent UART reader stopped during reinstall'
+              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify rescue reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1 && ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port 2>/dev/null)" = 18080' >/dev/null 2>&1; then break; fi
-              if ssh_guest source 'test -f /var/tmp/ddify-host.log' >/dev/null 2>&1; then
-                  ssh_guest source 'cat /var/tmp/ddify-host.log' > "$LOG/host-install.log.tmp" 2>/dev/null && mv "$LOG/host-install.log.tmp" "$LOG/host-install.log" || true
+              if grep -Eq 'DDIFY_HOST_RC:[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify host reported failure on serial console'; fi
+              if assert_os target "$TARGET_OS" >/dev/null 2>&1; then
+                  collect_guest target initializing
               fi
               if ssh_guest target 'test -f /var/log/reinstall-auto.log' >/dev/null 2>&1; then
                   ssh_guest target 'cat /var/log/reinstall-auto.log' > "$LOG/rescue.log.tmp" 2>/dev/null && mv "$LOG/rescue.log.tmp" "$LOG/rescue.log" || true
                   if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*' "$LOG/rescue.log"; then fail 'DDify installer reported failure'; fi
               fi
-              ((SECONDS < end)) || fail 'Target did not boot with new credentials and marker'
+              now=$(date +%s)
+              uart_mtime=$(stat -c %Y "$RAW_SERIAL")
+              if [ $((now - uart_mtime)) -ge 600 ] || [ "$now" -ge "$end" ]; then
+                  echo 'Collecting stalled guest diagnostics'
+                  collect_qemu_state
+                  SSH_TIMEOUT=30s ssh_guest target 'uname -a; cat /proc/meminfo /proc/diskstats 2>/dev/null; ps -ef; df -h; dmesg | tail -n 100' > "$LOG/stall-diagnostics.txt" 2>&1 || true
+                  cat "$LOG/stall-diagnostics.txt" || true
+                  [ "$now" -lt "$end" ] || fail 'Target did not boot with new credentials and marker'
+                  fail 'No QEMU UART output for 10 minutes'
+              fi
               sleep 10
           done
+          verify_target_hostname() {
+              [ "$TARGET_OS" != freebsd ] || return 0
+              if ! ssh_guest target "test \"\$(hostname)\" = 'ddify-$TARGET_OS' && test \"\$(cat /etc/hostname)\" = 'ddify-$TARGET_OS'"; then
+                  collect_guest target hostname-failed
+                  ssh_guest target 'hostname; cat /etc/hostname; ls -lZ /etc/hostname /etc/cloud/cloud.cfg; hostnamectl status; journalctl -b -u systemd-hostnamed -u NetworkManager --no-pager' > "$LOG/hostname-failed-details.txt" 2>&1 || true
+                  cat "$LOG/hostname-failed-details.txt"
+                  fail 'Target static or running hostname differs from expected'
+              fi
+          }
           cloud_wait target first-boot
+          verify_target_hostname
+          if [ "$TARGET_OS" = freebsd ]; then ssh_guest target 'grep -Fq "DDify: FreeBSD firstboot completed" /var/log/ddify-firstboot.log'; fi
           collect_guest target first-boot
           first=$(boot_id target)
           ssh_guest target 'if [ "$(uname -s)" = FreeBSD ]; then shutdown -r now; else systemctl reboot; fi' || true
-          end=$((SECONDS+900))
+          end=$(($(date +%s)+900))
           while :; do
               current=$(boot_id target 2>/dev/null || true)
-              [[ -z "$current" || "$current" == "$first" ]] || break
+              { [ -z "$current" ] || [ "$current" = "$first" ]; } || break
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped on second boot'
-              ((SECONDS < end)) || fail 'No new boot ID after reboot'
+              [ "$(date +%s)" -lt "$end" ] || fail 'No new boot ID after reboot'
               sleep 10
           done
           assert_os target "$TARGET_OS"
           cloud_wait target second-boot
+          verify_target_hostname
           ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port)" = 18080 && test "$(id -u)" = 0'
           if ssh_guest source true >/dev/null 2>&1; then fail 'Old source SSH key still grants root access'; fi
           collect_guest target second-boot
           case "$TARGET_OS" in
-              rocky) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
+              rocky|almalinux|fedora|debian|redhat) ssh_guest target 'test -d /sys/firmware/efi && labels=$(lsblk -nr -o PARTLABEL) && ! printf "%s\n" "$labels" | grep -ix CIDATA' ;;
               freebsd) ssh_guest target 'test -c /dev/efi && layout=$(gpart show -l) && ! printf "%s\n" "$layout" | grep -w CIDATA' ;;
           esac
-          echo "PASS: $SOURCE_OS -> $TARGET_OS (two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed)"
+          # Independent final acceptance from the runner, through QEMU's TCP
+          # forwarding, after DDify and both guest boots have completed.
+          echo '[SSH] Verify installed guest from runner at 127.0.0.1:2222 -> guest port 22'
+          ssh_nonce=$(openssl rand -hex 16)
+          # A fresh TCP connection must authenticate with the NEW key only,
+          # run a privileged remote command, and round-trip an unpredictable
+          # value through the guest filesystem. Disable connection sharing.
+          if ! timeout 60s ssh -v -T -p 2222 -i "$WORK/target-key" \
+              -o IdentitiesOnly=yes -o BatchMode=yes -o PreferredAuthentications=publickey \
+              -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+              -o ControlMaster=no -o ControlPath=none \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+              root@127.0.0.1 sh -s -- "$ssh_nonce" \
+              > "$LOG/final-ssh.txt" 2> "$LOG/final-ssh-client.log" <<'SSH_ACCEPTANCE'
+          set -eu
+          PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:$PATH
+          export PATH
+          test "$(id -u)" = 0
+          test -n "$SSH_CONNECTION"
+          printf 'Remote OS: '; uname -s
+          printf 'Remote hostname: '; hostname
+          printf 'SSH connection: %s\n' "$SSH_CONNECTION"
+          case "$(uname -s)" in
+              FreeBSD)
+                  service sshd onestatus
+                  sockstat -46l
+                  ;;
+              Linux)
+                  if systemctl is-active --quiet sshd.service; then
+                      systemctl is-active sshd.service
+                  elif systemctl is-active --quiet ssh.service; then
+                      systemctl is-active ssh.service
+                  elif systemctl is-active --quiet ssh.socket; then
+                      systemctl is-active ssh.socket
+                  elif systemctl is-active --quiet sshd.socket; then
+                      systemctl is-active sshd.socket
+                  else
+                      echo 'No active OpenSSH service or socket' >&2
+                      exit 1
+                  fi
+                  ss -ltn
+                  ;;
+              *) exit 1 ;;
+          esac
+          test -f /etc/reinstall-web-port
+          test "$(cat /etc/reinstall-web-port)" = 18080
+          test ! -e /var/tmp/ddify-old-system-marker
+          probe=$(mktemp /var/tmp/ddify-ssh-probe.XXXXXX)
+          trap 'rm -f "$probe"' 0
+          printf '%s\n' "$1" > "$probe"
+          test "$(cat "$probe")" = "$1"
+          printf 'DDIFY_SSH_OK:%s\n' "$(cat "$probe")"
+          SSH_ACCEPTANCE
+          then
+              cat "$LOG/final-ssh.txt" "$LOG/final-ssh-client.log" || true
+              fail 'Final runner-to-guest SSH acceptance failed'
+          fi
+          cat "$LOG/final-ssh.txt"
+          grep -Fxq "DDIFY_SSH_OK:$ssh_nonce" "$LOG/final-ssh.txt" ||
+              fail 'Final SSH challenge response missing'
+          echo '[SSH] PASS: new key, root login, SSH service and remote read/write verified'
+          echo '[QEMU] Requesting normal target shutdown over SSH'
+          shutdown_vm target
+          echo '[QEMU] PASS: guest powered off and QEMU exited normally'
+          echo "PASS: $SOURCE_OS -> $TARGET_OS ${TARGET_VERSION:-custom} (${RAM} MiB RAM, ${DISK_BYTES} bytes disk, two boots, new SSH key, NoCloud marker, old system absent, CIDATA removed, final SSH acceptance, clean shutdown)"
       - name: Upload logs even when installation fails
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}
+          name: qemu-${{ matrix.source }}-to-${{ matrix.target }}-${{ matrix.version || 'custom' }}
           path: ${{ runner.temp }}/ddify-qemu/logs/
           if-no-files-found: warn
           retention-days: 7
