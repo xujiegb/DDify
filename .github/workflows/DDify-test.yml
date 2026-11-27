@@ -269,6 +269,7 @@ jobs:
           PID=''
           serial_tail_pid=''
           serial_filter_pid=''
+          serial_session_pid=''
           # QEMU's unfiltered UART output stays outside the uploaded log folder.
           RAW_SERIAL="$WORK/serial.raw"
           export RAW_SERIAL
@@ -280,6 +281,10 @@ jobs:
               if [ -n "$PID" ]; then
                   kill "$PID" 2>/dev/null || true
                   wait "$PID" 2>/dev/null || true
+              fi
+              if [ -n "$serial_session_pid" ]; then
+                  kill "$serial_session_pid" 2>/dev/null || true
+                  wait "$serial_session_pid" 2>/dev/null || true
               fi
               if [ -n "$serial_tail_pid" ]; then
                   # Let the follower drain the final UART bytes after QEMU exits.
@@ -439,7 +444,7 @@ jobs:
               else
                   set --
               fi
-              rm -f "$WORK/serial.sock"
+              rm -f "$WORK/serial.sock" "$WORK/qmp.sock"
               qemu-system-x86_64 -machine "q35,accel=$accel" -cpu "$cpu" -smp 2 -m "$RAM" \
                   -drive "if=pflash,format=raw,readonly=on,file=$CODE" \
                   -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -447,7 +452,7 @@ jobs:
                   -device virtio-blk-pci,drive=system,serial=DDIFYCI001,bootindex=1 \
                   -netdev user,id=net,hostfwd=tcp:127.0.0.1:2222-:22 \
                   -device virtio-net-pci,netdev=net \
-                  -display none -monitor none \
+                  -display none -monitor none -qmp "unix:$WORK/qmp.sock,server=on,wait=off" \
                   -chardev "socket,id=console,path=$WORK/serial.sock,server=on,wait=off,logfile=$RAW_SERIAL,logappend=on" \
                   -serial chardev:console "$@" >> "$LOG/qemu.log" 2>&1 &
               PID=$!
@@ -553,7 +558,8 @@ jobs:
           # Drive the emulated UART, not SSH, QMP guest execution or file injection.
           # All commands below execute in the real guest root login session.
           echo '[serial] Login as root, download pinned DDify and reinstall'
-          expect <<'EXPECT'
+          rm -f "$WORK/serial-handoff.ok"
+          expect <<'EXPECT' &
           # The live UART follower already prints the received stream.
           # Use a binary, unbuffered pipe, not a second PTY/terminal driver.
           log_user 0
@@ -632,10 +638,44 @@ jobs:
               timeout { die "Installer did not reach reboot handoff" }
               eof { die "Serial connection lost before reboot handoff" }
           }
-          # QEMU itself continues logging UART output after Expect disconnects.
+          # Keep the serial socket connected and continuously drained through
+          # rescue, reboot, first boot and final verification. A disconnected
+          # or abandoned console must not backpressure the emulated UART.
+          set handoff [open "$env(WORK)/serial-handoff.ok" w]
+          puts $handoff "ready"
+          close $handoff
+          set timeout -1
+          expect {
+              eof {}
+              -re {[\s\S]+} { exp_continue }
+              full_buffer { exp_continue }
+          }
           catch {close}
           catch {wait}
           EXPECT
+          serial_session_pid=$!
+          handoff_end=$(($(date +%s)+2400))
+          until [ -f "$WORK/serial-handoff.ok" ]; do
+              if ! kill -0 "$serial_session_pid" 2>/dev/null; then
+                  wait "$serial_session_pid" || fail 'Serial root session failed'
+                  fail 'Serial session exited before installer handoff'
+              fi
+              [ "$(date +%s)" -lt "$handoff_end" ] || fail 'Serial installer handoff timed out'
+              sleep 1
+          done
+          collect_qemu_state() {
+              {
+                  date -u
+                  ps -L -p "$PID" -o pid,tid,stat,pcpu,wchan:32,comm
+                  cat "/proc/$PID/status" "/proc/$PID/io" 2>/dev/null || true
+                  printf '%s\n' '{"execute":"qmp_capabilities"}' \
+                      '{"execute":"query-status"}' '{"execute":"query-block"}' \
+                      '{"execute":"query-blockstats"}' '{"execute":"query-cpus-fast"}' \
+                      '{"execute":"human-monitor-command","arguments":{"command-line":"info registers"}}' |
+                      timeout 15s socat -t 10 STDIO "UNIX-CONNECT:$WORK/qmp.sock" || true
+              } > "$LOG/qemu-stall-state.txt" 2>&1
+              cat "$LOG/qemu-stall-state.txt"
+          }
           # Keep the ephemeral secret only until the UART artifact is redacted
           # in cleanup; it is never passed to the target installation.
           # SSH from this point is an independent check of the reinstalled OS.
@@ -645,6 +685,7 @@ jobs:
           end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
+              kill -0 "$serial_session_pid" 2>/dev/null || fail 'Persistent UART reader stopped during reinstall'
               if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify rescue reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1 && ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port 2>/dev/null)" = 18080' >/dev/null 2>&1; then break; fi
               if grep -Eq 'DDIFY_HOST_RC:[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify host reported failure on serial console'; fi
@@ -659,6 +700,7 @@ jobs:
               uart_mtime=$(stat -c %Y "$RAW_SERIAL")
               if [ $((now - uart_mtime)) -ge 600 ] || [ "$now" -ge "$end" ]; then
                   echo 'Collecting stalled guest diagnostics'
+                  collect_qemu_state
                   SSH_TIMEOUT=30s ssh_guest target 'uname -a; cat /proc/meminfo /proc/diskstats 2>/dev/null; ps -ef; df -h; dmesg | tail -n 100' > "$LOG/stall-diagnostics.txt" 2>&1 || true
                   cat "$LOG/stall-diagnostics.txt" || true
                   [ "$now" -lt "$end" ] || fail 'Target did not boot with new credentials and marker'
