@@ -1338,16 +1338,42 @@ seed_runcmd() {
 
     echo
     echo "runcmd:"
-    # Alpine may create /etc/hostname without the target's SELinux context.
-    # Reapply the target policy after it is loaded, not the rescue policy.
-    cat <<'EOF'
+    # The newly created static hostname may not have its SELinux label when
+    # PID 1 reads it. After relabeling, reconcile the running hostname too,
+    # because NetworkManager may have selected a DHCP name in the meantime.
+    local name
+    name=$(seed_hostname "$os") || error "Invalid Linux target hostname"
+    cat <<EOF
   - |
+      ddify_hostname='$name'
+EOF
+    cat <<'EOF'
       ddify_hostname_failed=0
       if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != Disabled ]; then
           if ! command -v restorecon >/dev/null 2>&1 ||
              ! restorecon -F /etc/hostname /etc/cloud/cloud.cfg; then
               ddify_hostname_failed=1
           fi
+      fi
+      if [ "$ddify_hostname_failed" = 0 ]; then
+          if [ "$(cat /etc/hostname)" != "$ddify_hostname" ] ||
+             [ "$(hostname)" != "$ddify_hostname" ]; then
+              if command -v hostnamectl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+                  hostnamectl set-hostname "$ddify_hostname" || ddify_hostname_failed=1
+              else
+                  (printf '%s\n' "$ddify_hostname" > /etc/hostname && hostname "$ddify_hostname") ||
+                      ddify_hostname_failed=1
+              fi
+          fi
+          if [ "$(cat /etc/hostname)" != "$ddify_hostname" ] ||
+             [ "$(hostname)" != "$ddify_hostname" ]; then
+              ddify_hostname_failed=1
+          fi
+      fi
+      if [ "$ddify_hostname_failed" = 0 ]; then
+          echo "DDify: verified static and running hostname $ddify_hostname"
+      else
+          echo "DDify: failed to reconcile static and running hostname" >&2
       fi
 EOF
     seed_runcmd_ssh_port "$os"
