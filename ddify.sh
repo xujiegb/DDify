@@ -2133,8 +2133,11 @@ setup_zram_swap() {
         exit 1
     }
 
-    [ "$mem_kb" -ge 716800 ] || {
-        echo "DDify requires a VPS with at least 768 MiB installed RAM (usable MemTotal=$mem_kb KiB)." >&2
+    # QEMU and firmware reserve some installed RAM before Linux sees it.
+    # The low-memory CI profile allocates 720 MiB, not 720 MiB MemTotal.
+    case "$mem_kb" in ''|*[!0-9]*) echo "Invalid MemTotal" >&2; exit 1 ;; esac
+    [ "$mem_kb" -ge 655360 ] || {
+        echo "DDify requires at least 640 MiB usable Linux RAM (MemTotal=$mem_kb KiB)." >&2
         exit 1
     }
     zram_bytes=$((mem_kb * 1024 * 2))
@@ -2177,7 +2180,10 @@ setup_work_tmpfs() {
     reserve=201326592
     # Logical compressed swap is not extra physical RAM.
     work_bytes=$((mem_bytes - reserve))
-    [ "$work_bytes" -gt 536870912 ] || work_bytes=536870912
+    [ "$work_bytes" -ge 134217728 ] || {
+        echo "Insufficient RAM for the rescue workspace." >&2
+        exit 1
+    }
 
     mkdir -p /run/reinstall-work
     if is_mountpoint /run/reinstall-work; then
@@ -2224,6 +2230,20 @@ relocate_modloop_to_ram() {
         exit 1
     }
 
+    # Network boot already downloads modloop into the diskless root in RAM.
+    # Avoid holding two copies. Only reuse a backing file whose filesystem
+    # is demonstrably independent of the target disk.
+    local backing_fs
+    backing_fs=$(findmnt -rn -o FSTYPE --target "$backing") || exit 1
+    case "$backing_fs" in
+        tmpfs|ramfs|rootfs)
+            [ -d "/.modloop/modules/$kver" ] && [ -e "/lib/modules/$kver" ] || {
+                echo "RAM-backed modloop is missing kernel modules." >&2
+                exit 1
+            }
+            echo "Alpine modloop already resides on $backing_fs; no duplicate RAM copy needed."
+            return 0 ;;
+    esac
     ram_modloop="/run/reinstall-work/modloop.ram.squashfs"
     echo "Relocating Alpine modloop to RAM: $backing -> $ram_modloop"
     cp "$backing" "$ram_modloop"
