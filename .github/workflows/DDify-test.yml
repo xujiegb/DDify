@@ -197,6 +197,42 @@ jobs:
           set -eu
           . "$DDIFY_HELPER_DIR/functions.sh"
           work=$(mktemp -d "$DDIFY_HELPER_DIR/run.XXXXXX")
+          # TUI helpers: plain output for automation; no real disk or reboot.
+          (
+              UI_TTY=0 UI_COLOR=0 UI_WIDTH=40
+              state=before
+              task() { state=after; warn 'test warning'; }
+              ui_step 2 'Target disk and image' 2>"$work/ui-plain"
+              ui_task 'Test task' task task 2>>"$work/ui-plain"
+              [ "$state" = after ]
+              grep -Fq '[##---] 2/5' "$work/ui-plain"
+              grep -Fq '[OK] Test task' "$work/ui-plain"
+              grep -Fq 'WARN: test warning' "$work/ui-plain"
+              if grep -q "$(printf '\033')" "$work/ui-plain"; then exit 1; fi
+          )
+          (
+              UI_TTY=1 UI_COLOR=0 UI_WIDTH=40
+              UI_LOG_DIR="$work/ui-logs"
+              mkdir "$UI_LOG_DIR"
+              state=before
+              task() { state=after; printf 'verbose internal output\n'; warn 'visible safety warning'; }
+              ui_task 'Captured task' captured task 2>"$work/ui-captured"
+              [ "$state" = after ]
+              grep -Fq 'verbose internal output' "$UI_LOG_DIR/captured.log"
+              grep -Fq '[!] visible safety warning' "$work/ui-captured"
+              if grep -Fq 'verbose internal output' "$work/ui-captured"; then exit 1; fi
+          )
+          (
+              UI_TTY=1 UI_COLOR=0
+              UI_LOG_DIR="$work/ui-failure-logs"
+              mkdir "$UI_LOG_DIR"
+              exec 3>"$work/ui-failure"
+              trap 'ui_exit "$?"' 0
+              fail_task() { error 'simulated terminal failure'; }
+              ui_task 'Failing task' failure fail_task
+          ) && exit 1
+          grep -Fq 'ERROR: simulated terminal failure' "$work/ui-failure"
+          [ -f "$work/ui-failure-logs/failure.log" ]
           value="key 'quoted' \$value"
           plan_assignment DDIFY_TEST_VALUE "$value" > "$work/plan"
           . "$work/plan"
