@@ -138,6 +138,7 @@ ui_notice() {
 usage() {
     cat <<EOF
 Usage:
+  $SCRIPT_NAME                          Interactive setup (terminal only)
   $SCRIPT_NAME freebsd 14|15 [options]
   $SCRIPT_NAME rocky 10 [options]
   $SCRIPT_NAME almalinux 10 [options]
@@ -4550,17 +4551,197 @@ target_versions() {
     esac
 }
 
-parse_target() {
-    [ $# -gt 0 ] || error "Missing target OS"
-    TARGET_OS=$(to_lower "$1"); shift
-    target_versions "$TARGET_OS" >/dev/null || error "Unknown target OS: $TARGET_OS"
+# The same settings feed the installer whether supplied by flags or the TUI.
+# Prompts run only on a real interactive terminal; pipes retain CLI behavior.
+ui_prompt() {
+    local answer
+    printf '  %s: ' "$1" >&2
+    IFS= read -r answer || error "Input cancelled"
+    printf '%s' "$answer"
+}
 
-    [ "$TARGET_OS" != redhat ] || { PARSE_SHIFT=0; return; }
-    { [ $# -gt 0 ] && { case "$1" in --*) false ;; *) true ;; esac; }; } || error "Missing version for $TARGET_OS"
-    TARGET_VER="$1"
-    [ -n "$TARGET_VER" ] && printf '%s\n' "$(target_versions "$TARGET_OS")" | tr ' ' '\n' | grep -Fxq -- "$TARGET_VER" || \
-        error "Unsupported $TARGET_OS version: $TARGET_VER (supported: $(target_versions "$TARGET_OS"))"
-    PARSE_SHIFT=1
+ui_setting() {
+    ui_field "$1" "$2 [$3]"
+}
+
+ui_display_url() {
+    # Avoid displaying credentials, signed URL queries, or fragments.
+    printf '%s\n' "$1" | sed -e 's#://[^/]*@#://[redacted]@#' -e 's/[?#].*$/ [redacted]/'
+}
+
+parse_host_request() {
+    if [ $# -gt 0 ]; then
+        case "$1" in
+            --*) ;;
+            *)
+                TARGET_OS=$(to_lower "$1"); shift
+                target_versions "$TARGET_OS" >/dev/null || error "Unknown target OS: $TARGET_OS"
+                if [ "$TARGET_OS" != redhat ] && [ $# -gt 0 ]; then
+                    case "$1" in --*) ;; *) TARGET_VER="$1"; shift ;; esac
+                fi
+                ;;
+        esac
+    fi
+    parse_host_options "$@"
+}
+
+ui_target_settings() {
+    local choice versions origin
+    if [ -n "$TARGET_OS" ]; then
+        ui_setting "Target OS" "$TARGET_OS" CLI
+    else
+        [ "$UI_TTY" = 1 ] || error "Missing target OS; run with --help"
+        ui_heading "  Select target operating system"
+        printf '  [1] Rocky Linux\n  [2] AlmaLinux\n  [3] Fedora\n  [4] Debian\n  [5] FreeBSD\n  [6] Red Hat Enterprise Linux (custom image)\n  [0] Cancel\n' >&2
+        choice=$(ui_prompt "Operating system") || error "Target selection cancelled"
+        case "$choice" in
+            1) TARGET_OS=rocky ;; 2) TARGET_OS=almalinux ;;
+            3) TARGET_OS=fedora ;; 4) TARGET_OS=debian ;;
+            5) TARGET_OS=freebsd ;; 6) TARGET_OS=redhat ;;
+            0) error "Installation cancelled" ;;
+            *) error "Invalid operating system selection" ;;
+        esac
+        ui_setting "Target OS" "$TARGET_OS" TUI
+    fi
+    if [ "$TARGET_OS" = redhat ]; then
+        ui_setting "Version" "From custom image" default
+        return 0
+    fi
+    versions=$(target_versions "$TARGET_OS") || error "Unknown target OS: $TARGET_OS"
+    origin=CLI
+    if [ -z "$TARGET_VER" ]; then
+        [ "$UI_TTY" = 1 ] || error "Missing version for $TARGET_OS"
+        case "$versions" in
+            *' '*)
+                TARGET_VER=$(ui_prompt "Version ($versions)") || error "Version selection cancelled"
+                origin=TUI ;;
+            *) TARGET_VER="$versions"; origin=default ;;
+        esac
+    fi
+    printf '%s\n' "$versions" | tr ' ' '\n' | grep -Fxq -- "$TARGET_VER" ||
+        error "Unsupported $TARGET_OS version: $TARGET_VER (supported: $versions)"
+    ui_setting "Version" "$TARGET_VER" "$origin"
+}
+
+ui_image_settings() {
+    local origin=CLI
+    if [ -z "$IMG_URL" ]; then
+        if [ "$UI_TTY" = 1 ]; then
+            if [ "$TARGET_OS" = redhat ]; then
+                IMG_URL=$(ui_prompt "HTTPS image URL") || error "Image selection cancelled"
+            else
+                IMG_URL=$(ui_prompt "Custom HTTPS image URL (Enter = official image)") || error "Image selection cancelled"
+            fi
+            origin=TUI
+        fi
+        if [ -z "$IMG_URL" ]; then
+            [ "$TARGET_OS" != redhat ] || error "redhat requires --img URL"
+            IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
+            IMAGE_BUILTIN=1
+            origin=default
+        fi
+    fi
+    case "$IMG_URL" in https://*) ;; *) error "Image URL must use HTTPS" ;; esac
+    if image_is_freebsd_raw && [ "$IMAGE_BUILTIN" != 1 ]; then
+        error "Custom RAW images require a trusted checksum; use the built-in FreeBSD RAW URL or a QCOW2 override"
+    fi
+    ui_setting "Image" "$(ui_display_url "$IMG_URL")" "$origin"
+}
+
+ui_disk_settings() {
+    local override origin=CLI
+    if [ -z "$DISK" ]; then
+        ui_task "Detect current system disk" disk-detect auto_detect_disk
+        origin=auto
+        if [ "$UI_TTY" = 1 ]; then
+            print_disk_candidates
+            override=$(ui_prompt "Target disk path (Enter = recommended)") || error "Disk selection cancelled"
+            if [ -n "$override" ]; then
+                DISK="$override"
+                DISK_AUTO_SELECTED=0
+                origin=TUI
+            fi
+        fi
+    fi
+    ui_task "Validate target disk" disk prepare_target_disk
+    ui_setting "Target disk" "$DISK" "$origin"
+    ui_task "Check disk capacity" capacity validate_target_capacity
+}
+
+ui_auth_settings() {
+    local key entered origin
+    if [ -n "$SSH_KEY_ARGS" ] || [ -n "$PASSWORD" ]; then
+        # Either CLI authentication method is complete; never prompt for
+        # an additional method or echo supplied secret/key material.
+        [ -z "$PASSWORD" ] || ui_setting "Root password" "Configured (hidden)" CLI
+        [ -z "$SSH_KEY_ARGS" ] || ui_setting "SSH public keys" "Supplied; validating" CLI
+        for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
+    elif [ "$UI_TTY" = 1 ]; then
+        entered=$(ui_prompt "SSH public key, path or HTTPS URL (Enter = password)") || error "Authentication cancelled"
+        if [ -n "$entered" ]; then
+            append_ssh_key "$entered"
+            ui_setting "SSH public keys" "Configured" TUI
+        fi
+    fi
+    prepare_credentials
+    if [ -n "$SSH_KEYS_ALL" ]; then
+        ui_field "Validated keys" "$(printf '%s\n' "$SSH_KEYS_ALL" | awk 'NF {n++} END {print n+0}')"
+    fi
+    origin=default
+    if [ -n "$SSH_PORT" ]; then
+        origin=CLI
+    elif [ "$UI_TTY" = 1 ]; then
+        SSH_PORT=$(ui_prompt "SSH port (Enter = 22)") || error "SSH port selection cancelled"
+        [ -z "$SSH_PORT" ] || origin=TUI
+    fi
+    if [ -n "$SSH_PORT" ]; then is_port_valid "$SSH_PORT" || error "Invalid SSH port: $SSH_PORT"; fi
+    ui_setting "SSH port" "${SSH_PORT:-22}" "$origin"
+}
+
+ui_optional_settings() {
+    local origin
+    origin=CLI
+    if [ -z "$WEB_PORT" ]; then
+        origin=default
+        if [ "$UI_TTY" = 1 ]; then
+            WEB_PORT=$(ui_prompt "Web port file (Enter = none)") || error "Web port selection cancelled"
+            [ -z "$WEB_PORT" ] || origin=TUI
+        fi
+    fi
+    if [ -n "$WEB_PORT" ]; then is_port_valid "$WEB_PORT" || error "Invalid web port: $WEB_PORT"; fi
+    ui_setting "Web port" "${WEB_PORT:-None}" "$origin"
+
+    origin=CLI
+    if [ -z "$FRPC_TOML" ]; then
+        origin=default
+        if [ "$UI_TTY" = 1 ]; then
+            FRPC_TOML=$(ui_prompt "FRPC TOML path or HTTPS URL (Enter = none)") || error "FRPC selection cancelled"
+            [ -z "$FRPC_TOML" ] || origin=TUI
+        fi
+    fi
+    if [ -n "$FRPC_TOML" ]; then
+        case "$FRPC_TOML" in
+            https://*) ;;
+            http://*) error "FRPC config URL must use HTTPS" ;;
+            *) [ -f "$FRPC_TOML" ] && [ -r "$FRPC_TOML" ] || error "FRPC configuration is not a readable file" ;;
+        esac
+        ui_setting "FRPC config" "$(ui_display_url "$FRPC_TOML")" "$origin"
+    else
+        ui_setting "FRPC config" "None" "$origin"
+    fi
+
+    origin=CLI
+    if [ -z "$POST_INSTALL_HOOK" ]; then
+        origin=default
+        if [ "$UI_TTY" = 1 ]; then
+            POST_INSTALL_HOOK=$(ui_prompt "Post-install shell script path (Enter = none)") || error "Hook selection cancelled"
+            [ -z "$POST_INSTALL_HOOK" ] || origin=TUI
+        fi
+    fi
+    if [ -n "$POST_INSTALL_HOOK" ]; then
+        [ -f "$POST_INSTALL_HOOK" ] && [ -r "$POST_INSTALL_HOOK" ] || error "Post-install hook is not a readable file"
+    fi
+    ui_setting "Post-install" "${POST_INSTALL_HOOK:-None}" "$origin"
 }
 
 append_ssh_key() {
@@ -4609,11 +4790,8 @@ ensure_supported_sector_size() {
 }
 
 prepare_target_disk() {
-    if [ -n "$DISK" ]; then
-        { case "$DISK" in /dev/*) true ;; *) false ;; esac; } || DISK="/dev/$DISK"
-    else
-        auto_detect_disk
-    fi
+    [ -n "$DISK" ] || auto_detect_disk
+    { case "$DISK" in /dev/*) true ;; *) false ;; esac; } || DISK="/dev/$DISK"
     validate_target_disk "$DISK"
     ensure_supported_sector_size
     capture_target_disk_identity "$DISK"
@@ -4661,15 +4839,15 @@ print_host_summary() {
     ui_field "Capacity" "$(awk -v n="$disk_bytes" 'BEGIN {printf "%.2f GB (%.2f GiB)",n/1000000000,n/1073741824}')"
     ui_field "Firmware" "UEFI / one-time rescue boot"
     ui_field "Staging" "Disk staging (destructive)"
-    ui_field "Image URL" "$IMG_URL"
+    ui_field "Image URL" "$(ui_display_url "$IMG_URL")"
     ui_field "Hostname" "$(seed_hostname "$TARGET_OS")"
     ui_field "SSH account" "root"
     ui_field "SSH port" "${SSH_PORT:-22}"
     ui_field "Authentication" "$auth"
     ui_field "SSH keys" "$keys"
     [ -z "$WEB_PORT" ] || ui_field "Web port file" "$WEB_PORT"
-    [ -z "$FRPC_TOML" ] || ui_field "FRPC config" "Configured"
-    [ -z "$POST_INSTALL_HOOK" ] || ui_field "Post-install" "Configured"
+    ui_field "FRPC config" "$(ui_display_url "${FRPC_TOML:-None}")"
+    ui_field "Post-install" "${POST_INSTALL_HOOK:-None}"
     ui_rule
     if [ "$AUTO_PASSWORD" = 1 ]; then
         ui_notice "Save this generated root password now:"
@@ -4751,14 +4929,13 @@ host_main() {
     { [ -f "$0" ] && [ -r "$0" ] && { case "$0" in /dev/fd/*) false ;; *) true ;; esac; } && { case "$0" in /proc/*/fd/*) false ;; *) true ;; esac; }; } ||
         error "Run from a local script file; piping or process substitution is unsupported"
 
-    parse_target "$@"
-    local skip=$((1 + PARSE_SHIFT))
-    shift "$skip"
-    parse_host_options "$@"
-
-    { [ "$TARGET_OS" != redhat ] || [ -n "$IMG_URL" ]; } || error "redhat requires --img URL"
-    { case "$IMG_URL" in http://*) false ;; *) true ;; esac; } || error "HTTP image URLs are not supported; use HTTPS"
+    parse_host_request "$@"
     ui_init
+    if [ "$UI_TTY" != 1 ]; then
+        [ -n "$TARGET_OS" ] || error "Missing target OS; run with --help"
+        [ "$TARGET_OS" = redhat ] || [ -n "$TARGET_VER" ] || error "Missing version for $TARGET_OS"
+        [ "$TARGET_OS" != redhat ] || [ -n "$IMG_URL" ] || error "redhat requires --img URL"
+    fi
     ui_step 1 "Environment"
     detect_os_arch
     validate_supported_install_mode
@@ -4766,22 +4943,14 @@ host_main() {
     ui_task "Check host dependencies" dependencies ensure_dependencies
     ui_task "Check Secure Boot" secure-boot check_secure_boot
     ui_step 2 "Target disk and image"
-    local key
-    ui_task "Identify and validate target disk" disk prepare_target_disk
-    ui_field "Selected disk" "$DISK"
-    ui_task "Check disk capacity" capacity validate_target_capacity
-    if [ -z "$IMG_URL" ]; then
-        IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
-        IMAGE_BUILTIN=1
-    fi
-    if image_is_freebsd_raw && [ "$IMAGE_BUILTIN" != 1 ]; then
-        error "Custom RAW images require a trusted checksum; use the built-in FreeBSD RAW URL or a QCOW2 override"
-    fi
+    ui_target_settings
+    ui_image_settings
+    ui_disk_settings
     ui_task "Check target image URL" image-url preflight_target_image_on_host
-    ui_step 3 "Authentication"
-    for key in $SSH_KEY_ARGS; do append_ssh_key "$(printf '%s' "$key" | base64 -d)"; done
-    prepare_credentials
+    ui_step 3 "Authentication and optional settings"
+    ui_auth_settings
     ui_ok "Root authentication configured"
+    ui_optional_settings
     ui_step 4 "Review and confirm"
     print_host_summary
     ui_notice "DHCPv4 is required; static IP, VLAN and bonding are not migrated."
