@@ -588,6 +588,9 @@ jobs:
           # Keep the ephemeral secret only until the UART artifact is redacted
           # in cleanup; it is never passed to the target installation.
           # SSH from this point is an independent check of the reinstalled OS.
+          # The copy backend emits a heartbeat every 15 seconds. If the
+          # installer stops emitting UART output, gather rescue diagnostics
+          # before failing rather than leaving an apparently frozen job.
           end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
@@ -601,7 +604,15 @@ jobs:
                   ssh_guest target 'cat /var/log/reinstall-auto.log' > "$LOG/rescue.log.tmp" 2>/dev/null && mv "$LOG/rescue.log.tmp" "$LOG/rescue.log" || true
                   if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*' "$LOG/rescue.log"; then fail 'DDify installer reported failure'; fi
               fi
-              [ "$(date +%s)" -lt "$end" ] || fail 'Target did not boot with new credentials and marker'
+              now=$(date +%s)
+              uart_mtime=$(stat -c %Y "$RAW_SERIAL")
+              if [ $((now - uart_mtime)) -ge 600 ] || [ "$now" -ge "$end" ]; then
+                  echo 'Collecting stalled guest diagnostics'
+                  SSH_TIMEOUT=30s ssh_guest target 'uname -a; cat /proc/meminfo /proc/diskstats 2>/dev/null; ps -ef; df -h; dmesg | tail -n 100' > "$LOG/stall-diagnostics.txt" 2>&1 || true
+                  cat "$LOG/stall-diagnostics.txt" || true
+                  [ "$now" -lt "$end" ] || fail 'Target did not boot with new credentials and marker'
+                  fail 'No QEMU UART output for 10 minutes'
+              fi
               sleep 10
           done
           cloud_wait target first-boot
