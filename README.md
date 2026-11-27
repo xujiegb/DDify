@@ -66,9 +66,9 @@ The pre-reboot terminal wizard uses the system `/bin/sh` (including dash, BusyBo
 
 重启前提供五阶段终端向导：环境检测、磁盘和镜像、身份认证、确认安装、重启准备。只需系统 `/bin/sh`，无需 Bash 或额外的 TUI 框架。管道和 CI 使用纯文本输出，可通过 `NO_COLOR=1` 关闭色彩。
 
-Run without arguments for interactive setup, or prefill any settings with the existing command-line options. Each supplied value is shown as `[CLI - preset]` and its prompt is skipped. Only missing settings are requested on an interactive terminal. Passwords and SSH key material are hidden; credentials and query strings in displayed URLs are redacted. The final destructive confirmation is always required.
+Run without arguments for interactive setup, or prefill any settings with the existing command-line options. Each supplied value is shown as `[CLI - preset]` and its prompt is skipped. Only missing settings are requested on an interactive terminal. Passwords and SSH key material are hidden; credentials and query strings in displayed URLs are redacted. The current system disk is automatically selected when `--disk` is omitted; specify `--disk` to override it. The final destructive confirmation is always required.
 
-无参数启动可进入完整交互配置，也可以使用原有命令行参数预填任意项目。已提供的参数显示为 `[CLI - preset]`，并跳过相应输入；只询问未提供的设置。密码、公钥内容以及 URL 中的敏感信息不回显。最终擦盘确认始终保留。
+无参数启动可进入完整交互配置，也可以使用原有命令行参数预填任意项目。已提供的参数显示为 `[CLI - preset]`，并跳过相应输入；只询问未提供的设置。密码、公钥内容以及 URL 中的敏感信息不回显。未指定 `--disk` 时自动选择当前系统盘，不再询问磁盘路径；可使用 `--disk` 显式指定。最终擦盘确认始终保留。
 
 ```sh
 sh ddify.sh
