@@ -66,6 +66,15 @@ The pre-reboot terminal wizard uses the system `/bin/sh` (including dash, BusyBo
 
 重启前提供五阶段终端向导：环境检测、磁盘和镜像、身份认证、确认安装、重启准备。只需系统 `/bin/sh`，无需 Bash 或额外的 TUI 框架。管道和 CI 使用纯文本输出，可通过 `NO_COLOR=1` 关闭色彩。
 
+Run without arguments for interactive setup, or prefill any settings with the existing command-line options. Each supplied value is shown as `[CLI - preset]` and its prompt is skipped. Only missing settings are requested on an interactive terminal. Passwords and SSH key material are hidden; credentials and query strings in displayed URLs are redacted. The final destructive confirmation is always required.
+
+无参数启动可进入完整交互配置，也可以使用原有命令行参数预填任意项目。已提供的参数显示为 `[CLI - preset]`，并跳过相应输入；只询问未提供的设置。密码、公钥内容以及 URL 中的敏感信息不回显。最终擦盘确认始终保留。
+
+```sh
+sh ddify.sh
+sh ddify.sh rocky 10 --disk /dev/vda --ssh-key /root/.ssh/id_ed25519.pub --ssh-port 2222
+```
+
 **Warning / 警告:** DDify always uses disk staging. After you confirm the target disk, it erases the old system before the entire image is downloaded and verified. Back up your data first.
 
 DDify 默认且仅使用磁盘暂存。确认目标磁盘后，脚本会在完整镜像下载和校验前擦除原系统，请先备份数据。
