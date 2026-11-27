@@ -973,8 +973,8 @@ $SSH_KEYS_ALL
 DDIFY_INPUT_18
 }
 
-# Use a real hostname rather than the reserved fallback "localhost".
-# systemd-hostnamed on Fedora rejects setting localhost as a static hostname.
+# Use a consistent hostname in the offline target and NoCloud metadata.
+# Fedora cloud-init 25.3 can call hostnamectl before the system bus exists.
 seed_hostname() {
     case "$1" in
         rocky|almalinux|fedora|debian|redhat|freebsd) printf 'ddify-%s\n' "$1" ;;
@@ -986,7 +986,7 @@ seed_account_linux() {
     local hostname
     hostname=$(seed_hostname "$1") || error "Invalid target OS for hostname"
     cat <<EOF
-preserve_hostname: false
+preserve_hostname: true
 hostname: $hostname
 prefer_fqdn_over_hostname: false
 growpart:
@@ -4144,6 +4144,22 @@ $(awk '$1 !~ /^#/ && $3 == "btrfs" && $2 != "/" {split($4,a,","); for(i in a) if
 DDIFY_INPUT_16
 }
 
+# Set the static hostname while the copied root is writable. This avoids
+# cloud-init local-stage hostnamectl calls before D-Bus starts. Keep the
+# existing inode and its SELinux attributes when the file already exists.
+linux_copy_set_hostname() {
+    local root="$1" os="$2" name file
+    name=$(seed_hostname "$os") || error "Invalid Linux target hostname"
+    file="$root/etc/hostname"
+    [ ! -L "$file" ] || error "Refusing to rewrite a symlinked target hostname"
+    if [ -e "$file" ]; then
+        [ -f "$file" ] || error "Target hostname is not a regular file"
+    fi
+    (umask 022; printf '%s\n' "$name" >"$file") || error "Cannot write target hostname"
+    [ "$(cat "$file")" = "$name" ] || error "Target hostname verification failed"
+    info "Prepared static hostname: $name"
+}
+
 linux_copy_recreate_and_copy() {
     local root="$INSTALL_TMPDIR/linux-target" src_boot_mnt="$INSTALL_TMPDIR/linux-src-boot" \
         src_efi_mnt="$INSTALL_TMPDIR/linux-src-efi" boot_dev= efi_dev src_boot_fs= root_available root_used
@@ -4200,6 +4216,7 @@ linux_copy_recreate_and_copy() {
     [ -f "$root/etc/os-release" ] || error "Copied Linux root is missing /etc/os-release"
     { [ -e "$root/bin/sh" ] || [ -e "$root/usr/bin/sh" ]; } || error "Copied Linux root has no shell"
     linux_copy_repair_boot_configs
+    linux_copy_set_hostname "$root" "$TARGET_OS"
     linux_copy_ensure_efi_fallback
     linux_copy_regenerate_lvm_initramfs
     sync
