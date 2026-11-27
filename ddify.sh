@@ -547,86 +547,47 @@ get_disk_size_bytes() {
     diskinfo "$disk" 2>/dev/null | awk 'NR==1 {print $3; exit}'
 }
 
-unmount_target_disk_filesystems() {
-    local disk="$1" dev mnt d sysname holder_found holder
-
-    cd /
-
-    if [ "$OS" = "Linux" ]; then
-        command -v lsblk >/dev/null 2>&1 || error "lsblk is required before destructive write"
-
-        if command -v swapon >/dev/null 2>&1 && command -v swapoff >/dev/null 2>&1; then
-            while IFS= read -r dev; do
-                [ -n "$dev" ] || continue
-                if lsblk -nrpo NAME "$disk" 2>/dev/null | grep -Fxq "$dev"; then
-                    info "Disabling swap on target disk: $dev"
-                    swapoff "$dev" || error "Failed to disable target-disk swap: $dev"
-                fi
-            done <<DDIFY_INPUT_3
-$(swapon --show=NAME --noheadings 2>/dev/null || true)
-DDIFY_INPUT_3
+# Rescue runs from RAM. A busy target is unexpected: never unmount or
+# deactivate unknown storage automatically, and never treat a failed query as empty.
+assert_target_disk_idle() {
+    local disk="$1" nodes mounts swaps id dev sys holder member member_id
+    [ "$OS" = Linux ] || error "Disk commit must run in Linux rescue"
+    nodes=$(lsblk -nr -o MAJ:MIN "$disk") || error "Cannot enumerate target disk devices"
+    [ -n "$nodes" ] || error "Empty target disk inventory"
+    mounts=$(findmnt -krn -o MAJ:MIN) || error "Cannot read kernel mount inventory"
+    swaps=$(awk 'NR > 1 {print $1}' /proc/swaps) || error "Cannot read swap inventory"
+    for id in $nodes; do
+        match_ere "$id" '^[0-9]+:[0-9]+$' || error "Invalid target device number"
+        sys="/sys/dev/block/$id"
+        [ -d "$sys/holders" ] || error "Missing target sysfs holder inventory: $id"
+        if printf '%s\n' "$mounts" | grep -Fxq "$id"; then
+            error "Target device $id is mounted; refusing disk commit"
         fi
-
-        while IFS= read -r dev; do
-            [ -n "$dev" ] || continue
-            while IFS= read -r mnt; do
-                [ -n "$mnt" ] || continue
-                info "Unmounting target-disk filesystem: $dev from $mnt"
-                if ! umount "$mnt"; then
-                    warn "Failed to unmount $mnt; dumping mount/loop diagnostics before aborting."
-                    findmnt -R "$mnt" 2>/dev/null || true
-                    losetup -a 2>/dev/null || true
-                    if command -v fuser >/dev/null 2>&1; then
-                        fuser -vm "$mnt" 2>/dev/null || true
-                    fi
-                    error "Failed to unmount target-disk filesystem: $mnt"
-                fi
-            done <<DDIFY_INPUT_4
-$(findmnt -rn -S "$dev" -o TARGET 2>/dev/null || true)
-DDIFY_INPUT_4
-        done <<DDIFY_INPUT_5
-$(lsblk -nrpo NAME "$disk" 2>/dev/null | tac)
-DDIFY_INPUT_5
-
-        while IFS= read -r dev; do
-            [ -n "$dev" ] || continue
-            if findmnt -rn -S "$dev" >/dev/null 2>&1; then
-                error "A target-disk filesystem is still mounted on $dev; refusing dd"
+        for holder in "$sys/holders/"*; do
+            [ ! -e "$holder" ] || error "Target device $id has active block holders"
+        done
+        # A multi-device Btrfs mount can report a different member in mountinfo.
+        for member in /sys/fs/btrfs/*/devices/*/dev; do
+            [ -e "$member" ] || continue
+            member_id=$(cat "$member") || error "Cannot inspect Btrfs member"
+            [ "$member_id" != "$id" ] || error "Target device $id belongs to active Btrfs"
+        done
+    done
+    for dev in $swaps; do
+        if [ -b "$dev" ]; then
+            id=$(lsblk -dnr -o MAJ:MIN "$dev") || error "Cannot identify active swap: $dev"
+            if printf '%s\n' "$nodes" | grep -Fxq "$id"; then
+                error "Target disk has active swap: $dev"
             fi
-        done <<DDIFY_INPUT_6
-$(lsblk -nrpo NAME "$disk" 2>/dev/null)
-DDIFY_INPUT_6
-
-        while IFS= read -r dev; do
-            [ -n "$dev" ] || continue
-            sysname="${dev#/dev/}"
-            sysname=$(printf '%s' "$sysname" | tr '/' '!')
-            holder_found=0
-            if [ -d "/sys/class/block/$sysname/holders" ]; then
-                for holder in "/sys/class/block/$sysname/holders/"*; do
-                    [ -e "$holder" ] || continue
-                    holder_found=1
-                    break
-                done
+        elif [ -f "$dev" ]; then
+            id=$(findmnt -kn -o MAJ:MIN --target "$dev") || error "Cannot identify swap file filesystem"
+            if printf '%s\n' "$nodes" | grep -Fxq "$id"; then
+                error "Target disk contains active swap file: $dev"
             fi
-            [ "$holder_found" -eq 0 ] || error "Target-disk device $dev still has active block holders; refusing dd"
-        done <<DDIFY_INPUT_7
-$(lsblk -nrpo NAME "$disk" 2>/dev/null)
-DDIFY_INPUT_7
-        return 0
-    fi
-
-    d="${disk#/dev/}"
-    while read -r dev mnt _; do
-        case "$dev" in
-            /dev/${d}p*|/dev/${d}s*|/dev/${d})
-                info "Unmounting target-disk filesystem: $dev from $mnt"
-                umount "$mnt" || error "Failed to unmount target-disk filesystem: $mnt"
-                ;;
-        esac
-    done <<DDIFY_INPUT_8
-$(mount -p 2>/dev/null || true)
-DDIFY_INPUT_8
+        else
+            error "Cannot identify active swap device or file: $dev"
+        fi
+    done
 }
 
 linux_source_to_disk() {
@@ -1528,7 +1489,8 @@ CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 PASSWORD_TO_DISPLAY=""
 ALLOW_EARLY_WIPE=0
-PREFETCH_IMAGE_PATH=""
+STAGED_IMAGE=""
+LINUX_COPY_ROOT_USED=""
 
 find_efi_for_plan() {
     local os
@@ -2910,8 +2872,8 @@ ensure_linux_block_node_from_sysfs() {
 reset_disk_for_staging() {
     { [ -z "${DISK_ID_PTUUID:-}" ] || match_ere "$DISK_ID_PTUUID" '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'; } ||
         error "Invalid saved GPT GUID; refusing destructive write"
-    wipefs -a "$DISK" >/dev/null 2>&1 || true
-    sgdisk -Z "$DISK" >/dev/null 2>&1 || true
+    wipefs -a "$DISK" >/dev/null || error "Cannot clear target disk signatures"
+    sgdisk -Z "$DISK" >/dev/null || error "Cannot clear target partition tables"
     partx -d "$DISK" >/dev/null 2>&1 || true
     blockdev --rereadpt "$DISK" >/dev/null 2>&1 || true
     mdev -s 2>/dev/null || true
@@ -3142,18 +3104,22 @@ image_checksum_from_official_manifest() {
     IMAGE_HASH_EXPECTED="$(to_lower "$expected")"
 }
 
-preflight_target_image_in_alpine() {
-    { case "$IMG_URL" in https://*) true ;; *) false ;; esac; } || error "Target image must use HTTPS"
+prepare_image_validation() {
+    case "$IMG_URL" in https://*) ;; *) error "Target image must use HTTPS" ;; esac
+    validate_target_capacity
     if [ "${IMAGE_BUILTIN:-0}" = 1 ]; then
         image_checksum_from_official_manifest
     else
         IMAGE_HASH_EXPECTED="" IMAGE_HASH_ALGO=""
         warn "Custom --img has no publisher-verified checksum; partition layout will still be validated"
     fi
-    info "Checking target image URL before modifying the disk"
-    curl -fsSIL --connect-timeout 15 --max-time 60 --proto '=https' --proto-redir '=https' "$IMG_URL" >/dev/null || \
-        error "Target image URL is not reachable before disk modification"
-    preflight_image_geometry
+    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
+        # Only the low-memory path needs a remote size/header before commit.
+        calculate_disk_staging_budget
+        if ! image_is_freebsd_raw; then
+            probe_remote_qcow_virtual_size >/dev/null || error "Cannot read remote QCOW2 header before disk commit"
+        fi
+    fi
 }
 
 # The script never accepts decompression output beyond the negotiated workspace limit.
@@ -3434,84 +3400,54 @@ confirm_destructive_write() {
     case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
 }
 
-# Source staging is intentionally completed in RAM, or the caller must explicitly
-# opt into legacy early-wipe staging. Space on the target disk cannot serve as a
-# pre-commit cache: destroying that disk also destroys the cache.
-installer_preflight_linux_files() {
-    local disk_bytes efi_bytes boot_bytes root_bytes root_budget source_dir top
-    local fs cmd
-    connect_qcow_readonly_nbd "$PREFETCH_IMAGE_PATH"
-    linux_copy_scan_source
-
+# Use the same source validation for RAM and disk staging. Keep the read-only
+# Linux source mounted for the copy instead of rescanning it after commit.
+validate_linux_source() {
+    local efi_bytes boot_bytes=0 root_budget source_dir top fs cmd esp efi_candidate
     source_dir="$LINUX_COPY_SRC_MNT"
     if [ "$LINUX_COPY_ROOT_TYPE" = btrfs ]; then
         top="$INSTALL_TMPDIR/precheck-btrfs-top"
         mkdir -p "$top"
-        mount -t btrfs -o ro,subvolid=5 "$LINUX_COPY_SRC_ROOT" "$top" || error "Cannot inspect all Btrfs source subvolumes"
-        root_bytes=$(du -s -B1 "$top" | awk '{print $1}')
-        umount "$top" || error "Failed to unmount Btrfs source preflight"
+        mount -t btrfs -o ro,subvolid=5 "$LINUX_COPY_SRC_ROOT" "$top" || error "Cannot inspect Btrfs source subvolumes"
+        LINUX_COPY_ROOT_USED=$(du -s -B1 --apparent-size "$top" | awk '{print $1}') || error "Cannot measure Btrfs source"
+        umount "$top" || error "Cannot release Btrfs source inspection"
     else
-        root_bytes=$(du -sx -B1 "$source_dir" | awk '{print $1}')
+        LINUX_COPY_ROOT_USED=$(du -sx -B1 "$source_dir" | awk '{print $1}') || error "Cannot measure source root"
     fi
-    disk_bytes=$(get_disk_size_bytes "$DISK")
-    efi_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_EFI")
-    boot_bytes=0
-    [ -z "$LINUX_COPY_SRC_BOOT" ] || boot_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_BOOT")
-    root_budget=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - efi_bytes - boot_bytes - 384 * 1024 * 1024))
-    match_ere "$root_bytes" '^[0-9]+$' || error "Cannot measure source root data before commit"
-    [ "$(( root_budget > 0 && root_bytes + root_bytes / 5 + 256 * 1024 * 1024 < root_budget ))" -ne 0 ] || \
-        error "Source files require more space than temporary Linux root (data=$root_bytes, budget=$root_budget)"
-
-    # A missing guest formatter or loader must not be discovered after wiping.
-    case "$LINUX_COPY_ROOT_TYPE" in
-        xfs) cmd=mkfs.xfs ;;
-        ext4) cmd=mkfs.ext4 ;;
-        btrfs) cmd="" ;;
-    esac
-    if [ -n "$cmd" ]; then
-        { [ -x "$source_dir/usr/sbin/$cmd" ] || [ -x "$source_dir/sbin/$cmd" ]; } || \
+    efi_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_EFI") || error "Cannot read EFI size"
+    efi_bytes=$(((efi_bytes + 1048575) / 1048576 * 1048576))
+    [ "$efi_bytes" -ge $((32 * 1048576)) ] || efi_bytes=$((32 * 1048576))
+    if [ -n "$LINUX_COPY_SRC_BOOT" ]; then
+        boot_bytes=$(blockdev --getsize64 "$LINUX_COPY_SRC_BOOT") || error "Cannot read boot size"
+        boot_bytes=$(((boot_bytes + 1048575) / 1048576 * 1048576))
+        fs=$(blkid -s TYPE -o value "$LINUX_COPY_SRC_BOOT") || error "Cannot identify /boot filesystem"
+        case "$fs" in ext4|xfs) ;; *) error "Unsupported /boot filesystem: $fs" ;; esac
+    fi
+    root_budget=$((TEMP_STAGE_START_BYTES - efi_bytes - boot_bytes - 16 * 1048576))
+    match_ere "$LINUX_COPY_ROOT_USED" '^[0-9]+$' || error "Cannot measure root data"
+    [ "$root_budget" -gt $((LINUX_COPY_ROOT_USED + 256 * 1048576)) ] ||
+        error "Source data exceeds estimated destination root budget (data=$LINUX_COPY_ROOT_USED, budget=$root_budget)"
+    for fs in "$LINUX_COPY_ROOT_TYPE" "${fs:-}"; do
+        case "$fs" in xfs) cmd=mkfs.xfs ;; ext4) cmd=mkfs.ext4 ;; *) continue ;; esac
+        { [ -x "$source_dir/usr/sbin/$cmd" ] || [ -x "$source_dir/sbin/$cmd" ]; } ||
             error "Source image has no matching $cmd formatter"
-    fi
-    if { { case "$LINUX_COPY_SRC_ROOT" in /dev/mapper/*) true ;; *) false ;; esac; } || { case "$LINUX_COPY_SRC_ROOT" in /dev/dm-*) true ;; *) false ;; esac; }; }; then
-        { [ -x "$source_dir/usr/bin/dracut" ] || [ -x "$source_dir/usr/sbin/dracut" ] || [ -x "$source_dir/sbin/dracut" ]; } || \
-            error "LVM image has no dracut to rebuild its initramfs"
-    fi
-    local esp="$INSTALL_TMPDIR/precheck-efi"
+    done
+    case "$LINUX_COPY_SRC_ROOT" in
+        /dev/mapper/*|/dev/dm-*)
+            { [ -x "$source_dir/usr/bin/dracut" ] || [ -x "$source_dir/usr/sbin/dracut" ] || [ -x "$source_dir/sbin/dracut" ]; } ||
+                error "LVM image has no dracut to rebuild its initramfs" ;;
+    esac
+    esp="$INSTALL_TMPDIR/precheck-efi"
     mkdir -p "$esp"
     linux_copy_source_mount "$LINUX_COPY_SRC_EFI" "$esp" vfat
-    local efi_candidate=""
     case "$MACHINE_ARCH" in
-        x86_64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTX64.EFI' -o -iname 'grubx64.efi' \) -print -quit 2>/dev/null) ;;
-        aarch64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTAA64.EFI' -o -iname 'grubaa64.efi' \) -print -quit 2>/dev/null) ;;
+        x86_64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTX64.EFI' -o -iname 'grubx64.efi' \) -print -quit) ;;
+        aarch64) efi_candidate=$(find "$esp/EFI" -type f \( -iname 'BOOTAA64.EFI' -o -iname 'grubaa64.efi' \) -print -quit) ;;
+        *) error "Unsupported EFI architecture" ;;
     esac
-    [ -n "$efi_candidate" ] || error "Image EFI system partition has no matching $MACHINE_ARCH bootloader"
-    umount "$esp" || error "Cannot unmount EFI preflight"
-    umount "$source_dir" || error "Cannot release source root before commit"
-    local vg
-    for vg in $LINUX_COPY_SOURCE_VGS; do
-        vgchange -an "$vg" >/dev/null || error "Cannot deactivate preflight LVM VG: $vg"
-    done
-    LINUX_COPY_SOURCE_VGS=""
-    cleanup_qcow_nbd
-    info "Pre-commit Linux source and space checks passed (root data $root_bytes bytes)."
-}
-
-installer_preflight_freebsd_image() {
-    local disk_bytes
-    disk_bytes=$(get_disk_size_bytes "$DISK")
-    # Conservative lower bound for the beginning of the eventual temporary
-    # temporary partition; the exact geometry is checked again after commit.
-    TEMP_STAGE_START_BYTES=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - 4 * 1024 * 1024))
-    inspect_qcow_partition_layout "$PREFETCH_IMAGE_PATH"
-    [ "$QCOW_PARTITION_TABLE" = gpt ] || error "FreeBSD installation requires GPT"
-    # The old shadow code cannot shrink UFS. Do not start a destructive operation
-    # that could need a large unverified RAW copy or a non-existent UFS shrink.
-    [ "$(( QCOW_MAX_PART_END_BYTES + 8 * 1024 * 1024 < TEMP_STAGE_START_BYTES ))" -ne 0 ] || \
-        error "FreeBSD source partitions cross the protected staging area; safe UFS install backend unavailable"
-    [ "$(( QCOW_MAX_PART_END_BYTES + 64 * 1024 * 1024 < disk_bytes ))" -ne 0 ] || \
-        error "FreeBSD image leaves no safe room for CIDATA and GPT"
-    cleanup_qcow_nbd
-    info "Pre-commit FreeBSD GPT and partition-space checks passed."
+    [ -n "$efi_candidate" ] || error "Image lacks a matching EFI bootloader"
+    umount "$esp" || error "Cannot release EFI inspection"
+    info "Linux source and estimated destination capacity validated"
 }
 
 # ----------------- bounded low-memory image backends -----------------
@@ -3614,19 +3550,7 @@ inspect_freebsd_raw() {
 }
 
 installer_write_freebsd_raw() {
-    local img written_guid written_table
-    resolve_target_disk_from_identity
-    unmount_target_disk_filesystems "$DISK"
-    confirm_destructive_write
-    prepare_fixed_temp_staging_partition
-    if [ -n "$PREFETCH_IMAGE_PATH" ]; then
-        img=$PREFETCH_IMAGE_PATH
-    else
-        set_disk_download_limit
-        img="$TEMP_STAGE_MNT/image.raw.xz"
-        download_freebsd_raw "$img"
-    fi
-    inspect_freebsd_raw "$img"
+    local img="$STAGED_IMAGE" written_guid written_table
     info "Writing verified FreeBSD RAW stream (no full decompressed image)"
     xz --threads=1 --memlimit-decompress=128MiB -dc "$img" |
         dd of="$DISK" bs=1M iflag=fullblock conv=notrunc,fsync status=progress ||
@@ -3641,70 +3565,83 @@ installer_write_freebsd_raw() {
     grow_last_partition_reserving_cidata
 }
 
-installer_precommit_prepare() {
-    [ "$ALLOW_EARLY_WIPE" = 0 ] || {
-        warn "EXPLICIT HIGH-RISK MODE: target disk will be erased before the image is fully downloaded and inspected."
-        warn "If the download, checksum, QCOW2, or source-layout validation fails, the old installation cannot be recovered by this script."
-        return 0
-    }
-    # The verified image stays in RAM. Reserve only 128 MiB on the target
-    # for the temporary partition mapping/expansion protocol.
+# Calculate a conservative boundary for validation without changing a disk.
+# The actual partition boundary is checked against it after commit.
+planned_stage_boundary() {
+    local disk_bytes
+    disk_bytes=$(get_disk_size_bytes "$DISK") || error "Cannot read target disk size"
+    TEMP_STAGE_START_BYTES=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - 4 * 1048576))
+    [ "$TEMP_STAGE_START_BYTES" -gt $((2 * 1024 * 1048576)) ] || error "Insufficient destination space"
+}
+
+stage_source_image() {
+    local dir="$1"
+    if image_is_freebsd_raw; then
+        STAGED_IMAGE="$dir/image.raw.xz"
+        download_freebsd_raw "$STAGED_IMAGE"
+    else
+        STAGED_IMAGE="$dir/image.qcow2"
+        download_target_image_in_alpine "$STAGED_IMAGE"
+    fi
+}
+
+validate_staged_source() {
+    if image_is_freebsd_raw; then
+        inspect_freebsd_raw "$STAGED_IMAGE"
+    elif [ "$TARGET_OS" = freebsd ]; then
+        inspect_qcow_partition_layout "$STAGED_IMAGE"
+        [ "$QCOW_PARTITION_TABLE" = gpt ] || error "FreeBSD installation requires GPT"
+        [ "$QCOW_PARTITION_CROSSES_STAGE" = 0 ] || error "FreeBSD source overlaps staging"
+    else
+        connect_qcow_readonly_nbd "$STAGED_IMAGE"
+        linux_copy_scan_source
+        validate_linux_source
+    fi
+}
+
+prepare_ram_source() {
+    local mem_bytes free_bytes limit
     TEMP_STAGE_SIZE_MIB=128
-    TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1024 * 1024))
-    local mem_bytes free_bytes limit remote_size oldmnt
+    TEMP_STAGE_SIZE_BYTES=$((TEMP_STAGE_SIZE_MIB * 1048576))
+    planned_stage_boundary
     mem_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
     free_bytes=$(df -B1 --output=avail /run/reinstall-work | awk 'NR == 2 {print $1}')
-    { match_ere "$mem_bytes" '^[0-9]+$' && match_ere "$free_bytes" '^[0-9]+$'; } || error "Cannot budget RAM source staging"
-    # Reserve physical memory for the rescue OS, XZ and filesystem tools.
-    # Never treat logical zram capacity as real RAM.
-    limit=$((mem_bytes - 384 * 1024 * 1024))
-    [ "$(( free_bytes - 256 * 1024 * 1024 < limit ))" -ne 0 ] && limit=$((free_bytes - 256 * 1024 * 1024))
-    [ "$(( limit > 64 * 1024 * 1024 ))" -ne 0 ] || error "Not enough RAM staging budget before disk commit"
-    remote_size=$(http_content_length "$IMG_URL" || true)
-    { match_ere "$remote_size" '^[0-9]+$' && [ "$remote_size" -gt 0 ]; } || \
-        error "Remote image size is unknown; safe pre-commit staging requires a Content-Length"
-    [ "$(( remote_size <= limit ))" -ne 0 ] || \
-        error "Image payload ($remote_size bytes) exceeds safe RAM budget ($limit); use separate rescue storage, or explicitly opt into --allow-early-wipe"
+    { match_ere "$mem_bytes" '^[0-9]+$' && match_ere "$free_bytes" '^[0-9]+$'; } || error "Cannot budget RAM staging"
+    limit=$((mem_bytes - 384 * 1048576))
+    [ "$limit" -le $((free_bytes - 256 * 1048576)) ] || limit=$((free_bytes - 256 * 1048576))
+    [ "$limit" -gt $((64 * 1048576)) ] ||
+        error "Insufficient safe RAM staging; use --allow-early-wipe only if data loss is acceptable"
     IMAGE_DOWNLOAD_LIMIT_BYTES="$limit"
-    PREFETCH_IMAGE_PATH="$INSTALL_TMPDIR/verified-source.qcow2"
-    oldmnt="$TEMP_STAGE_MNT"
-    TEMP_STAGE_MNT=/run/reinstall-work
-    if image_is_freebsd_raw; then
-        PREFETCH_IMAGE_PATH="$INSTALL_TMPDIR/verified-source.raw.xz"
-        download_freebsd_raw "$PREFETCH_IMAGE_PATH"
-    else
-        download_target_image_in_alpine "$PREFETCH_IMAGE_PATH"
+    stage_source_image "$INSTALL_TMPDIR"
+    validate_staged_source
+    mem_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    match_ere "$mem_bytes" '^[0-9]+$' && [ "$mem_bytes" -ge $((256 * 1048576)) ] ||
+        error "Insufficient RAM after source validation; disk untouched"
+    info "Source verified before disk commit"
+}
+
+commit_disk_and_prepare_source() {
+    local planned
+    if [ "$TARGET_OS" != freebsd ]; then TEMP_STAGE_PART_NUM=128; fi
+    planned_stage_boundary
+    planned="$TEMP_STAGE_START_BYTES"
+    resolve_target_disk_from_identity
+    validate_target_disk "$DISK"
+    ensure_supported_sector_size
+    confirm_destructive_write
+    assert_target_disk_idle "$DISK"
+    prepare_fixed_temp_staging_partition
+    [ "$TEMP_STAGE_START_BYTES" -ge "$planned" ] || error "Actual staging boundary is smaller than validated plan"
+    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
+        set_disk_download_limit
+        stage_source_image "$TEMP_STAGE_MNT"
+        validate_staged_source
     fi
-    TEMP_STAGE_MNT="$oldmnt"
-    local usable
-    usable=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
-    [ "$(( usable >= 256 * 1024 * 1024 ))" -ne 0 ] || \
-        error "Insufficient memory after image verification; disk was not modified"
-    if image_is_freebsd_raw; then
-        TEMP_STAGE_START_BYTES=$(($(get_disk_size_bytes "$DISK") - TEMP_STAGE_SIZE_BYTES - 4 * 1048576))
-        inspect_freebsd_raw "$PREFETCH_IMAGE_PATH"
-    elif [ "$TARGET_OS" = freebsd ]; then
-        installer_preflight_freebsd_image
-    else
-        installer_preflight_linux_files
-    fi
-    info "Downloaded image passed integrity/layout preflight; target disk is still untouched."
 }
 
 installer_write_image() {
-    resolve_target_disk_from_identity
-    unmount_target_disk_filesystems "$DISK"
-    confirm_destructive_write
-    prepare_fixed_temp_staging_partition
+    IMG_QCOW="$STAGED_IMAGE"
 
-    if [ -n "$PREFETCH_IMAGE_PATH" ]; then
-        IMG_QCOW="$PREFETCH_IMAGE_PATH"
-    else
-        IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
-        set_disk_download_limit
-        download_target_image_in_alpine "$IMG_QCOW"
-    fi
-    inspect_qcow_partition_layout "$IMG_QCOW"
     write_qcow_without_overwriting_staging "$IMG_QCOW"
 
     [ "${TEMP_STAGE_RELEASED:-0}" = 1 ] || release_temp_staging_partition
@@ -3781,7 +3718,7 @@ verify_gpt_strict() {
 }
 
 linux_copy_scan_source() {
-    # Preflight and installation each scan the source independently.
+    # Scan the staged source once; the validated mount is reused for copying.
     LINUX_COPY_SRC_ROOT= LINUX_COPY_SRC_BOOT= LINUX_COPY_SRC_EFI=
     LINUX_COPY_ROOT_TYPE= LINUX_COPY_ROOT_UUID= LINUX_COPY_BOOT_UUID= LINUX_COPY_EFI_UUID=
     local nbd="$QCOW_NBD_DEV" table pv vg dev fs type mp path count=0
@@ -4274,7 +4211,7 @@ linux_copy_recreate_and_copy() {
     mkfs.vfat "$@" "$efi_dev" >/dev/null || error "Cannot format target EFI filesystem"
 
     root_available=$(blockdev --getsize64 "$LINUX_COPY_ROOT_TARGET")
-    root_used=$(du -sx -B1 "$LINUX_COPY_SRC_MNT" | awk '{print $1}')
+    root_used="${LINUX_COPY_ROOT_USED:?missing validated source size}"
     [ "$(( root_used + 256 * 1024 * 1024 < root_available ))" -ne 0 ] || \
         error "Source root data ($root_used bytes) does not fit into staging-safe target root ($root_available bytes)"
 
@@ -4382,20 +4319,8 @@ linux_copy_release_staging_and_grow() {
 }
 
 installer_write_image_linux_by_copy() {
-    resolve_target_disk_from_identity
-    unmount_target_disk_filesystems "$DISK"
-    confirm_destructive_write
-    TEMP_STAGE_PART_NUM=128
-    prepare_fixed_temp_staging_partition
-    if [ -n "$PREFETCH_IMAGE_PATH" ]; then
-        IMG_QCOW="$PREFETCH_IMAGE_PATH"
-    else
-        IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
-        set_disk_download_limit
-        download_target_image_in_alpine "$IMG_QCOW"
-    fi
-    connect_qcow_readonly_nbd "$IMG_QCOW"
-    linux_copy_scan_source
+    IMG_QCOW="$STAGED_IMAGE"
+
     linux_copy_create_partitions
     linux_copy_recreate_and_copy
     linux_copy_release_staging_and_grow
@@ -4455,14 +4380,19 @@ do_install() {
     info "[1/5] Prepare rescue workspace and verify image metadata"
     installer_workspace
     installer_stage_optional_inputs
-    preflight_target_image_in_alpine
-    info "[2/5] Prepare bounded image staging and pre-commit checks"
-    installer_precommit_prepare
+    prepare_image_validation
+    info "[2/5] Prepare bounded source and validate before disk commit"
+    if [ "$ALLOW_EARLY_WIPE" = 0 ]; then
+        prepare_ram_source
+    else
+        warn "Explicit early-wipe mode: a failed download or validation can leave the original system unrecoverable"
+    fi
     [ "$HOLD" != 1 ] || {
         info "Full rescue preflight passed; target disk was not changed (--hold 1)"
         return 0
     }
-    info "[3/5] Install operating system"
+    info "[3/5] Commit disk and install operating system"
+    commit_disk_and_prepare_source
     if image_is_freebsd_raw; then
         installer_write_freebsd_raw
     elif [ "$TARGET_OS" = freebsd ]; then
@@ -4643,34 +4573,11 @@ probe_remote_qcow_virtual_size() {
     printf '%s\n' "$size"
 }
 
-preflight_image_geometry() {
-    local disk_bytes image_bytes stage_safe
-    disk_bytes=$(get_disk_size_bytes "$DISK")
-    { match_ere "$disk_bytes" '^[0-9]+$' && [ "$disk_bytes" -ge 9499999744 ]; } || \
+validate_target_capacity() {
+    local disk_bytes
+    disk_bytes=$(get_disk_size_bytes "$DISK") || error "Cannot read target capacity"
+    { match_ere "$disk_bytes" '^[0-9]+$' && [ "$disk_bytes" -ge 9499999744 ]; } ||
         error "Minimum supported target disk size is 9.5 GB (rounded down to a 512-byte sector)"
-    if image_is_freebsd_raw; then
-        # XZ virtual length and both GPT copies are checked on the verified file.
-        if [ "$ALLOW_EARLY_WIPE" = 1 ]; then calculate_disk_staging_budget; fi
-        info "FreeBSD RAW backend: compressed payload staged, full layout checked before image write"
-        return 0
-    fi
-    image_bytes=$(probe_remote_qcow_virtual_size) || \
-        error "Cannot read remote QCOW2 header before disk modification"
-    if [ "$ALLOW_EARLY_WIPE" = 1 ]; then
-        calculate_disk_staging_budget
-        stage_safe=$((disk_bytes - TEMP_STAGE_SIZE_BYTES - 64 * 1024 * 1024))
-    else
-        stage_safe=$((disk_bytes - 128 * 1024 * 1024 - 64 * 1024 * 1024))
-    fi
-    if [ "$(( image_bytes > disk_bytes ))" -ne 0 ]; then
-        warn "Image virtual size exceeds target disk; actual partition boundaries will be validated before writing"
-    fi
-    if [ "$(( image_bytes > stage_safe ))" -ne 0 ] && [ "$TARGET_OS" = freebsd ]; then
-        warn "Image virtual size crosses the selected staging boundary; full image layout preflight is required"
-    elif [ "$TARGET_OS" != freebsd ]; then
-        info "Linux target will be installed by filesystem copy (no XFS shrink or RAW shadow)"
-    fi
-    info "Remote QCOW2 virtual size: $image_bytes bytes (disk: $disk_bytes bytes)"
 }
 
 preflight_target_image_on_host() {
@@ -4739,7 +4646,7 @@ host_main() {
         error "Custom RAW images require a trusted checksum; use the built-in FreeBSD RAW URL or a QCOW2 override"
     fi
     preflight_target_image_on_host
-    preflight_image_geometry
+    validate_target_capacity
     print_host_summary
     warn "Rescue boot currently uses DHCPv4; static IP, VLAN and bonding are not migrated. Verify DHCP access before reboot."
     warn "The apkovl contains password hash/configuration on the boot filesystem; FAT filesystems cannot enforce 0600 access."
@@ -4762,7 +4669,7 @@ host_main() {
     fi
 
     [ "$HOLD" != 1 ] || {
-        info "--hold 1 (host): image URL/header and host capability checked; full download/source verification requires Alpine rescue."
+        info "--hold 1 (host): image URL, disk capacity and host capability checked; full download/source verification requires Alpine rescue."
         return 0
     }
     PASSWORD_TO_DISPLAY=""
