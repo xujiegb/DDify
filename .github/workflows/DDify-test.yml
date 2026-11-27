@@ -197,6 +197,13 @@ jobs:
           logger_pid=$!
           exec > "$WORK/test-log.fifo" 2>&1
           PID=''
+          serial_tail_pid=''
+          serial_filter_pid=''
+          # QEMU's unfiltered UART output stays outside the uploaded log folder.
+          RAW_SERIAL="$WORK/serial.raw"
+          export RAW_SERIAL
+          umask 077
+          : >"$RAW_SERIAL"
           cleanup() {
               local rc=$?
               trap - 0
@@ -204,10 +211,27 @@ jobs:
                   kill "$PID" 2>/dev/null || true
                   wait "$PID" 2>/dev/null || true
               fi
+              if [ -n "$serial_tail_pid" ]; then
+                  # Let the follower drain the final UART bytes after QEMU exits.
+                  sleep 1
+                  kill "$serial_tail_pid" 2>/dev/null || true
+                  wait "$serial_tail_pid" 2>/dev/null || true
+              fi
+              if [ -n "$serial_filter_pid" ]; then wait "$serial_filter_pid" 2>/dev/null || true; fi
+              # Regenerate the complete artifact from the raw stream even if
+              # the live follower missed its final partial line. Never upload
+              # a plaintext console password, even if a guest echoed it.
+              LC_ALL=C awk '
+                  BEGIN { RS="\r\n|\r|\n"; secret=ENVIRON["SOURCE_CONSOLE_PASSWORD"] }
+                  { if(secret!="") gsub(secret,"[REDACTED]"); print }
+              ' "$RAW_SERIAL" >"$LOG/serial.log"
               if [ "$rc" -ne 0 ]; then
-                  tail -c 24000 "$LOG/serial.log" 2>/dev/null || true
+                  echo '[UART] Last 80 lines (failure context):'
+                  tail -n 80 "$LOG/serial.log" | sed 's/^/[UART] /' || true
                   tail -c 4000 "$LOG/qemu.log" 2>/dev/null || true
               fi
+              rm -f "$RAW_SERIAL" "$WORK/serial-live.fifo"
+              unset SOURCE_CONSOLE_PASSWORD
               rm -f "$WORK/source-key" "$WORK/target-key" "$WORK/user-data" "$WORK/seed.iso"
               exec >&3 2>&4
               wait "$logger_pid" || true
@@ -256,6 +280,17 @@ jobs:
           SOURCE_CONSOLE_PASSWORD=$(openssl rand -hex 24)
           echo "::add-mask::$SOURCE_CONSOLE_PASSWORD" >&3
           export SOURCE_CONSOLE_PASSWORD
+          # Follow UART output throughout every boot, including when Expect is
+          # disconnected. Prefix every line so guest output cannot become a
+          # GitHub Actions workflow command. Redact the ephemeral login secret.
+          mkfifo "$WORK/serial-live.fifo"
+          LC_ALL=C awk '
+              BEGIN { RS="\r\n|\r|\n"; secret=ENVIRON["SOURCE_CONSOLE_PASSWORD"] }
+              { if(secret!="") gsub(secret,"[REDACTED]"); print "[UART] " $0; fflush() }
+          ' <"$WORK/serial-live.fifo" >&3 &
+          serial_filter_pid=$!
+          tail -c +1 -f --sleep-interval=0.2 "$RAW_SERIAL" >"$WORK/serial-live.fifo" &
+          serial_tail_pid=$!
           root_hash=$(printf '%s\n' "$SOURCE_CONSOLE_PASSWORD" | openssl passwd -6 -stdin)
           printf '%s\n' "$SCRIPT_REF" | grep -Eq '^[0-9a-f]{40}$' || fail 'Invalid script commit SHA'
           printf '%s\n' "$SCRIPT_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || fail 'Invalid script repository'
@@ -343,7 +378,7 @@ jobs:
                   -netdev user,id=net,hostfwd=tcp:127.0.0.1:2222-:22 \
                   -device virtio-net-pci,netdev=net \
                   -display none -monitor none \
-                  -chardev "socket,id=console,path=$WORK/serial.sock,server=on,wait=off,logfile=$LOG/serial.log,logappend=on" \
+                  -chardev "socket,id=console,path=$WORK/serial.sock,server=on,wait=off,logfile=$RAW_SERIAL,logappend=on" \
                   -serial chardev:console "$@" >> "$LOG/qemu.log" 2>&1 &
               PID=$!
               local end=$(($(date +%s)+30))
@@ -444,34 +479,42 @@ jobs:
           # All commands below execute in the real guest root login session.
           echo '[serial] Login as root, download pinned DDify and reinstall'
           expect <<'EXPECT'
+          # The live UART follower already prints the received stream.
+          # Use a binary, unbuffered pipe, not a second PTY/terminal driver.
           log_user 0
           set timeout 90
           proc die {message} { puts stderr "SERIAL ERROR: $message"; exit 1 }
-          spawn -noecho socat STDIO,rawer,echo=0 UNIX-CONNECT:$env(WORK)/serial.sock
+          set channel [open [list | socat STDIO UNIX-CONNECT:$env(WORK)/serial.sock] r+]
+          fconfigure $channel -translation binary -encoding binary -buffering none
+          spawn -noecho -open $channel
+          match_max 65536
           send -- "\r"
           expect {
-              -re {(?i)login:[ \t]*$} {}
+              -nocase -exact "login:" {}
               timeout { die "No serial login prompt" }
               eof { die "Serial socket closed" }
           }
           send -- "root\r"
+          # Password prompts do not end in a newline. Match their literal
+          # text immediately even if spaces or terminal control bytes follow.
           expect {
-              -re {(?i)password:[ \t]*$} {}
+              -nocase -exact "password:" {}
               timeout { die "No root password prompt" }
               eof { die "Serial socket closed during login" }
           }
           send -- "$env(SOURCE_CONSOLE_PASSWORD)\r"
           expect {
-              -re {(?i)login incorrect|authentication failure} { die "Root login rejected" }
-              -re {(?m)[#][ \t]*$} {}
+              -nocase -re {login incorrect|authentication failure|login:} { die "Root login rejected" }
+              -re {#[ \t]*} {}
               timeout { die "No root shell prompt" }
               eof { die "Serial socket closed during authentication" }
           }
+          puts "SERIAL: root login prompt received; verifying uid"
           # Markers are split in the command so terminal echo cannot fake success.
           proc checked {command label seconds} {
               global spawn_id
               set timeout $seconds
-              set pattern [format {DDIFY_%s:([0-9]+)\r?\n} $label]
+              set pattern [format {DDIFY_%s:([0-9]+)\r*\n} $label]
               set line [format {%s; rc=$?; printf 'DDIFY_%%s:%%s\n' '%s' "$rc"} $command $label]
               send -- "$line\r"
               expect {
@@ -504,7 +547,7 @@ jobs:
           send -- "$command\r"
           set timeout 1800
           expect {
-              -re {DDIFY_HOST_RC:([0-9]+)\r?\n} {
+              -re {DDIFY_HOST_RC:([0-9]+)\r*\n} {
                   if {$expect_out(1,string) ne "0"} { die "Installer host rc=$expect_out(1,string)" }
                   puts "SERIAL: installer host returned success"
               }
@@ -515,17 +558,18 @@ jobs:
               eof { die "Serial connection lost before reboot handoff" }
           }
           # QEMU itself continues logging UART output after Expect disconnects.
-          close
-          wait
+          catch {close}
+          catch {wait}
           EXPECT
-          unset SOURCE_CONSOLE_PASSWORD
+          # Keep the ephemeral secret only until the UART artifact is redacted
+          # in cleanup; it is never passed to the target installation.
           # SSH from this point is an independent check of the reinstalled OS.
           end=$(($(date +%s)+3600))
           while :; do
               kill -0 "$PID" 2>/dev/null || fail 'QEMU stopped during reinstall'
-              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$LOG/serial.log"; then fail 'DDify rescue reported failure on serial console'; fi
+              if grep -Eq 'Installer phase finished with rc=[1-9][0-9]*|reinstall runner returned rc=[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify rescue reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1 && ssh_guest target 'test ! -e /var/tmp/ddify-old-system-marker && test "$(cat /etc/reinstall-web-port 2>/dev/null)" = 18080' >/dev/null 2>&1; then break; fi
-              if grep -Eq 'DDIFY_HOST_RC:[1-9][0-9]*' "$LOG/serial.log"; then fail 'DDify host reported failure on serial console'; fi
+              if grep -Eq 'DDIFY_HOST_RC:[1-9][0-9]*' "$RAW_SERIAL"; then fail 'DDify host reported failure on serial console'; fi
               if assert_os target "$TARGET_OS" >/dev/null 2>&1; then
                   collect_guest target initializing
               fi
